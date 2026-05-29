@@ -4,7 +4,8 @@ use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use std::collections::HashSet;
+use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 pub fn unique(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
@@ -25,7 +26,7 @@ pub fn unique(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
     }
 }
 
-pub fn isin(py: Python<'_>, a: &GrumpyArray, test: &GrumpyArray) -> PyResult<GrumpyArray> {
+pub fn isin(a: &GrumpyArray, test: &GrumpyArray) -> PyResult<GrumpyArray> {
     if a.layout.has_union() || test.layout.has_union() {
         return Err(PyValueError::new_err("isin() on union layouts is not implemented yet."));
     }
@@ -34,8 +35,11 @@ pub fn isin(py: Python<'_>, a: &GrumpyArray, test: &GrumpyArray) -> PyResult<Gru
     }
     let test_leaf = find_leaf(&test.layout)?;
     let set = build_membership_set(test.dtype, test_leaf)?;
-    let out_layout = isin_layout(py, &a.layout, a.dtype, &set)?;
-    Ok(GrumpyArray { dtype: DType::Bool, layout: out_layout })
+    let out_layout = isin_layout(&a.layout, a.dtype, &set)?;
+    Ok(GrumpyArray {
+        dtype: DType::Bool,
+        layout: out_layout,
+    })
 }
 
 pub fn setunion(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<GrumpyArray> {
@@ -594,65 +598,125 @@ fn setxor_f32(_py: Python<'_>, a: &Leaf, b: &Leaf) -> PyResult<GrumpyArray> {
 // -------- isin implementation --------
 
 enum MembershipSet {
-    I32(HashSet<i32>),
-    I64(HashSet<i64>),
-    U32(HashSet<u32>),
-    U64(HashSet<u64>),
-    Bool(HashSet<u8>),
-    Char(HashSet<u32>),
-    F32(HashSet<u32>), // bits, with 0 normalized; NaNs excluded
-    F64(HashSet<u64>), // bits, with 0 normalized; NaNs excluded
+    I32(FxHashSet<i32>),
+    I64(FxHashSet<i64>),
+    U32(FxHashSet<u32>),
+    U64(FxHashSet<u64>),
+    Bool(FxHashSet<u8>),
+    Char(FxHashSet<u32>),
+    F32(FxHashSet<u32>), // bits, with 0 normalized; NaNs excluded
+    F64(FxHashSet<u64>), // bits, with 0 normalized; NaNs excluded
 }
 
 fn build_membership_set(dt: DType, leaf: &Leaf) -> PyResult<MembershipSet> {
     match (dt, &leaf.buffer) {
         (DType::Int32, LeafBuffer::I32(v)) => {
-            let mut s = HashSet::new();
-            for i in 0..leaf.len { if leaf.validity[i] { s.insert(v[i]); } }
+            let mut s = FxHashSet::default();
+            s.reserve(leaf.len.min(131_072));
+            if leaf.has_nulls {
+                for i in 0..leaf.len {
+                    if leaf.validity[i] {
+                        s.insert(v[i]);
+                    }
+                }
+            } else {
+                s.extend(v.iter().copied());
+            }
             Ok(MembershipSet::I32(s))
         }
         (DType::Int64, LeafBuffer::I64(v)) => {
-            let mut s = HashSet::new();
-            for i in 0..leaf.len { if leaf.validity[i] { s.insert(v[i]); } }
+            let mut s = FxHashSet::default();
+            s.reserve(leaf.len.min(131_072));
+            if leaf.has_nulls {
+                for i in 0..leaf.len {
+                    if leaf.validity[i] {
+                        s.insert(v[i]);
+                    }
+                }
+            } else {
+                s.extend(v.iter().copied());
+            }
             Ok(MembershipSet::I64(s))
         }
         (DType::UInt32, LeafBuffer::U32(v)) => {
-            let mut s = HashSet::new();
-            for i in 0..leaf.len { if leaf.validity[i] { s.insert(v[i]); } }
+            let mut s = FxHashSet::default();
+            s.reserve(leaf.len.min(131_072));
+            if leaf.has_nulls {
+                for i in 0..leaf.len {
+                    if leaf.validity[i] {
+                        s.insert(v[i]);
+                    }
+                }
+            } else {
+                s.extend(v.iter().copied());
+            }
             Ok(MembershipSet::U32(s))
         }
         (DType::UInt64, LeafBuffer::U64(v)) => {
-            let mut s = HashSet::new();
-            for i in 0..leaf.len { if leaf.validity[i] { s.insert(v[i]); } }
+            let mut s = FxHashSet::default();
+            s.reserve(leaf.len.min(131_072));
+            if leaf.has_nulls {
+                for i in 0..leaf.len {
+                    if leaf.validity[i] {
+                        s.insert(v[i]);
+                    }
+                }
+            } else {
+                s.extend(v.iter().copied());
+            }
             Ok(MembershipSet::U64(s))
         }
         (DType::Bool, LeafBuffer::Bool(v)) => {
-            let mut s = HashSet::new();
-            for i in 0..leaf.len { if leaf.validity[i] { s.insert(if v[i] != 0 { 1 } else { 0 }); } }
+            let mut s = FxHashSet::default();
+            s.reserve(leaf.len.min(131_072));
+            for i in 0..leaf.len {
+                if leaf.validity[i] {
+                    s.insert(if v[i] != 0 { 1u8 } else { 0u8 });
+                }
+            }
             Ok(MembershipSet::Bool(s))
         }
         (DType::Char, LeafBuffer::Char(v)) => {
-            let mut s = HashSet::new();
-            for i in 0..leaf.len { if leaf.validity[i] { s.insert(v[i]); } }
+            let mut s = FxHashSet::default();
+            s.reserve(leaf.len.min(131_072));
+            if leaf.has_nulls {
+                for i in 0..leaf.len {
+                    if leaf.validity[i] {
+                        s.insert(v[i]);
+                    }
+                }
+            } else {
+                s.extend(v.iter().copied());
+            }
             Ok(MembershipSet::Char(s))
         }
         (DType::Float32, LeafBuffer::F32(v)) => {
-            let mut s = HashSet::new();
+            let mut s = FxHashSet::default();
+            s.reserve(leaf.len.min(131_072));
             for i in 0..leaf.len {
-                if !leaf.validity[i] { continue; }
+                if !leaf.validity[i] {
+                    continue;
+                }
                 let x = v[i];
-                if x.is_nan() { continue; }
+                if x.is_nan() {
+                    continue;
+                }
                 let bits = if x == 0.0 { 0.0f32.to_bits() } else { x.to_bits() };
                 s.insert(bits);
             }
             Ok(MembershipSet::F32(s))
         }
         (DType::Float64, LeafBuffer::F64(v)) => {
-            let mut s = HashSet::new();
+            let mut s = FxHashSet::default();
+            s.reserve(leaf.len.min(131_072));
             for i in 0..leaf.len {
-                if !leaf.validity[i] { continue; }
+                if !leaf.validity[i] {
+                    continue;
+                }
                 let x = v[i];
-                if x.is_nan() { continue; }
+                if x.is_nan() {
+                    continue;
+                }
                 let bits = if x == 0.0 { 0.0f64.to_bits() } else { x.to_bits() };
                 s.insert(bits);
             }
@@ -662,15 +726,18 @@ fn build_membership_set(dt: DType, leaf: &Leaf) -> PyResult<MembershipSet> {
     }
 }
 
-fn isin_layout(_py: Python<'_>, layout: &Layout, dt: DType, set: &MembershipSet) -> PyResult<Layout> {
+fn isin_layout(layout: &Layout, dt: DType, set: &MembershipSet) -> PyResult<Layout> {
     match layout {
         Layout::Leaf(l) => Ok(Layout::Leaf(isin_leaf(l, dt, set)?)),
         Layout::ListOffset(lo) => {
-            let content = isin_layout(_py, lo.content.as_ref(), dt, set)?;
-            Ok(Layout::ListOffset(ListOffset { offsets: lo.offsets.clone(), content: Box::new(content) }))
+            let content = isin_layout(lo.content.as_ref(), dt, set)?;
+            Ok(Layout::ListOffset(ListOffset {
+                offsets: lo.offsets.clone(),
+                content: Box::new(content),
+            }))
         }
         Layout::OffsetView(v) => {
-            let content = isin_layout(_py, v.content.as_ref(), dt, set)?;
+            let content = isin_layout(v.content.as_ref(), dt, set)?;
             Ok(Layout::OffsetView(crate::layout::OffsetView {
                 offsets: v.offsets.clone(),
                 start: v.start,
@@ -679,8 +746,11 @@ fn isin_layout(_py: Python<'_>, layout: &Layout, dt: DType, set: &MembershipSet)
             }))
         }
         Layout::Indexed(ix) => {
-            let content = isin_layout(_py, ix.content.as_ref(), dt, set)?;
-            Ok(Layout::Indexed(crate::layout::Indexed { index: ix.index.clone(), content: Box::new(content) }))
+            let content = isin_layout(ix.content.as_ref(), dt, set)?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ix.index.clone(),
+                content: Box::new(content),
+            }))
         }
         Layout::UnionScalarList(_) => Err(PyValueError::new_err("Union not supported.")),
     }
@@ -696,7 +766,17 @@ fn isin_leaf(leaf: &Leaf, dt: DType, set: &MembershipSet) -> PyResult<Leaf> {
     let oo = match &mut out.buffer { LeafBuffer::Bool(v) => Arc::make_mut(v), _ => unreachable!() };
     match (dt, set, &leaf.buffer) {
         (DType::Int32, MembershipSet::I32(s), LeafBuffer::I32(v)) => {
-            for i in 0..n { if leaf.validity[i] { oo[i] = s.contains(&v[i]) as u8; } }
+            if !leaf.has_nulls {
+                oo.par_iter_mut()
+                    .zip(v.par_iter())
+                    .for_each(|(o, &x)| *o = s.contains(&x) as u8);
+            } else {
+                for i in 0..n {
+                    if leaf.validity[i] {
+                        oo[i] = s.contains(&v[i]) as u8;
+                    }
+                }
+            }
         }
         (DType::Int64, MembershipSet::I64(s), LeafBuffer::I64(v)) => {
             for i in 0..n { if leaf.validity[i] { oo[i] = s.contains(&v[i]) as u8; } }

@@ -119,6 +119,17 @@ def main() -> int:
         if int(s) == -1:
             raise RuntimeError
 
+    def gr_mul_rect_scalar_via_op() -> None:
+        s = (a_gr * 2)._sum2d_i32_i64()
+        if int(s) == -1:
+            raise RuntimeError
+
+    def np_mul_rect_scalar() -> None:
+        np.multiply(a_np, 2, out=tmp)
+        s = int(tmp.sum())
+        if s == -1:
+            raise RuntimeError
+
     def np_add_ragged() -> None:
         np.add(flat_a_np, flat_b_np, out=tmp_flat)
         s = int(tmp_flat.sum())
@@ -139,6 +150,8 @@ def main() -> int:
         ("mul_rect_numpy", np_mul_rect, None),
         ("mul_rect_grumpy_kernel", None, gr_mul_rect_kernel),
         ("mul_rect_grumpy_via_op", None, gr_mul_rect_via_op),
+        ("mul_rect_scalar_numpy", np_mul_rect_scalar, None),
+        ("mul_rect_scalar_grumpy", None, gr_mul_rect_scalar_via_op),
         ("add_rect_numpy", np_add_rect, None),
         ("add_rect_grumpy_kernel", None, gr_add_rect_kernel),
         ("add_rect_grumpy_via_op", None, gr_add_rect_via_op),
@@ -167,6 +180,7 @@ def main() -> int:
     print("### Ratios (lower is better for Grumpy)")
     print(f"- mul_rect_grumpy_kernel / mul_rect_numpy: {_ratio('mul_rect_grumpy_kernel','mul_rect_numpy'):.2f}×")
     print(f"- mul_rect_grumpy_via_op / mul_rect_numpy: {_ratio('mul_rect_grumpy_via_op','mul_rect_numpy'):.2f}×")
+    print(f"- mul_rect_scalar_grumpy / mul_rect_scalar_numpy: {_ratio('mul_rect_scalar_grumpy','mul_rect_scalar_numpy'):.2f}×")
     print(f"- add_rect_grumpy_kernel / add_rect_numpy: {_ratio('add_rect_grumpy_kernel','add_rect_numpy'):.2f}×")
     print(f"- add_rect_grumpy_via_op / add_rect_numpy: {_ratio('add_rect_grumpy_via_op','add_rect_numpy'):.2f}×")
     print(f"- mul_ragged_grumpy_kernel / mul_ragged_numpy_flat: {_ratio('mul_ragged_grumpy_kernel','mul_ragged_numpy_flat'):.2f}×")

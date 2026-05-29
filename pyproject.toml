@@ -4,20 +4,33 @@ build-backend = "maturin"
 
 [project]
 name = "grumpy"
-version = "0.0.0"
+version = "0.1.0"
 description = "High-performance numerical computing on ragged data (Rust core, Python bindings)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-authors = [{ name = "Grumpy contributors" }]
+authors = [{ name = "Imaginary Biolabs GmbH" }]
 classifiers = [
+  "License :: Other/Proprietary License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Rust",
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering",
 ]
 dependencies = ["numpy>=1.23"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-cov>=4"]
+dev = [
+  "pytest>=7",
+  "pytest-cov>=4",
+  "mkdocs>=1.5",
+  "mkdocs-material>=9",
+]
+benchmark = [
+  "awkward>=2.6",
+  "numpy>=1.23",
+]
 
 [tool.maturin]
 python-source = "python"
@@ -28,3 +41,12 @@ features = ["pyo3/extension-module"]
 addopts = "-q"
 testpaths = ["tests"]
 
+[tool.coverage.run]
+source = ["grumpy"]
+omit = []
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "return snippet",
+]

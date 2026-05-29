@@ -1,0 +1,29 @@
+# Ignore dotfiles and dot-directories by default (venv, caches, IDE, OS junk).
+.*
+!.gitignore
+!.github/
+!.github/**
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+htmlcov/
+
+# Rust
+/target/
+
+# Compiled extension (built by maturin in CI / local dev)
+python/grumpy/_core*.so
+python/grumpy/_core*.pyd
+
+# Local benchmark / test dataset artifacts
+*.gr
+
+# IDE / OS (non-dot paths)
+*.swp
+
+# Docs build output
+site/

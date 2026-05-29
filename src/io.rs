@@ -190,6 +190,47 @@ pub fn load_dataframe(py: Python<'_>, path: &str) -> PyResult<GrumpyDataFrame> {
     }
 }
 
+/// Return axis-0 length from on-disk metadata and offset buffers without loading leaf data.
+pub fn stored_axis0_len(path: &str) -> PyResult<usize> {
+    let meta = read_meta(path)?;
+    let store = store_fs(path)?;
+    match meta.root {
+        RootMeta::Array { layout, .. } => axis0_len_from_layout_meta(&store, &layout),
+        RootMeta::DataFrame { columns, .. } => {
+            if columns.is_empty() {
+                return Ok(0);
+            }
+            let mut n = 0usize;
+            for c in &columns {
+                n = n.max(axis0_len_from_layout_meta(&store, &c.layout)?);
+            }
+            Ok(n)
+        }
+    }
+}
+
+fn axis0_len_from_layout_meta(
+    store: &ReadableWritableListableStorage,
+    meta: &LayoutMeta,
+) -> PyResult<usize> {
+    match meta {
+        LayoutMeta::ListOffset { offsets, .. } => {
+            let offs = read_vec::<i64>(store, offsets)?;
+            Ok(offs.len().saturating_sub(1))
+        }
+        LayoutMeta::OffsetView { start, stop, .. } => Ok(stop.saturating_sub(*start)),
+        LayoutMeta::Indexed { index, .. } => {
+            let idx = read_vec::<i64>(store, index)?;
+            Ok(idx.len())
+        }
+        LayoutMeta::Leaf { len, .. } => Ok(*len),
+        LayoutMeta::UnionScalarList { tags, .. } => {
+            let tags = read_vec::<u8>(store, tags)?;
+            Ok(tags.len())
+        }
+    }
+}
+
 fn save_layout(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, dt: DType, layout: &Layout) -> PyResult<LayoutMeta> {
     match layout {
         Layout::Leaf(leaf) => save_leaf(store, ctx, dt, leaf),

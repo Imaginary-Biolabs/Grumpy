@@ -1,107 +1,105 @@
-## Grumpy
+<p align="center">
+  <img src="docs/assets/grumpy_icon.svg" alt="Grumpy" width="72" />
+</p>
 
-Grumpy is a Python library (Rust core + Python bindings) for high-performance numerical computing on ragged/nested data.
+<h1 align="center">Grumpy</h1>
 
-### Quickstart
+<p align="center">
+  <strong>High-performance numerical computing on ragged and nested data</strong><br/>
+  Rust core · Python bindings · Zarr I/O · optional compile-time fusion
+</p>
 
-Build + install locally (Rust extension):
+<p align="center">
+  <a href="LICENSE">License BSL 1.1</a> ·
+  <a href="docs/">Documentation</a> ·
+  <a href="benchmarks/README.md">Benchmarks</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+<p align="center">
+  <!-- Replace with real badges when published to GitHub -->
+  <img src="https://img.shields.io/badge/tests-pytest-blue" alt="tests" />
+  <img src="https://img.shields.io/badge/python-%3E%3D3.10-blue" alt="python" />
+  <img src="https://img.shields.io/badge/license-BSL--1.1-lightgrey" alt="license" />
+</p>
+
+---
+
+**Grumpy** is developed by [Imaginary Biolabs](https://www.imaginary.bio) as layout-first infrastructure for biomolecular machine learning — and as a general-purpose library for **ragged**, **nested**, and **nullable** scientific arrays.
+
+It shares Awkward Array’s buffer-tree mental model, with deliberate differences: **mutable** arrays, **strong dtypes**, homogeneous leaves, explicit **validity bitmaps**, integrated **Zarr** storage, and **streaming** transforms that can fuse into Rust execution plans.
+
+## Features
+
+- **Ragged arrays** — arbitrary nesting via `ListOffset` layouts; NumPy-like ops with broadcasting
+- **DataFrames** — named columns, optional multi-level **schema**, dot-notation access
+- **I/O** — save/load Zarr stores; axis-0 **streaming** with parallel `apply`
+- **Compilation** — `@gr.compile` and `Stream.apply(compile="auto")` fuse supported transforms in Rust
+- **Neighbors** — kNN / radius graph edges for 0D and grouped 1D point clouds
+
+## Install (from source)
 
 ```bash
-python -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip
-python -m pip install maturin
+git clone https://github.com/imaginary-bio/grumpy.git
+cd grumpy
+python -m venv .venv && source .venv/bin/activate
+pip install -U pip maturin
 maturin develop --release
-python -m pip install -e '.[dev]'
+pip install -e ".[dev]"
 pytest
 ```
 
-Basic arrays:
+Published wheels are not yet on PyPI; build with [maturin](https://www.maturin.rs/) as above.
+
+## Quickstart
 
 ```python
 import grumpy as gr
 
+print(gr.__version__)
+
 x = gr.array([[1, 2, 3], [4, 5]], dtype=gr.int32)
-y = gr.array([[1, 2, 3], [[None, 5], [6]]])  # dtype inferred, supports None/nulls
+print(x.to_list())
+print(x.mean(dim=1).to_list())
 
-print(x.to_list())         # [[1, 2, 3], [4, 5]]
-print(x.to_numpy())        # numpy array if rectangular + all-valid, else object array
-print(x.shape(dim=1))      # [3, 2]
-```
-
-Strings:
-
-```python
-s = gr.array([["one", None], ["two", "three"]], dtype=gr.string)
-print(s.to_list())  # [['one', None], ['two', 'three']]
-```
-
-Elementwise ops + broadcasting:
-
-```python
-x = gr.array([[1, 2, 3], [4, 5]])
-print((x * 2).to_list())         # [[2, 4, 6], [8, 10]]
-print((x + x).to_list())         # [[2, 4, 6], [8, 10]]
-```
-
-Reductions (examples):
-
-```python
-x = gr.array([[1, 2, 3], [4, 5]])
-print(x.sum(dim=1).to_list())    # [6, 9]
-print(x.mean(dim=1).to_list())   # [2.0, 4.5]
-```
-
-DataFrames + schema + dot-notation:
-
-```python
 df = gr.dataframe(
-    {
-        "molecule_id": ["one", "two"],
-        "residue_name": [["A", "B", "C"], ["D", "E"]],
-        "atom_number": [[[1, 2], [3, 4, 5], [6]], [[7, 8], [9]]],
-    },
-    schema=["molecule", ("residue", "group"), "atom"],
+    {"id": ["a", "b"], "vals": [[1, 2], [3, 4, 5]]},
 )
-
-print(df.atom_number.to_list())          # [1,2,3,4,5,6,7,8,9]
-print(df.residue.atom_number.to_list())  # [[1,2],[3,4,5],[6],[7,8],[9]]
-
-df.residue.residue_weight = [0.5, 0.7, 0.8, 0.9, 1.0]
-print(df["residue_weight"].to_dict()["residue_weight"])  # [[0.5,0.7,0.8],[0.9,1.0]]
+gr.save(df, "data.gr")
+for batch in gr.stream("data.gr", batch_size=32):
+    batch = batch * 2  # or @gr.compile transform
 ```
 
-Saving + loading (Zarr-backed):
+## Documentation
 
-```python
-gr.save(df, "mydata.gr", chunk_size=1024)
-df2 = gr.load("mydata.gr")
-print(df2.to_dict() == df.to_dict())  # True
-```
+- [Getting started](docs/getting-started.md)
+- [Arrays](docs/arrays.md)
+- [DataFrames & schema](docs/dataframes.md)
+- [I/O & streaming](docs/io-streaming.md)
+- [Compilation](docs/compilation.md)
 
-Streaming + parallel apply (CPU threads):
+Build the site locally: `pip install -e ".[dev]" && mkdocs serve`.
 
-```python
-st = gr.stream("mydata.gr", batch_size=32, drop_last=False)
+## Benchmarks
 
-def transform(batch):
-    # do work on a batch (best if it releases the GIL, e.g. I/O or Rust-backed kernels)
-    return batch
-
-st2 = st.apply(transform, cpu=8)  # preserves order
-for batch in st2:
-    ...
-```
-
-### Local dev
-
-Install (builds the Rust extension):
+See [benchmarks/README.md](benchmarks/README.md). Quick run:
 
 ```bash
-python -m pip install -U pip
-python -m pip install maturin
-maturin develop
-python -m pip install -e '.[dev]'
-pytest
+make bench
 ```
 
+Grumpy targets NumPy-class kernel performance on hot paths; Awkward comparisons help validate ragged-layout competitiveness (construction overhead reported separately).
+
+## Development
+
+```bash
+make develop
+make coverage   # 100% on python/grumpy/
+make bench-all
+```
+
+Rust code lives in `src/`; Python bindings in `python/grumpy/`. See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).
+
+## License
+
+Business Source License 1.1 — see [LICENSE](LICENSE). Copyright Imaginary Biolabs GmbH.

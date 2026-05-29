@@ -257,6 +257,24 @@ pub fn elementwise_scalar_inplace(
     Ok(ok)
 }
 
+pub fn elementwise_with_scalar(
+    a: &GrumpyArray,
+    op: BinOp,
+    value: f64,
+    is_int: bool,
+) -> PyResult<GrumpyArray> {
+    if let Some(out) = elementwise_rect2d_scalar_fast(a, op, value, is_int)? {
+        return Ok(out);
+    }
+    let mut out = a.clone();
+    if !elementwise_scalar_inplace(&mut out, op, value, is_int)? {
+        return Err(PyValueError::new_err(
+            "Scalar elementwise operation is not supported for this layout/dtype.",
+        ));
+    }
+    Ok(out)
+}
+
 pub fn elementwise(a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyResult<GrumpyArray> {
     // Rectangular 2D fast path (ListOffset -> Leaf) for common dtypes, no nulls.
     if let Some(out) = elementwise_rect2d_fast(a, b, op)? {
@@ -1507,6 +1525,60 @@ fn rect2d_shape(layout: &Layout) -> Option<(usize, usize, &Vec<i64>)> {
     Some((nrows, first, &lo.offsets))
 }
 
+fn elementwise_rect2d_scalar_fast(
+    a: &GrumpyArray,
+    op: BinOp,
+    value: f64,
+    is_int: bool,
+) -> PyResult<Option<GrumpyArray>> {
+    if !is_int {
+        return Ok(None);
+    }
+    let (nrows, ncols, _offsets) = match rect2d_shape(&a.layout) {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    let leaf_a = match &a.layout {
+        Layout::ListOffset(lo) => match lo.content.as_ref() {
+            Layout::Leaf(l) => l,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    if leaf_a.has_nulls || a.dtype != DType::Int32 {
+        return Ok(None);
+    }
+    let s = value as i32;
+    let n = nrows * ncols;
+    let aa = match &leaf_a.buffer {
+        LeafBuffer::I32(v) => v.as_slice(),
+        _ => return Ok(None),
+    };
+    let out_vec: Vec<i32> = match op {
+        BinOp::Add => aa.iter().map(|&x| x.wrapping_add(s)).collect(),
+        BinOp::Sub => aa.iter().map(|&x| x.wrapping_sub(s)).collect(),
+        BinOp::Mul => aa.iter().map(|&x| x.wrapping_mul(s)).collect(),
+        _ => return Ok(None),
+    };
+    debug_assert_eq!(out_vec.len(), n);
+    let mut out_leaf = Leaf::new(DType::Int32);
+    out_leaf.len = n;
+    out_leaf.has_nulls = false;
+    out_leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    out_leaf.buffer = LeafBuffer::I32(Arc::new(out_vec));
+    let out_layout = Layout::ListOffset(ListOffset {
+        offsets: match &a.layout {
+            Layout::ListOffset(lo) => lo.offsets.clone(),
+            _ => unreachable!(),
+        },
+        content: Box::new(Layout::Leaf(out_leaf)),
+    });
+    Ok(Some(GrumpyArray {
+        dtype: DType::Int32,
+        layout: out_layout,
+    }))
+}
+
 fn elementwise_rect2d_fast(a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyResult<Option<GrumpyArray>> {
     let (nrows, ncols, offsets_a) = match rect2d_shape(&a.layout) {
         Some(x) => x,
@@ -1570,17 +1642,29 @@ fn elementwise_rect2d_fast(a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyRes
 
     // Tight contiguous loops (LLVM auto-vectorizes these).
     match (a.dtype, &leaf_a.buffer, &leaf_b.buffer, &mut out_leaf.buffer, op) {
+        (DType::Int32, LeafBuffer::I32(aa), LeafBuffer::I32(bb), LeafBuffer::I32(oo), BinOp::Mul) => {
+            let out_vec: Vec<i32> = aa
+                .iter()
+                .zip(bb.iter())
+                .map(|(&a, &b)| a.wrapping_mul(b))
+                .collect();
+            out_leaf.buffer = LeafBuffer::I32(Arc::new(out_vec));
+        }
         (DType::Int32, LeafBuffer::I32(aa), LeafBuffer::I32(bb), LeafBuffer::I32(oo), BinOp::Add) => {
-            let oo = Arc::make_mut(oo);
-            for i in 0..n { oo[i] = aa[i].wrapping_add(bb[i]); }
+            let out_vec: Vec<i32> = aa
+                .iter()
+                .zip(bb.iter())
+                .map(|(&a, &b)| a.wrapping_add(b))
+                .collect();
+            out_leaf.buffer = LeafBuffer::I32(Arc::new(out_vec));
         }
         (DType::Int32, LeafBuffer::I32(aa), LeafBuffer::I32(bb), LeafBuffer::I32(oo), BinOp::Sub) => {
-            let oo = Arc::make_mut(oo);
-            for i in 0..n { oo[i] = aa[i].wrapping_sub(bb[i]); }
-        }
-        (DType::Int32, LeafBuffer::I32(aa), LeafBuffer::I32(bb), LeafBuffer::I32(oo), BinOp::Mul) => {
-            let oo = Arc::make_mut(oo);
-            for i in 0..n { oo[i] = aa[i].wrapping_mul(bb[i]); }
+            let out_vec: Vec<i32> = aa
+                .iter()
+                .zip(bb.iter())
+                .map(|(&a, &b)| a.wrapping_sub(b))
+                .collect();
+            out_leaf.buffer = LeafBuffer::I32(Arc::new(out_vec));
         }
         (DType::Int64, LeafBuffer::I64(aa), LeafBuffer::I64(bb), LeafBuffer::I64(oo), BinOp::Add) => {
             let oo = Arc::make_mut(oo);

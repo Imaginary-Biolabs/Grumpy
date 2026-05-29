@@ -1,3 +1,16 @@
+"""Compile restricted batch transforms into fused Rust execution plans.
+
+The compiler analyzes straight-line Python functions (typically ``def f(batch): ...``)
+and builds :class:`~grumpy._core.CompiledPlan` opcode lists for use with
+:meth:`~grumpy.stream.Stream.apply` or the :func:`compile` decorator.
+
+Known limitations
+-----------------
+- No control flow (``if``/``for``/``try``), no imports, single ``batch`` parameter.
+- ``UnionScalarList`` layouts are not compilable.
+- Rust scheduling supports only a fixed opcode set (see ``stream.py``).
+"""
+
 from __future__ import annotations
 
 import ast
@@ -436,12 +449,17 @@ def _get_source(fn: Callable[..., Any]) -> Optional[str]:
         except SyntaxError:
             continue
         for node in mod.body:
-            if isinstance(node, ast.FunctionDef) and node.name == getattr(fn, "__name__", ""):
-                # If end_lineno exists, trim exactly.
-                if getattr(node, "end_lineno", None):
-                    rel_end = int(node.end_lineno)
-                    return "".join(buf[:rel_end])
-                return snippet
+            if not (
+                isinstance(node, ast.FunctionDef)
+                and node.name == getattr(fn, "__name__", "")
+                and getattr(node, "end_lineno", None)
+            ):
+                continue
+            rel_end = int(node.end_lineno)  # type: ignore[arg-type]
+            chunk = "".join(buf[:rel_end])
+            # Avoid returning a partial function body before the final `return`.
+            if "return" in chunk:
+                return chunk
     return None
 
 

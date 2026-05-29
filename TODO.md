@@ -1,5 +1,0 @@
-- license
-- cuda
-- integrate with fabric
-- github/pypi
-- docs

@@ -18,7 +18,7 @@ use crate::dtype::{infer_dtype, inferclass_to_dtype, DType, PyDType};
 use crate::layout::{
     build_array, concat_to_py_list, coord_to_leaf_index, drop_axis0_select_element, fill_layout_like,
     gather_2d_fancy_leaf, gather_2d_fancy_sum_i64, scatter_2d_fancy_i32, scatter_2d_fancy_numeric,
-    GrumpyArray, Layout, OffsetView,
+    GrumpyArray, Layout, LeafBuffer, OffsetView,
 };
 use crate::ops::{self, BinOp};
 use crate::reduce::{self, ReduceOp, ReduceOutput};
@@ -39,7 +39,7 @@ use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
-use pyo3::types::{PyAnyMethods, PySlice, PyTuple};
+use pyo3::types::{PyAnyMethods, PyBool, PyFloat, PyInt, PySlice, PyTuple};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
@@ -733,9 +733,9 @@ impl PyGrumpyArray {
     }
 
     fn copy(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
+        let mut inner = self.inner.clone();
+        inner.uniquify_buffers();
+        Self { inner }
     }
 
     fn sum(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
@@ -1313,45 +1313,31 @@ impl PyGrumpyArray {
     }
 
     fn __add__(&self, py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<Self> {
-        let rhs = coerce_to_array(py, &other, self.inner.dtype)?;
-        let out = ops::elementwise(&self.inner, &rhs, BinOp::Add)?;
-        Ok(Self { inner: out })
+        apply_elementwise_binop(py, &self.inner, &other, BinOp::Add).map(|inner| Self { inner })
     }
 
     fn __sub__(&self, py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<Self> {
-        let rhs = coerce_to_array(py, &other, self.inner.dtype)?;
-        let out = ops::elementwise(&self.inner, &rhs, BinOp::Sub)?;
-        Ok(Self { inner: out })
+        apply_elementwise_binop(py, &self.inner, &other, BinOp::Sub).map(|inner| Self { inner })
     }
 
     fn __mul__(&self, py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<Self> {
-        let rhs = coerce_to_array(py, &other, self.inner.dtype)?;
-        let out = ops::elementwise(&self.inner, &rhs, BinOp::Mul)?;
-        Ok(Self { inner: out })
+        apply_elementwise_binop(py, &self.inner, &other, BinOp::Mul).map(|inner| Self { inner })
     }
 
     fn __truediv__(&self, py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<Self> {
-        let rhs = coerce_to_array(py, &other, self.inner.dtype)?;
-        let out = ops::elementwise(&self.inner, &rhs, BinOp::Div)?;
-        Ok(Self { inner: out })
+        apply_elementwise_binop(py, &self.inner, &other, BinOp::Div).map(|inner| Self { inner })
     }
 
     fn __mod__(&self, py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<Self> {
-        let rhs = coerce_to_array(py, &other, self.inner.dtype)?;
-        let out = ops::elementwise(&self.inner, &rhs, BinOp::Mod)?;
-        Ok(Self { inner: out })
+        apply_elementwise_binop(py, &self.inner, &other, BinOp::Mod).map(|inner| Self { inner })
     }
 
     fn remainder(&self, py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<Self> {
-        let rhs = coerce_to_array(py, &other, self.inner.dtype)?;
-        let out = ops::elementwise(&self.inner, &rhs, BinOp::Remainder)?;
-        Ok(Self { inner: out })
+        apply_elementwise_binop(py, &self.inner, &other, BinOp::Remainder).map(|inner| Self { inner })
     }
 
     fn mod_(&self, py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<Self> {
-        let rhs = coerce_to_array(py, &other, self.inner.dtype)?;
-        let out = ops::elementwise(&self.inner, &rhs, BinOp::Mod)?;
-        Ok(Self { inner: out })
+        apply_elementwise_binop(py, &self.inner, &other, BinOp::Mod).map(|inner| Self { inner })
     }
 }
 
@@ -1362,6 +1348,42 @@ fn coerce_to_array(py: Python<'_>, obj: &Bound<'_, PyAny>, dtype_hint: DType) ->
     // Scalars / python lists: build GrumpyArray with the dtype of lhs.
     // This enables scalar broadcasting like x * 2.
     build_array(py, obj, dtype_hint)
+}
+
+fn try_extract_broadcast_scalar(obj: &Bound<'_, PyAny>, dtype: DType) -> Option<(f64, bool)> {
+    if obj.is_none() {
+        return None;
+    }
+    if obj.is_instance_of::<PyBool>() {
+        let v = obj.extract::<bool>().ok()?;
+        return Some((if v { 1.0 } else { 0.0 }, true));
+    }
+    if obj.is_instance_of::<PyInt>() {
+        let v = obj.extract::<i64>().ok()? as f64;
+        return Some((v, true));
+    }
+    if obj.is_instance_of::<PyFloat>() {
+        let v = obj.extract::<f64>().ok()?;
+        return Some((v, false));
+    }
+    let _ = dtype;
+    None
+}
+
+fn apply_elementwise_binop(
+    py: Python<'_>,
+    lhs: &GrumpyArray,
+    other: &Bound<'_, PyAny>,
+    op: BinOp,
+) -> PyResult<GrumpyArray> {
+    if let Ok(rhs) = other.extract::<PyRef<'_, PyGrumpyArray>>() {
+        return ops::elementwise(lhs, &rhs.inner, op);
+    }
+    if let Some((value, is_int)) = try_extract_broadcast_scalar(other, lhs.dtype) {
+        return ops::elementwise_with_scalar(lhs, op, value, is_int);
+    }
+    let rhs = coerce_to_array(py, other, lhs.dtype)?;
+    ops::elementwise(lhs, &rhs, op)
 }
 
 #[pymethods]
@@ -2177,6 +2199,32 @@ fn fast_getitem(py: Python<'_>, arr: &GrumpyArray, index: &Bound<'_, PyAny>) -> 
 
     // Coordinate tuple indexing
     if let Ok(tup) = index.downcast::<PyTuple>() {
+        // Hot path: x[int, int] on 2D int32 arrays (skip fancy-index probes).
+        if tup.len() == 2 {
+            let a0 = tup.get_item(0)?;
+            let a1 = tup.get_item(1)?;
+            if a0.is_instance_of::<PyInt>() && a1.is_instance_of::<PyInt>() {
+                if let (Ok(r), Ok(c)) = (a0.extract::<i64>(), a1.extract::<i64>()) {
+                    if arr.dtype == DType::Int32 {
+                        if let Layout::ListOffset(lo) = &arr.layout {
+                            if let Layout::Leaf(leaf) = lo.content.as_ref() {
+                                if !leaf.has_nulls {
+                                    if let LeafBuffer::I32(buf) = &leaf.buffer {
+                                        let leaf_ix = coord_to_leaf_index(&arr.layout, &[r, c])?;
+                                        return Ok(Some((buf[leaf_ix] as i64).into_py(py)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let leaf_ix = coord_to_leaf_index(&arr.layout, &[r, c])?;
+                    let leaf = find_leaf_fast(&arr.layout)?;
+                    let out = leaf.scalar_to_py(py, leaf_ix)?;
+                    return Ok(Some(out));
+                }
+            }
+        }
+
         // Fancy coordinate indexing if any part is sequence-like (and no slices).
         let mut has_seq = false;
         let mut has_slice = false;
@@ -2190,6 +2238,30 @@ fn fast_getitem(py: Python<'_>, arr: &GrumpyArray, index: &Bound<'_, PyAny>) -> 
         }
         if has_slice {
             return Ok(None);
+        }
+        if tup.len() == 2 && !has_seq {
+            let a0 = tup.get_item(0)?;
+            let a1 = tup.get_item(1)?;
+            if a0.downcast::<PySlice>().is_err() && a1.downcast::<PySlice>().is_err() {
+                if let (Ok(r), Ok(c)) = (a0.extract::<i64>(), a1.extract::<i64>()) {
+                    if arr.dtype == DType::Int32 {
+                        if let Layout::ListOffset(lo) = &arr.layout {
+                            if let Layout::Leaf(leaf) = lo.content.as_ref() {
+                                if !leaf.has_nulls {
+                                    if let LeafBuffer::I32(buf) = &leaf.buffer {
+                                        let leaf_ix = coord_to_leaf_index(&arr.layout, &[r, c])?;
+                                        return Ok(Some((buf[leaf_ix] as i64).into_py(py)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let leaf_ix = coord_to_leaf_index(&arr.layout, &[r, c])?;
+                    let leaf = find_leaf_fast(&arr.layout)?;
+                    let out = leaf.scalar_to_py(py, leaf_ix)?;
+                    return Ok(Some(out));
+                }
+            }
         }
         if has_seq {
             // Support 2D fancy: (rows, cols) with optional scalar broadcast.
@@ -2354,6 +2426,40 @@ fn fast_setitem(
         if tup.len() == 0 {
             return Ok(false);
         }
+
+        // Hot path: x[int, int] = int on 2D int32 arrays (skip fancy-index probes).
+        if tup.len() == 2 {
+            let a0 = tup.get_item(0)?;
+            let a1 = tup.get_item(1)?;
+            if a0.is_instance_of::<PyInt>() && a1.is_instance_of::<PyInt>() {
+                if let (Ok(r), Ok(c)) = (a0.extract::<i64>(), a1.extract::<i64>()) {
+                    if arr.dtype == DType::Int32 {
+                        if let Ok(v) = value.extract::<i32>() {
+                            let leaf_ix = coord_to_leaf_index(&arr.layout, &[r, c])?;
+                            if let Layout::ListOffset(lo) = &mut arr.layout {
+                                if let Layout::Leaf(leaf) = lo.content.as_mut() {
+                                    if !leaf.has_nulls {
+                                        if let LeafBuffer::I32(buf) = &mut leaf.buffer {
+                                            Arc::make_mut(buf)[leaf_ix] = v;
+                                            return Ok(true);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let leaf_ix = coord_to_leaf_index(&arr.layout, &[r, c])?;
+                    let leaf = find_leaf_mut_fast(&mut arr.layout)?;
+                    if arr.dtype == DType::Int32 {
+                        if let Ok(v) = value.extract::<i32>() {
+                            leaf.set_i32(leaf_ix, v)?;
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut has_seq = false;
         let mut has_slice = false;
         for i in 0..tup.len() {
@@ -2424,6 +2530,26 @@ fn fast_setitem(
         }
 
         // Pure scalar coordinate assignment (2D+ supported if it ends in leaf)
+        if tup.len() == 2 {
+            let a0 = tup.get_item(0)?;
+            let a1 = tup.get_item(1)?;
+            if a0.downcast::<PySlice>().is_err()
+                && a1.downcast::<PySlice>().is_err()
+                && !is_index_vec_like(py, &a0)?
+                && !is_index_vec_like(py, &a1)?
+            {
+                if let (Ok(r), Ok(c)) = (a0.extract::<i64>(), a1.extract::<i64>()) {
+                    let leaf_ix = coord_to_leaf_index(&arr.layout, &[r, c])?;
+                    let leaf = find_leaf_mut_fast(&mut arr.layout)?;
+                    if arr.dtype == DType::Int32 {
+                        if let Ok(v) = value.extract::<i32>() {
+                            leaf.set_i32(leaf_ix, v)?;
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
         let mut coords: Vec<i64> = Vec::with_capacity(tup.len());
         for i in 0..tup.len() {
             coords.push(tup.get_item(i)?.extract::<i64>()?);
@@ -3136,7 +3262,9 @@ pub fn unique(py: Python<'_>, x: PyRef<'_, PyGrumpyArray>) -> PyResult<PyGrumpyA
 
 #[pyfunction]
 pub fn isin(py: Python<'_>, x: PyRef<'_, PyGrumpyArray>, test_elements: PyRef<'_, PyGrumpyArray>) -> PyResult<PyGrumpyArray> {
-    let out = set_ops::isin(py, &x.inner, &test_elements.inner)?;
+    let a = x.inner.clone();
+    let test = test_elements.inner.clone();
+    let out = py.allow_threads(|| set_ops::isin(&a, &test))?;
     Ok(PyGrumpyArray { inner: out })
 }
 
@@ -3413,8 +3541,26 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dataframe, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add_function(wrap_pyfunction!(stored_len, m)?)?;
+    m.add_function(wrap_pyfunction!(load_slice, m)?)?;
     m.add_function(wrap_pyfunction!(compiled_stream_apply, m)?)?;
     Ok(())
+}
+
+#[pyfunction]
+fn stored_len(path: String) -> PyResult<usize> {
+    io_ops::stored_axis0_len(&path)
+}
+
+#[pyfunction]
+fn load_slice(py: Python<'_>, path: String, start: usize, stop: usize) -> PyResult<PyObject> {
+    if let Ok(arr) = io_ops::load_array(py, &path) {
+        let sliced = slice_axis0_view(&arr, start, stop)?;
+        return Ok(Py::new(py, PyGrumpyArray { inner: sliced })?.into_py(py));
+    }
+    let df = io_ops::load_dataframe(py, &path)?;
+    let sliced = df_slice_axis0_view(&df, start, stop)?;
+    Ok(Py::new(py, PyGrumpyDataFrame { inner: sliced })?.into_py(py))
 }
 
 #[pyfunction]

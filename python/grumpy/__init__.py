@@ -1,4 +1,18 @@
+"""Grumpy: high-performance numerical computing on ragged and nested data.
+
+Grumpy provides Awkward-like layout semantics with strong typing, explicit nullability,
+mutable arrays, Zarr-backed I/O, and optional compilation of streaming transforms.
+
+Known limitations
+-----------------
+- ``UnionScalarList`` layouts are not supported for most ops (use pure list-chains).
+- Streaming is axis-0 batching only; advanced dataloader features are planned.
+- ``gr.compile`` accepts a restricted subset of Python (see :func:`compile`).
+"""
+
 from __future__ import annotations
+
+from ._version import __version__
 
 from ._core import (
     DType,
@@ -36,7 +50,10 @@ from ._core import (
     load as _load,
 )
 
+from . import compiler as _compiler_mod
 from .stream import Stream, StreamApply
+
+compile = _compiler_mod.compile
 
 # Public dtype singletons (match the API examples).
 int8 = DType.int8()
@@ -321,6 +338,8 @@ def angle(x: GrumpyArray) -> GrumpyArray:
 
 
 __all__ = [
+    "__version__",
+    "compile",
     "GrumpyArray",
     "DType",
     "array",

@@ -1,3 +1,19 @@
+"""Streaming iterators and parallel batch transforms for saved Grumpy datasets.
+
+This module provides :class:`Stream` and :class:`StreamApply` for axis-0 batching
+over Zarr-backed stores written by :func:`grumpy.save`.
+
+Known limitations
+-----------------
+- Batching is axis-0 only; ``batch_on``, shuffle, DDP sharding, and random access
+  indexing are not implemented yet.
+- :meth:`Stream.__iter__` loads one batch at a time via ``load_slice`` (not the full
+  dataset in memory), but ``load_slice`` still reads the on-disk layout tree for
+  each batch. True chunked I/O without traversing parent layouts is future work.
+- ``UnionScalarList`` layouts are not supported for streaming slice loads.
+- Compiled Rust scheduling supports a restricted opcode set (see ``compiler.py``).
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -16,11 +32,22 @@ def _ceil_div(a: int, b: int) -> int:
 @dataclass(frozen=True)
 class Stream:
     """
-    Minimal streaming iterator over a saved GrumpyArray / GrumpyDataFrame.
+    Iterator over batches of a saved :class:`~grumpy.GrumpyArray` or dataframe.
 
-    Notes:
-    - This currently slices along axis-0 only.
-    - This is a correctness-first implementation; it loads the dataset once per iterator.
+    Parameters
+    ----------
+    path:
+        Path passed to :func:`grumpy.save` (Zarr directory store).
+    batch_size:
+        Maximum number of axis-0 elements per yielded batch.
+    drop_last:
+        If ``True``, drop the final partial batch when ``len(data) % batch_size != 0``.
+
+    Notes
+    -----
+    ``__len__`` uses on-disk metadata (``stored_len``) without loading leaf buffers.
+    Each batch is loaded with ``load_slice`` so repeated iteration does not keep the
+    full dataset in memory; per-batch I/O still depends on the stored layout.
     """
 
     path: str
@@ -32,23 +59,21 @@ class Stream:
             raise ValueError("batch_size must be > 0")
 
     def __len__(self) -> int:
-        from ._core import load as _load
+        from ._core import stored_len
 
-        obj = _load(self.path)
-        n = len(obj)
+        n = stored_len(self.path)
         if self.drop_last:
             return n // self.batch_size
         return _ceil_div(n, self.batch_size)
 
     def __iter__(self) -> Iterator:
-        from ._core import load as _load
+        from ._core import load_slice, stored_len
 
-        obj = _load(self.path)
-        n = len(obj)
+        n = stored_len(self.path)
         bs = self.batch_size
         end = n - (n % bs) if (self.drop_last and n % bs != 0) else n
         for i in range(0, end, bs):
-            yield obj[i : i + bs]
+            yield load_slice(self.path, i, min(i + bs, end))
 
     def apply(
         self,
@@ -58,6 +83,22 @@ class Stream:
         compile: Union[bool, str] = "auto",
         scheduler: str = "auto",
     ) -> "StreamApply[T]":
+        """
+        Apply one or more batch transforms, optionally compiled and parallelized.
+
+        Parameters
+        ----------
+        fns:
+            Callable or sequence of callables ``fn(batch) -> batch``.
+        cpu:
+            Worker count for parallel apply (``1`` = serial).
+        prefetch:
+            Max in-flight batches for threaded scheduling (default ``2 * cpu``).
+        compile:
+            ``True``/``'force'``, ``False``/``'never'``, or ``'auto'`` (compile when possible).
+        scheduler:
+            ``'auto'``, ``'python'`` (thread pool), or ``'rust'`` (Rayon for fully compiled ops).
+        """
         if cpu < 1:
             raise ValueError("cpu must be >= 1")
         if callable(fns):
@@ -71,6 +112,8 @@ class Stream:
 
 @dataclass(frozen=True)
 class StreamApply(Iterable[T]):
+    """Lazy iterable of transformed batches produced from a :class:`Stream`."""
+
     base: Stream
     fns: list[Callable[[T], T]]
     cpu: int = 1
@@ -98,9 +141,9 @@ class StreamApply(Iterable[T]):
             from .compiler import compile_pipeline_info
 
             pipeline_info = compile_pipeline_info(self.fns)
-            if compile_mode == "auto" and (not pipeline_info.run_all):
+            if compile_mode == "auto" and (not pipeline_info.fully_compiled):
                 pipeline_info = None
-            run_all = pipeline_info.run_all
+            run_all = pipeline_info.run_all if pipeline_info is not None else None
         if run_all is None:
             def run_all(x: T) -> T:
                 for fn in self.fns:
@@ -186,5 +229,3 @@ class StreamApply(Iterable[T]):
                 except StopIteration:
                     continue
                 futures.append(ex.submit(run_all, b))
-
-

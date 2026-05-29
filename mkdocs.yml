@@ -1,0 +1,28 @@
+site_name: Grumpy
+site_description: High-performance numerical computing on ragged data
+repo_url: https://github.com/imaginary-bio/grumpy
+repo_name: imaginary-bio/grumpy
+
+theme:
+  name: material
+  logo: assets/grumpy_icon.svg
+  favicon: assets/grumpy_icon.svg
+  palette:
+    - scheme: default
+      primary: custom
+      accent: custom
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Arrays: arrays.md
+  - DataFrames & schema: dataframes.md
+  - I/O & streaming: io-streaming.md
+  - Compilation & parallel apply: compilation.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - toc:
+      permalink: true

@@ -1,9 +1,11 @@
 use crate::dtype::{is_sequence_like, DType};
 use bitvec::prelude::*;
 use half::f16;
+use numpy::PyUntypedArrayMethods;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyFloat, PyInt, PySequence};
+use pyo3::types::{PyBool, PyFloat, PyInt, PyList, PySequence};
+use pyo3::types::PyListMethods;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -52,6 +54,25 @@ impl Layout {
 
     pub fn is_pure_list_chain(&self) -> bool {
         !self.has_union()
+    }
+
+    pub fn uniquify_buffers(&mut self) {
+        match self {
+            Layout::Leaf(l) => l.uniquify_buffers(),
+            Layout::ListOffset(lo) => {
+                Arc::make_mut(&mut lo.offsets);
+                lo.content.uniquify_buffers();
+            }
+            Layout::Indexed(ix) => {
+                Arc::make_mut(&mut ix.index);
+                ix.content.uniquify_buffers();
+            }
+            Layout::OffsetView(v) => {
+                Arc::make_mut(&mut v.offsets);
+                v.content.uniquify_buffers();
+            }
+            Layout::UnionScalarList(u) => u.uniquify_buffers(),
+        }
     }
 }
 
@@ -430,6 +451,68 @@ impl Leaf {
         self.buffer.set_from_bytes(idx, bytes, self.dtype)?;
         Ok(())
     }
+
+    pub fn set_i32(&mut self, idx: usize, value: i32) -> PyResult<()> {
+        if idx >= self.len {
+            return Err(PyValueError::new_err("Index out of bounds."));
+        }
+        if self.dtype != DType::Int32 {
+            return Err(PyValueError::new_err("Internal error: set_i32 requires dtype=int32."));
+        }
+        match &mut self.buffer {
+            LeafBuffer::I32(v) => Arc::make_mut(v)[idx] = value,
+            _ => return Err(PyValueError::new_err("Internal error: dtype mismatch.")),
+        }
+        Ok(())
+    }
+
+    pub fn uniquify_buffers(&mut self) {
+        Arc::make_mut(&mut self.validity);
+        match &mut self.buffer {
+            LeafBuffer::I8(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::I16(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::I32(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::I64(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::U8(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::U16(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::U32(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::U64(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::F16(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::F32(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::F64(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::Bool(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::Char(v) => {
+                Arc::make_mut(v);
+            }
+            LeafBuffer::String(v) => {
+                Arc::make_mut(v);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -519,6 +602,12 @@ impl UnionScalarList {
         }
         Ok(c)
     }
+
+    pub fn uniquify_buffers(&mut self) {
+        self.scalars.uniquify_buffers();
+        Arc::make_mut(&mut self.lists.offsets);
+        self.lists.content.uniquify_buffers();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -542,6 +631,9 @@ impl GrumpyArray {
 }
 
 pub fn build_array(py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType) -> PyResult<GrumpyArray> {
+    if let Some(layout) = try_build_from_numpy(py, obj, dtype)? {
+        return Ok(GrumpyArray { dtype, layout });
+    }
     let layout = build_layout(py, obj, dtype)?;
     Ok(GrumpyArray { dtype, layout })
 }
@@ -549,6 +641,11 @@ pub fn build_array(py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType) -> PyRe
 impl GrumpyArray {
     pub fn is_pure_list_chain(&self) -> bool {
         self.layout.is_pure_list_chain()
+    }
+
+    /// Eagerly detach shared Arc buffers so subsequent in-place writes avoid copy-on-write.
+    pub fn uniquify_buffers(&mut self) {
+        self.layout.uniquify_buffers();
     }
 }
 
@@ -701,7 +798,20 @@ fn take_leaf_indices(l: &Leaf, indices: &[usize]) -> PyResult<Leaf> {
 }
 
 pub fn coord_to_leaf_index(layout: &Layout, coords: &[i64]) -> PyResult<usize> {
-    // Fast path only for pure list chains (ListOffset* -> Leaf).
+    // Fast path: 2D list-chain (ListOffset -> Leaf), coords [row, col].
+    if coords.len() == 2 {
+        if let Layout::ListOffset(lo) = layout {
+            if let Layout::Leaf(_) = lo.content.as_ref() {
+                let row = normalize_index(coords[0], lo.len() as i64)?;
+                let start = lo.offsets[row] as usize;
+                let end = lo.offsets[row + 1] as usize;
+                let col = normalize_index(coords[1], (end - start) as i64)?;
+                return Ok(start + col);
+            }
+        }
+    }
+
+    // General path for pure list chains (ListOffset* -> Leaf).
     let mut list_offsets: Vec<&ListOffset> = Vec::new();
     let mut cur = layout;
     loop {
@@ -1060,6 +1170,7 @@ pub fn scatter_2d_fancy_i32(
         _ => return Err(PyValueError::new_err("Expected list array.")),
     };
     let nrows = lo.len() as i64;
+    let offsets = lo.offsets.as_slice();
     let leaf = match lo.content.as_mut() {
         Layout::Leaf(l) => l,
         _ => return Err(PyValueError::new_err("Expected leaf at depth 2.")),
@@ -1070,6 +1181,10 @@ pub fn scatter_2d_fancy_i32(
     if rows.len() != cols.len() || rows.len() != values.len() {
         return Err(PyValueError::new_err("Index/value length mismatch."));
     }
+    let v = match &mut leaf.buffer {
+        LeafBuffer::I32(buf) => Arc::make_mut(buf),
+        _ => return Err(PyValueError::new_err("Internal error: expected int32 buffer.")),
+    };
     for k in 0..rows.len() {
         let mut r = rows[k];
         if r < 0 {
@@ -1078,8 +1193,8 @@ pub fn scatter_2d_fancy_i32(
         if r < 0 || r >= nrows {
             return Err(PyValueError::new_err("Index out of bounds."));
         }
-        let start = lo.offsets[r as usize] as usize;
-        let end = lo.offsets[r as usize + 1] as usize;
+        let start = offsets[r as usize] as usize;
+        let end = offsets[r as usize + 1] as usize;
         let mut c = cols[k];
         let len = (end - start) as i64;
         if c < 0 {
@@ -1089,11 +1204,7 @@ pub fn scatter_2d_fancy_i32(
             return Err(PyValueError::new_err("Index out of bounds."));
         }
         let ix = start + c as usize;
-        Arc::make_mut(&mut leaf.validity).set(ix, true);
-        match &mut leaf.buffer {
-            LeafBuffer::I32(v) => Arc::make_mut(v)[ix] = values[k],
-            _ => return Err(PyValueError::new_err("Internal error: expected int32 buffer.")),
-        }
+        v[ix] = values[k];
     }
     Ok(())
 }
@@ -1217,8 +1328,255 @@ fn concat_py_any(py: Python<'_>, a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>, dim
     Ok(out.into())
 }
 
+#[inline]
+unsafe fn extract_pyint_i32(ob: *mut pyo3::ffi::PyObject) -> Option<i32> {
+    if pyo3::ffi::PyLong_Check(ob) == 0 {
+        return None;
+    }
+    let err_before = pyo3::ffi::PyErr_Occurred();
+    let v = pyo3::ffi::PyLong_AsLong(ob);
+    if v == -1 {
+        let err_after = pyo3::ffi::PyErr_Occurred();
+        if !err_after.is_null() {
+            if err_before.is_null() {
+                pyo3::ffi::PyErr_Clear();
+            }
+            return None;
+        }
+    }
+    if v < i32::MIN as i64 || v > i32::MAX as i64 {
+        return None;
+    }
+    Some(v as i32)
+}
+
+fn try_build_leaf_i32_from_pylist_fast(list: &Bound<'_, PyList>) -> PyResult<Option<Leaf>> {
+    let n = list.len();
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(n);
+    for i in 0..n {
+        let item = match list.get_item(i) {
+            Ok(x) => x,
+            Err(_) => return Ok(None),
+        };
+        let Some(v) = (unsafe { extract_pyint_i32(item.as_ptr()) }) else {
+            return Ok(None);
+        };
+        values.push(v);
+    }
+    let mut leaf = Leaf::new(DType::Int32);
+    leaf.len = values.len();
+    leaf.has_nulls = false;
+    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; values.len()]);
+    leaf.buffer = LeafBuffer::I32(Arc::new(values));
+    Ok(Some(leaf))
+}
+
+fn try_build_rect2d_listoffset_i32_fast(list: &Bound<'_, PyList>) -> PyResult<Option<ListOffset>> {
+    let nrows = list.len();
+    if nrows == 0 {
+        return Ok(None);
+    }
+    let row0 = match list.get_item(0) {
+        Ok(x) => x,
+        Err(_) => return Ok(None),
+    };
+    let row0_list = match row0.downcast::<PyList>() {
+        Ok(x) => x,
+        Err(_) => return Ok(None),
+    };
+    let ncols = row0_list.len();
+    if ncols == 0 {
+        return Ok(None);
+    }
+
+    let mut offsets = Vec::with_capacity(nrows + 1);
+    offsets.push(0);
+    let mut values = Vec::with_capacity(nrows * ncols);
+
+    for i in 0..nrows {
+        let row = match list.get_item(i) {
+            Ok(x) => x,
+            Err(_) => return Ok(None),
+        };
+        let row_list = match row.downcast::<PyList>() {
+            Ok(x) => x,
+            Err(_) => return Ok(None),
+        };
+        if row_list.len() != ncols {
+            return Ok(None);
+        }
+        for j in 0..ncols {
+            let item = match row_list.get_item(j) {
+                Ok(x) => x,
+                Err(_) => return Ok(None),
+            };
+            let Some(v) = (unsafe { extract_pyint_i32(item.as_ptr()) }) else {
+                return Ok(None);
+            };
+            values.push(v);
+        }
+        offsets.push(offsets[i] + ncols as i64);
+    }
+
+    let n = values.len();
+    let mut leaf = Leaf::new(DType::Int32);
+    leaf.len = n;
+    leaf.has_nulls = false;
+    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    leaf.buffer = LeafBuffer::I32(Arc::new(values));
+
+    Ok(Some(ListOffset {
+        offsets: Arc::new(offsets),
+        content: Box::new(Layout::Leaf(leaf)),
+    }))
+}
+
+fn try_build_from_numpy(_py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType) -> PyResult<Option<Layout>> {
+    if dtype != DType::Int32 {
+        return Ok(None);
+    }
+    if let Ok(arr) = obj.extract::<numpy::PyReadonlyArray2<'_, i32>>() {
+        let shape = arr.shape();
+        if shape.len() != 2 {
+            return Ok(None);
+        }
+        let nrows = shape[0];
+        let ncols = shape[1];
+        if ncols == 0 {
+            return Ok(None);
+        }
+        let slice = arr.as_slice()?;
+        let mut offsets = Vec::with_capacity(nrows + 1);
+        offsets.push(0);
+        for r in 0..nrows {
+            offsets.push(offsets[r] + ncols as i64);
+        }
+        let n = nrows * ncols;
+        let mut leaf = Leaf::new(DType::Int32);
+        leaf.len = n;
+        leaf.has_nulls = false;
+        leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+        leaf.buffer = LeafBuffer::I32(Arc::new(slice.to_vec()));
+        return Ok(Some(Layout::ListOffset(ListOffset {
+            offsets: Arc::new(offsets),
+            content: Box::new(Layout::Leaf(leaf)),
+        })));
+    }
+    if let Ok(arr) = obj.extract::<numpy::PyReadonlyArray1<'_, i32>>() {
+        let n = arr.len();
+        let slice = arr.as_slice()?;
+        let mut leaf = Leaf::new(DType::Int32);
+        leaf.len = n;
+        leaf.has_nulls = false;
+        leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+        leaf.buffer = LeafBuffer::I32(Arc::new(slice.to_vec()));
+        return Ok(Some(Layout::Leaf(leaf)));
+    }
+    Ok(None)
+}
+
+fn try_build_leaf_i32_from_pylist(_py: Python<'_>, seq: &Bound<'_, PySequence>) -> PyResult<Option<Leaf>> {
+    if let Ok(list) = seq.downcast::<PyList>() {
+        return try_build_leaf_i32_from_pylist_fast(list);
+    }
+    let n = seq.len()?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let item = seq.get_item(i)?;
+        if item.is_none() {
+            return Ok(None);
+        }
+        match extract_int::<i32>(&item) {
+            Ok(v) => values.push(v),
+            Err(_) => return Ok(None),
+        }
+    }
+    let mut leaf = Leaf::new(DType::Int32);
+    leaf.len = values.len();
+    leaf.has_nulls = false;
+    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; values.len()]);
+    leaf.buffer = LeafBuffer::I32(Arc::new(values));
+    Ok(Some(leaf))
+}
+
+fn try_build_rect2d_listoffset_i32(_py: Python<'_>, seq: &Bound<'_, PySequence>) -> PyResult<Option<ListOffset>> {
+    if let Ok(list) = seq.downcast::<PyList>() {
+        return try_build_rect2d_listoffset_i32_fast(list);
+    }
+    let nrows = seq.len()?;
+    if nrows == 0 {
+        return Ok(None);
+    }
+    let row0 = seq.get_item(0)?;
+    let row0_seq = row0.downcast::<PySequence>().ok();
+    let ncols = row0_seq.as_ref().map(|r| r.len()).transpose()?;
+    let ncols = match ncols {
+        Some(0) | None => return Ok(None),
+        Some(n) => n as usize,
+    };
+
+    let mut offsets = Vec::with_capacity(nrows as usize + 1);
+    offsets.push(0);
+    let mut values = Vec::with_capacity(nrows as usize * ncols);
+
+    for i in 0..nrows {
+        let row = seq.get_item(i)?;
+        let row_seq = row.downcast::<PySequence>().map_err(|_| {
+            PyValueError::new_err("Internal error: expected sequence element.")
+        })?;
+        if row_seq.len()? as usize != ncols {
+            return Ok(None);
+        }
+        for j in 0..ncols {
+            let item = row_seq.get_item(j)?;
+            if item.is_none() {
+                return Ok(None);
+            }
+            match extract_int::<i32>(&item) {
+                Ok(v) => values.push(v),
+                Err(_) => return Ok(None),
+            }
+        }
+        offsets.push(offsets[i as usize] + ncols as i64);
+    }
+
+    let n = values.len();
+    let mut leaf = Leaf::new(DType::Int32);
+    leaf.len = n;
+    leaf.has_nulls = false;
+    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    leaf.buffer = LeafBuffer::I32(Arc::new(values));
+
+    Ok(Some(ListOffset {
+        offsets: Arc::new(offsets),
+        content: Box::new(Layout::Leaf(leaf)),
+    }))
+}
+
 fn build_layout(py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType) -> PyResult<Layout> {
     if is_sequence_like(py, obj)? {
+        // Fast path: rectangular nested Python lists of ints (int32) without per-element type probes.
+        if dtype == DType::Int32 {
+            if let Ok(list) = obj.downcast::<PyList>() {
+                if list.len() > 0 {
+                    let row0 = list.get_item(0)?;
+                    if row0.downcast::<PyList>().is_ok() {
+                        if let Some(lo) = try_build_rect2d_listoffset_i32_fast(list)? {
+                            return Ok(Layout::ListOffset(lo));
+                        }
+                    } else if let Some(leaf) = try_build_leaf_i32_from_pylist_fast(list)? {
+                        return Ok(Layout::Leaf(leaf));
+                    }
+                }
+            }
+        }
+
         let seq = obj.downcast::<PySequence>()?;
         let n = seq.len()?;
         if n == 0 {
@@ -1233,9 +1591,19 @@ fn build_layout(py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType) -> PyResul
         }
 
         if flags.iter().all(|b| !*b) {
+            if dtype == DType::Int32 {
+                if let Some(leaf) = try_build_leaf_i32_from_pylist(py, seq)? {
+                    return Ok(Layout::Leaf(leaf));
+                }
+            }
             return Ok(Layout::Leaf(build_leaf_from_scalars(py, seq, dtype)?));
         }
         if flags.iter().all(|b| *b) {
+            if dtype == DType::Int32 {
+                if let Some(lo) = try_build_rect2d_listoffset_i32(py, seq)? {
+                    return Ok(Layout::ListOffset(lo));
+                }
+            }
             return Ok(Layout::ListOffset(build_listoffset_from_lists(py, seq, dtype)?));
         }
 
