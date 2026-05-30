@@ -10,21 +10,18 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE">License BSL 1.1</a> ·
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL--1.1-2A2725?style=for-the-badge&logo=opensourceinitiative&logoColor=E3E1DE" alt="license BSL 1.1" /></a>
+  <a href="https://github.com/Imaginary-Biolabs/Grumpy/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Imaginary-Biolabs/Grumpy/CI?branch=main&style=for-the-badge&label=build&color=484240&logo=githubactions&logoColor=E3E1DE" alt="build status" /></a>
+  <img src="https://img.shields.io/badge/coverage-100%25-777067?style=for-the-badge&logo=pytest&logoColor=E3E1DE" alt="coverage 100%" />
+  <a href="https://github.com/Imaginary-Biolabs/Grumpy/releases"><img src="https://img.shields.io/badge/version-0.1.0-C8C4BF?style=for-the-badge&logo=python&logoColor=2A2725" alt="version 0.1.0" /></a>
+</p>
+
+<p align="center">
   <a href="LICENSE-FAQ.md">License FAQ</a> ·
   <a href="docs/">Documentation</a> ·
   <a href="benchmarks/README.md">Benchmarks</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
-
-<p align="center">
-  <!-- Replace with real badges when published to GitHub -->
-  <img src="https://img.shields.io/badge/tests-pytest-blue" alt="tests" />
-  <img src="https://img.shields.io/badge/python-%3E%3D3.10-blue" alt="python" />
-  <img src="https://img.shields.io/badge/license-BSL--1.1-lightgrey" alt="license" />
-</p>
-
----
 
 **Grumpy** is developed by [Imaginary Biolabs](https://www.imaginary.bio) as layout-first infrastructure for biomolecular machine learning — and as a general-purpose library for **ragged**, **nested**, and **nullable** scientific arrays.
 
