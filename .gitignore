@@ -4,6 +4,10 @@
 !.github/
 !.github/**
 
+# dot-ai generated LLM files
+AGENTS.md
+.AGENTS.md
+
 # Python
 __pycache__/
 *.py[cod]
