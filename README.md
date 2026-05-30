@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="LICENSE">License BSL 1.1</a> ·
+  <a href="LICENSE-FAQ.md">License FAQ</a> ·
   <a href="docs/">Documentation</a> ·
   <a href="benchmarks/README.md">Benchmarks</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
@@ -102,4 +103,4 @@ Rust code lives in `src/`; Python bindings in `python/grumpy/`. See [CONTRIBUTIN
 
 ## License
 
-Business Source License 1.1 — see [LICENSE](LICENSE). Copyright Imaginary Biolabs GmbH.
+Business Source License 1.1 — see [LICENSE](LICENSE) and [License FAQ](LICENSE-FAQ.md). Copyright Imaginary Biolabs GmbH. For commercial or partnership licensing, <a href="mailto:licensing&#64;imaginary&#46;bio?subject=Grumpy%20licensing%20inquiry">contact licensing</a>.

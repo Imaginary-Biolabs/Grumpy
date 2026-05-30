@@ -21,17 +21,36 @@ Additional Use Grant: You may use, copy, modify, create derivative works of,
                       columnar data-structure layer for ragged or nested
                       scientific data, (ii) a biomolecular machine learning
                       platform, benchmark registry, model marketplace, or
-                      dataset registry, or (iii) an integrated biology
+                      dataset registry, (iii) an integrated biology
                       environment or agent that orchestrates biology tools,
+                      or (iv) a library or framework substantially similar
+                      to Licensor's "Fabric" product — i.e., software for
+                      standardized biomolecular machine learning data
+                      processing, model training, and evaluation on ragged
+                      or nested scientific arrays, including composable
+                      transform pipelines, config-driven (e.g. YAML or JSON)
+                      definitions of datasets, benchmarks, metrics,
+                      transforms, models, or layers, and an integrated
+                      evaluation engine for biomolecular ML, whether
+                      distributed as open source, as a hosted service, or
+                      otherwise made available to third parties,
                       where such product or service is offered in commercial
                       competition with Licensor or its platform products,
                       without a separate written license from Licensor.
 
-                      The foregoing limitation does not apply to Production
-                      Use by (a) non-profit academic or research
+                      The commercial-competition requirement in the
+                      preceding sentence does not apply to internal
+                      Production Use by (a) non-profit academic or research
                       institutions or (b) individuals for personal
-                      non-commercial research, provided such use is not
-                      otherwise offered to third parties as described above.
+                      non-commercial research. However, neither (a) nor (b)
+                      may use the Licensed Work in Production to develop,
+                      publish, distribute, sublicense, or otherwise make
+                      available to third parties (including via open source,
+                      public repositories, package indexes, or hosted
+                      services) any product or service whose primary purpose
+                      falls within (i)–(iv) above, including any alternative
+                      to Licensor's Fabric product, without a separate
+                      written license from Licensor.
 
 
                               Terms
@@ -113,3 +132,7 @@ Change Date: 2030-12-31
 
 On the date above, in accordance with the Business Source License, use of
 this software will be governed by the Apache License, Version 2.0.
+
+For plain-language guidance on permitted use, see LICENSE-FAQ.md in this
+repository. For commercial or partnership licensing inquiries, see
+LICENSE-FAQ.md.

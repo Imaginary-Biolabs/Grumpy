@@ -19,10 +19,13 @@ nav:
   - DataFrames & schema: dataframes.md
   - I/O & streaming: io-streaming.md
   - Compilation & parallel apply: compilation.md
+  - License FAQ: license-faq.md
 
 markdown_extensions:
   - admonition
   - pymdownx.highlight
   - pymdownx.superfences
+  - pymdownx.snippets:
+      check_paths: true
   - toc:
       permalink: true
