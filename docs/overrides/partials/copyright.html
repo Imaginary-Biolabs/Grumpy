@@ -1,0 +1,19 @@
+<div class="md-copyright">
+  {% if config.copyright %}
+    <div class="md-copyright__highlight">
+      {{ config.copyright }}
+    </div>
+  {% endif %}
+  {% if not config.extra.generator == false %}
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  {% endif %}
+  <div class="gr-footer-brand">
+    <span>Built by</span>
+    <a href="https://www.imaginary.bio" target="_blank" rel="noopener">Imaginary Biolabs</a>
+    <span>·</span>
+    <a href="{{ config.repo_url }}" target="_blank" rel="noopener">GitHub</a>
+  </div>
+</div>

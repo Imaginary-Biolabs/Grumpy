@@ -1,4 +1,4 @@
-.PHONY: develop test coverage docs bench bench-all wheel wheel-install clean
+.PHONY: develop test coverage docs docs-serve bench bench-all wheel wheel-install clean
 
 develop:
 	maturin develop --release
@@ -12,6 +12,9 @@ coverage:
 
 docs:
 	mkdocs build -f mkdocs.yml
+
+docs-serve:
+	mkdocs serve -f mkdocs.yml
 
 bench:
 	python benchmarks/benchmark_ragged_api.py

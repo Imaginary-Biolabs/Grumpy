@@ -2,8 +2,6 @@
 
 **Grumpy** is a high-performance Python library (Rust core) for numerical computing on **ragged and nested** data — Awkward-like layouts with strong typing, explicit nullability, mutable arrays, and Zarr-backed I/O.
 
-![Grumpy icon](assets/grumpy_icon.svg){ width="64" }
-
 ## Highlights
 
 - Layout-first kernels for elementwise ops, reductions, neighbors, and more

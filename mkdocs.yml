@@ -1,16 +1,44 @@
 site_name: Grumpy
-site_description: High-performance numerical computing on ragged data
-repo_url: https://github.com/imaginary-bio/grumpy
-repo_name: imaginary-bio/grumpy
+site_description: High-performance numerical computing on ragged and nested data
+site_url: https://imaginary-biolabs.github.io/Grumpy/
+repo_url: https://github.com/Imaginary-Biolabs/Grumpy
+repo_name: Imaginary-Biolabs/Grumpy
+edit_uri: edit/main/docs/
 
 theme:
   name: material
+  custom_dir: docs/overrides
   logo: assets/grumpy_icon.svg
   favicon: assets/grumpy_icon.svg
+  font:
+    text: IBM Plex Sans
+    code: IBM Plex Mono
+  icon:
+    repo: fontawesome/brands/github
   palette:
-    - scheme: default
+    - media: "(prefers-color-scheme: light)"
+      scheme: imaginary
       primary: custom
       accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: imaginary-dark
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
 
 nav:
   - Home: index.md
@@ -21,11 +49,34 @@ nav:
   - Compilation & parallel apply: compilation.md
   - License FAQ: license-faq.md
 
+extra_css:
+  - stylesheets/imaginary.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Imaginary-Biolabs/Grumpy
+    - icon: fontawesome/solid/globe
+      link: https://www.imaginary.bio
+
+copyright: Copyright &copy; 2026 Imaginary Biolabs GmbH
+
 markdown_extensions:
   - admonition
   - pymdownx.highlight
   - pymdownx.superfences
   - pymdownx.snippets:
       check_paths: true
+      base_path: ["."]
   - toc:
       permalink: true
+
+plugins:
+  - search
+
+validation:
+  links:
+    not_found: ignore
+    unrecognized_links: ignore
+
+strict: true

@@ -1,0 +1,280 @@
+/* Imaginary Biolabs · Grumpy docs theme (paper + warm ink palette) */
+
+@import url("https://fonts.googleapis.com/css2?family=Bayon&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
+
+:root {
+  --gr-sand-50: #faf9f7;
+  --gr-sand-100: #f5f3ef;
+  --gr-sand-200: #ebe7e0;
+  --gr-sand-300: #ddd8ce;
+  --gr-sand-400: #b8b0a3;
+  --gr-sand-900: #1e1b19;
+  --gr-ink-100: #e3e1de;
+  --gr-ink-200: #c8c4bf;
+  --gr-ink-400: #777067;
+  --gr-ink-600: #484240;
+  --gr-ink-700: #383432;
+  --gr-ink-800: #2a2725;
+  --gr-ink-900: #1c1a18;
+  --gr-font-logo: "Bayon", system-ui, sans-serif;
+  --gr-font-body: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --gr-font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+}
+
+/* Light scheme — default paper field */
+[data-md-color-scheme="imaginary"] {
+  color-scheme: light;
+
+  --md-primary-fg-color: var(--gr-ink-800);
+  --md-primary-fg-color--light: var(--gr-ink-600);
+  --md-primary-fg-color--dark: var(--gr-ink-900);
+  --md-primary-bg-color: var(--gr-sand-50);
+  --md-primary-bg-color--light: var(--gr-sand-100);
+
+  --md-accent-fg-color: var(--gr-ink-400);
+  --md-accent-fg-color--transparent: #77706726;
+  --md-accent-bg-color: var(--gr-sand-200);
+
+  --md-default-fg-color: var(--gr-sand-900);
+  --md-default-fg-color--light: var(--gr-ink-600);
+  --md-default-fg-color--lighter: var(--gr-ink-400);
+  --md-default-fg-color--lightest: #96897a;
+  --md-default-bg-color: var(--gr-sand-50);
+  --md-default-bg-color--light: var(--gr-sand-100);
+  --md-default-bg-color--lighter: var(--gr-sand-200);
+  --md-default-bg-color--lightest: var(--gr-sand-300);
+
+  --md-code-fg-color: var(--gr-sand-900);
+  --md-code-bg-color: var(--gr-sand-100);
+
+  --md-typeset-color: var(--gr-sand-900);
+  --md-typeset-a-color: var(--gr-ink-600);
+
+  --md-footer-fg-color: var(--gr-ink-400);
+  --md-footer-fg-color--light: var(--gr-ink-200);
+  --md-footer-fg-color--lighter: #96897a66;
+  --md-footer-bg-color: var(--gr-sand-100);
+  --md-footer-bg-color--dark: var(--gr-sand-200);
+
+  --md-typeset-kbd-color: var(--gr-sand-900);
+  --md-typeset-kbd-accent-color: var(--gr-sand-50);
+  --md-typeset-kbd-border-color: var(--gr-ink-200);
+}
+
+/* Dark scheme — warm ink field */
+[data-md-color-scheme="imaginary-dark"] {
+  color-scheme: dark;
+
+  --md-primary-fg-color: var(--gr-sand-100);
+  --md-primary-fg-color--light: var(--gr-ink-200);
+  --md-primary-fg-color--dark: var(--gr-sand-50);
+  --md-primary-bg-color: var(--gr-ink-900);
+  --md-primary-bg-color--light: var(--gr-ink-800);
+
+  --md-accent-fg-color: var(--gr-ink-200);
+  --md-accent-fg-color--transparent: #c8c4bf26;
+  --md-accent-bg-color: var(--gr-ink-700);
+
+  --md-default-fg-color: var(--gr-sand-100);
+  --md-default-fg-color--light: var(--gr-ink-200);
+  --md-default-fg-color--lighter: var(--gr-ink-400);
+  --md-default-fg-color--lightest: #96897a;
+  --md-default-bg-color: var(--gr-ink-900);
+  --md-default-bg-color--light: var(--gr-ink-800);
+  --md-default-bg-color--lighter: var(--gr-ink-700);
+  --md-default-bg-color--lightest: var(--gr-ink-600);
+
+  --md-code-fg-color: var(--gr-sand-100);
+  --md-code-bg-color: var(--gr-ink-800);
+
+  --md-typeset-color: var(--gr-sand-100);
+  --md-typeset-a-color: var(--gr-ink-200);
+
+  --md-footer-fg-color: var(--gr-ink-400);
+  --md-footer-fg-color--light: var(--gr-ink-300, var(--gr-ink-400));
+  --md-footer-fg-color--lighter: #96897a66;
+  --md-footer-bg-color: var(--gr-ink-800);
+  --md-footer-bg-color--dark: var(--gr-ink-900);
+}
+
+/* Typography */
+.md-typeset {
+  font-family: var(--gr-font-body);
+  font-size: 0.94rem;
+  line-height: 1.65;
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-family: var(--gr-font-body);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--gr-ink-800);
+}
+
+[data-md-color-scheme="imaginary-dark"] .md-typeset h1,
+[data-md-color-scheme="imaginary-dark"] .md-typeset h2,
+[data-md-color-scheme="imaginary-dark"] .md-typeset h3 {
+  color: var(--gr-sand-100);
+}
+
+.md-typeset code,
+.md-typeset pre code {
+  font-family: var(--gr-font-mono);
+}
+
+.md-typeset a:hover {
+  color: var(--gr-ink-800);
+}
+
+[data-md-color-scheme="imaginary-dark"] .md-typeset a:hover {
+  color: var(--gr-sand-50);
+}
+
+/* Header & logo */
+.md-header {
+  border-bottom: 1px solid var(--gr-sand-200);
+  box-shadow: none;
+}
+
+[data-md-color-scheme="imaginary-dark"] .md-header {
+  border-bottom-color: var(--gr-ink-700);
+}
+
+.md-header__title {
+  font-family: var(--gr-font-logo);
+  font-size: 1.35rem;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.md-header__button.md-logo img,
+.md-nav__button.md-logo img {
+  height: 1.6rem;
+  width: 1.6rem;
+}
+
+/* Sidebar */
+.md-sidebar__inner {
+  font-size: 0.82rem;
+}
+
+.md-nav__link--active {
+  font-weight: 600;
+  color: var(--gr-ink-800) !important;
+}
+
+[data-md-color-scheme="imaginary-dark"] .md-nav__link--active {
+  color: var(--gr-sand-50) !important;
+}
+
+.md-nav__link:hover {
+  color: var(--gr-ink-600);
+}
+
+/* Content chrome */
+.md-content__inner {
+  margin-bottom: 2rem;
+}
+
+.md-typeset .admonition,
+.md-typeset details {
+  border-radius: 0.35rem;
+  border: 1px solid var(--gr-sand-200);
+  box-shadow: none;
+}
+
+[data-md-color-scheme="imaginary-dark"] .md-typeset .admonition,
+[data-md-color-scheme="imaginary-dark"] .md-typeset details {
+  border-color: var(--gr-ink-700);
+}
+
+.md-typeset pre > code {
+  border-radius: 0.35rem;
+}
+
+/* Tables */
+.md-typeset table:not([class]) {
+  border: 1px solid var(--gr-sand-200);
+  border-radius: 0.35rem;
+  overflow: hidden;
+}
+
+.md-typeset table:not([class]) th {
+  background-color: var(--gr-sand-100);
+  font-weight: 600;
+}
+
+[data-md-color-scheme="imaginary-dark"] .md-typeset table:not([class]) {
+  border-color: var(--gr-ink-700);
+}
+
+[data-md-color-scheme="imaginary-dark"] .md-typeset table:not([class]) th {
+  background-color: var(--gr-ink-800);
+}
+
+/* Footer & Imaginary attribution */
+.md-footer-meta {
+  background-color: transparent;
+}
+
+.gr-footer-brand {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.75rem;
+  margin-top: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--gr-ink-400);
+}
+
+.gr-footer-brand a {
+  color: var(--gr-ink-600);
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.gr-footer-brand a:hover {
+  color: var(--gr-ink-800);
+  text-decoration: underline;
+}
+
+[data-md-color-scheme="imaginary-dark"] .gr-footer-brand a {
+  color: var(--gr-ink-200);
+}
+
+[data-md-color-scheme="imaginary-dark"] .gr-footer-brand a:hover {
+  color: var(--gr-sand-50);
+}
+
+/* Home hero */
+.gr-hero {
+  text-align: center;
+  padding: 1.5rem 0 2rem;
+}
+
+.gr-hero img {
+  width: 4.5rem;
+  height: 4.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.gr-hero-tagline {
+  font-size: 1.05rem;
+  color: var(--gr-ink-400);
+  max-width: 36rem;
+  margin: 0.5rem auto 0;
+}
+
+/* Selection highlight — subtle eco touch */
+::selection {
+  background: #d4e8dc;
+  color: var(--gr-sand-900);
+}
+
+[data-md-color-scheme="imaginary-dark"] ::selection {
+  background: #3d5a48;
+  color: var(--gr-sand-50);
+}

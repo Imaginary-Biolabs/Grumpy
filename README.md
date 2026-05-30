@@ -18,7 +18,7 @@
 
 <p align="center">
   <a href="LICENSE-FAQ.md">License FAQ</a> ·
-  <a href="docs/">Documentation</a> ·
+  <a href="https://imaginary-biolabs.github.io/Grumpy/">Documentation</a> ·
   <a href="benchmarks/README.md">Benchmarks</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -77,6 +77,8 @@ for batch in gr.stream("data.gr", batch_size=32):
 - [Compilation](docs/compilation.md)
 
 Build the site locally: `pip install -e ".[dev]" && mkdocs serve`.
+
+Published docs: [imaginary-biolabs.github.io/Grumpy](https://imaginary-biolabs.github.io/Grumpy/)
 
 ## Benchmarks
 

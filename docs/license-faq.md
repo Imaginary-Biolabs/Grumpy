@@ -1,1 +1,1 @@
---8<-- "../LICENSE-FAQ.md"
+--8<-- "LICENSE-FAQ.md"
