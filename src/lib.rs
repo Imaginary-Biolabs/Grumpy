@@ -1,4 +1,5 @@
 mod dtype;
+mod kernels;
 mod layout;
 mod ops;
 mod reduce;

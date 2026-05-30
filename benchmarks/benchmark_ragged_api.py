@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         extra=header_extra(args, ds.n_elements)
         + [
             "- **Timed region:** idiomatic library calls (includes temporaries)",
-            "- Grumpy 2D reductions require explicit ``dim=`` (no bare ``.sum()``)",
+            "- Grumpy ``.sum()`` without ``dim`` reduces all leaves (like NumPy ``.sum()`` on 2D)",
         ],
     )
 
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         checksum(int((ds.np_rect_a * ds.np_rect_b).sum(dtype=np.int64)))
 
     def gr_mul_sum() -> None:
-        checksum(int((ds.gr_a * ds.gr_b).sum(dim=1).sum(dim=0)))
+        checksum(int((ds.gr_a * ds.gr_b).sum()))
 
     def ak_mul_sum() -> None:
         checksum(int(ak.sum(ds.ak_a * ds.ak_b)))
@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         checksum(int((ds.np_rect_a + ds.np_rect_b).sum(dtype=np.int64)))
 
     def gr_add_sum() -> None:
-        checksum(int((ds.gr_a + ds.gr_b).sum(dim=1).sum(dim=0)))
+        checksum(int((ds.gr_a + ds.gr_b).sum()))
 
     def ak_add_sum() -> None:
         checksum(int(ak.sum(ds.ak_a + ds.ak_b)))
@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         checksum(int((ds.np_rect_a * 2).sum(dtype=np.int64)))
 
     def gr_mul_scalar_sum() -> None:
-        checksum(int((ds.gr_a * 2).sum(dim=1).sum(dim=0)))
+        checksum(int((ds.gr_a * 2).sum()))
 
     def ak_mul_scalar_sum() -> None:
         checksum(int(ak.sum(ds.ak_a * 2)))
@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         checksum(int(ds.np_rect_a.sum(dtype=np.int64)))
 
     def gr_sum_all() -> None:
-        checksum(int(ds.gr_a.sum(dim=1).sum(dim=0)))
+        checksum(int(ds.gr_a.sum()))
 
     def ak_sum_all() -> None:
         checksum(int(ak.sum(ds.ak_a)))
@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         checksum(int(ds.np_rect_a.sum(axis=1, dtype=np.int64).sum()))
 
     def gr_sum_axis1() -> None:
-        checksum(int(ds.gr_a.sum(dim=1).sum(dim=0)))
+        checksum(int(ds.gr_a.sum(dim=1).sum()))
 
     def ak_sum_axis1() -> None:
         checksum(int(ak.sum(ak.sum(ds.ak_a, axis=1))))
@@ -208,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
                 "Elementwise",
                 "(a * b).sum()",
                 "int((a * b).sum())",
-                "int((a * b).sum(dim=1).sum(dim=0))",
+                "int((a * b).sum())",
                 "int(ak.sum(a * b))",
                 np_mul_sum,
                 gr_mul_sum,
@@ -218,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 "Elementwise",
                 "(a + b).sum()",
                 "int((a + b).sum())",
-                "int((a + b).sum(dim=1).sum(dim=0))",
+                "int((a + b).sum())",
                 "int(ak.sum(a + b))",
                 np_add_sum,
                 gr_add_sum,
@@ -228,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
                 "Elementwise",
                 "(a * 2).sum()",
                 "int((a * 2).sum())",
-                "int((a * 2).sum(dim=1).sum(dim=0))",
+                "int((a * 2).sum())",
                 "int(ak.sum(a * 2))",
                 np_mul_scalar_sum,
                 gr_mul_scalar_sum,
@@ -238,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
                 "Reductions",
                 "a.sum()",
                 "int(a.sum())",
-                "int(a.sum(dim=1).sum(dim=0))",
+                "int(a.sum())",
                 "int(ak.sum(a))",
                 np_sum_all,
                 gr_sum_all,

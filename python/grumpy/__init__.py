@@ -18,6 +18,9 @@ from ._core import (
     DType,
     GrumpyArray,
     array as _array,
+    multiply as _multiply,
+    add_arrays as _add_arrays,
+    subtract as _subtract,
     cat as _cat,
     full_like as _full_like,
     ones_like as _ones_like,
@@ -87,6 +90,21 @@ def array(obj, dtype: DType | None = None) -> GrumpyArray:
         Optional explicit dtype. If omitted, dtype is inferred from non-null leaves.
     """
     return _array(obj, dtype)
+
+
+def multiply(a: GrumpyArray, b: GrumpyArray, out: GrumpyArray | None = None) -> GrumpyArray:
+    """Elementwise multiply with optional pre-allocated ``out`` (NumPy ``out=`` style)."""
+    return _multiply(a, b, out)
+
+
+def add(a: GrumpyArray, b: GrumpyArray, out: GrumpyArray | None = None) -> GrumpyArray:
+    """Elementwise add with optional pre-allocated ``out``."""
+    return _add_arrays(a, b, out)
+
+
+def subtract(a: GrumpyArray, b: GrumpyArray, out: GrumpyArray | None = None) -> GrumpyArray:
+    """Elementwise subtract with optional pre-allocated ``out``."""
+    return _subtract(a, b, out)
 
 
 def cat(arrays: list[GrumpyArray], dim: int = 0) -> GrumpyArray:

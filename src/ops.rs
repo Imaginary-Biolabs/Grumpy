@@ -266,6 +266,9 @@ pub fn elementwise_with_scalar(
     if let Some(out) = elementwise_rect2d_scalar_fast(a, op, value, is_int)? {
         return Ok(out);
     }
+    if let Some(out) = elementwise_listoffset2d_scalar_fast(a, op, value, is_int)? {
+        return Ok(out);
+    }
     let mut out = a.clone();
     if !elementwise_scalar_inplace(&mut out, op, value, is_int)? {
         return Err(PyValueError::new_err(
@@ -278,6 +281,10 @@ pub fn elementwise_with_scalar(
 pub fn elementwise(a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyResult<GrumpyArray> {
     // Rectangular 2D fast path (ListOffset -> Leaf) for common dtypes, no nulls.
     if let Some(out) = elementwise_rect2d_fast(a, b, op)? {
+        return Ok(out);
+    }
+    // Same-offset 2D list->leaf (ragged or rectangular): one flat leaf pass.
+    if let Some(out) = elementwise_same_listoffset2d_fast(a, b, op)? {
         return Ok(out);
     }
     // Ragged 2D fast path (ListOffset -> Leaf) including per-row broadcast (len==1).
@@ -306,6 +313,101 @@ pub fn elementwise(a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyResult<Grum
 
     let layout = elementwise_layout_broadcast(&a.layout, &b.layout, a.dtype, b.dtype, out_dtype, op)?;
     Ok(GrumpyArray { dtype: out_dtype, layout })
+}
+
+/// Write ``a op b`` into ``out`` when layouts match (same offsets, list->leaf, all-valid int32).
+pub fn elementwise_into(out: &mut GrumpyArray, a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyResult<()> {
+    if !layouts_compatible(&a.layout, &b.layout) || !layouts_compatible(&a.layout, &out.layout) {
+        return Err(PyValueError::new_err(
+            "elementwise out= requires identical list structure for a, b, and out.",
+        ));
+    }
+    if a.dtype != DType::Int32 || b.dtype != DType::Int32 || out.dtype != DType::Int32 {
+        return Err(PyValueError::new_err(
+            "elementwise out= currently requires dtype=int32 for a, b, and out.",
+        ));
+    }
+    let (off, leaf_a) = listoffset2d_leaf_view(&a.layout).ok_or_else(|| {
+        PyValueError::new_err("elementwise out= requires 2D list->leaf layout.")
+    })?;
+    let leaf_b = listoffset2d_leaf_view(&b.layout).unwrap().1;
+    let leaf_o = match &mut out.layout {
+        Layout::ListOffset(lo) => match lo.content.as_mut() {
+            Layout::Leaf(l) => l,
+            _ => return Err(PyValueError::new_err("elementwise out= requires leaf content.")),
+        },
+        _ => return Err(PyValueError::new_err("elementwise out= requires list layout.")),
+    };
+    if leaf_a.has_nulls || leaf_b.has_nulls || leaf_o.has_nulls {
+        return Err(PyValueError::new_err("elementwise out= requires all-valid arrays."));
+    }
+    let aa = match &leaf_a.buffer {
+        LeafBuffer::I32(v) => v.as_slice(),
+        _ => return Err(PyValueError::new_err("elementwise out= requires int32 leaf.")),
+    };
+    let bb = match &leaf_b.buffer {
+        LeafBuffer::I32(v) => v.as_slice(),
+        _ => return Err(PyValueError::new_err("elementwise out= requires int32 leaf.")),
+    };
+    let oo = match &mut leaf_o.buffer {
+        LeafBuffer::I32(v) => Arc::make_mut(v),
+        _ => return Err(PyValueError::new_err("elementwise out= requires int32 leaf.")),
+    };
+    let _ = off;
+    match op {
+        BinOp::Mul => crate::kernels::mul_i32_slices(aa, bb, oo),
+        BinOp::Add => crate::kernels::add_i32_slices(aa, bb, oo),
+        BinOp::Sub => crate::kernels::sub_i32_slices(aa, bb, oo),
+        _ => {
+            return Err(PyValueError::new_err(
+                "elementwise out= supports add/sub/mul for int32 only.",
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Fused ``(a * scalar).sum()`` over all leaves for 2D list->leaf int32 arrays.
+pub fn mul_scalar_sum_all_i64(a: &GrumpyArray, scalar: i32) -> PyResult<i64> {
+    if a.dtype != DType::Int32 {
+        return Err(PyValueError::new_err("mul_scalar_sum_all requires int32 array."));
+    }
+    let (_off, leaf) = listoffset2d_leaf_view(&a.layout)
+        .ok_or_else(|| PyValueError::new_err("mul_scalar_sum_all requires 2D list->leaf layout."))?;
+    if leaf.has_nulls {
+        return Err(PyValueError::new_err("mul_scalar_sum_all requires all-valid array."));
+    }
+    let v = match &leaf.buffer {
+        LeafBuffer::I32(buf) => buf.as_slice(),
+        _ => return Err(PyValueError::new_err("mul_scalar_sum_all requires int32 leaf.")),
+    };
+    Ok(crate::kernels::sum_i32_mul_scalar_to_i64(v, scalar))
+}
+
+/// Fused ``(a * b).sum()`` over all leaves for matching 2D list->leaf int32 arrays.
+pub fn mul_sum_all_i64(a: &GrumpyArray, b: &GrumpyArray) -> PyResult<i64> {
+    if a.dtype != DType::Int32 || b.dtype != DType::Int32 {
+        return Err(PyValueError::new_err("mul_sum_all requires int32 arrays."));
+    }
+    let (off_a, leaf_a) = listoffset2d_leaf_view(&a.layout)
+        .ok_or_else(|| PyValueError::new_err("mul_sum_all requires 2D list->leaf layout."))?;
+    let (off_b, leaf_b) = listoffset2d_leaf_view(&b.layout)
+        .ok_or_else(|| PyValueError::new_err("mul_sum_all requires 2D list->leaf layout."))?;
+    if off_a != off_b {
+        return Err(PyValueError::new_err("mul_sum_all requires matching offsets."));
+    }
+    if leaf_a.has_nulls || leaf_b.has_nulls {
+        return Err(PyValueError::new_err("mul_sum_all requires all-valid arrays."));
+    }
+    let aa = match &leaf_a.buffer {
+        LeafBuffer::I32(v) => v.as_slice(),
+        _ => return Err(PyValueError::new_err("mul_sum_all requires int32 leaf.")),
+    };
+    let bb = match &leaf_b.buffer {
+        LeafBuffer::I32(v) => v.as_slice(),
+        _ => return Err(PyValueError::new_err("mul_sum_all requires int32 leaf.")),
+    };
+    Ok(crate::kernels::sum_i32_mul_to_i64(aa, bb))
 }
 
 fn elementwise_out_dtype(a: DType, b: DType, op: BinOp) -> PyResult<DType> {
@@ -1496,6 +1598,122 @@ fn elementwise_leaf_broadcast(
     }
 
     Ok(out)
+}
+
+fn listoffset2d_leaf_view(layout: &Layout) -> Option<(&[i64], &Leaf)> {
+    let lo = match layout {
+        Layout::ListOffset(lo) => lo,
+        _ => return None,
+    };
+    let leaf = match lo.content.as_ref() {
+        Layout::Leaf(l) => l,
+        _ => return None,
+    };
+    Some((lo.offsets.as_slice(), leaf))
+}
+
+fn build_listoffset2d_from_leaf(offsets: &[i64], leaf: Leaf, dtype: DType) -> GrumpyArray {
+    GrumpyArray {
+        dtype,
+        layout: Layout::ListOffset(ListOffset {
+            offsets: Arc::new(offsets.to_vec()),
+            content: Box::new(Layout::Leaf(leaf)),
+        }),
+    }
+}
+
+fn elementwise_same_listoffset2d_fast(
+    a: &GrumpyArray,
+    b: &GrumpyArray,
+    op: BinOp,
+) -> PyResult<Option<GrumpyArray>> {
+    let (off_a, leaf_a) = match listoffset2d_leaf_view(&a.layout) {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    let (off_b, leaf_b) = match listoffset2d_leaf_view(&b.layout) {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    if off_a != off_b || a.dtype != b.dtype {
+        return Ok(None);
+    }
+    if leaf_a.has_nulls || leaf_b.has_nulls {
+        return Ok(None);
+    }
+    if a.dtype != DType::Int32 {
+        return Ok(None);
+    }
+    let n = leaf_a.len;
+    if n != leaf_b.len {
+        return Ok(None);
+    }
+    let aa = match &leaf_a.buffer {
+        LeafBuffer::I32(v) => v.as_slice(),
+        _ => return Ok(None),
+    };
+    let bb = match &leaf_b.buffer {
+        LeafBuffer::I32(v) => v.as_slice(),
+        _ => return Ok(None),
+    };
+    let mut out_vec = vec![0i32; n];
+    match op {
+        BinOp::Mul => crate::kernels::mul_i32_slices(aa, bb, &mut out_vec),
+        BinOp::Add => crate::kernels::add_i32_slices(aa, bb, &mut out_vec),
+        BinOp::Sub => crate::kernels::sub_i32_slices(aa, bb, &mut out_vec),
+        _ => return Ok(None),
+    }
+    let mut out_leaf = Leaf::new(DType::Int32);
+    out_leaf.len = n;
+    out_leaf.has_nulls = false;
+    out_leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    out_leaf.buffer = LeafBuffer::I32(Arc::new(out_vec));
+    Ok(Some(build_listoffset2d_from_leaf(off_a, out_leaf, DType::Int32)))
+}
+
+fn elementwise_listoffset2d_scalar_fast(
+    a: &GrumpyArray,
+    op: BinOp,
+    value: f64,
+    is_int: bool,
+) -> PyResult<Option<GrumpyArray>> {
+    if !is_int || a.dtype != DType::Int32 {
+        return Ok(None);
+    }
+    let (offsets, leaf_a) = match listoffset2d_leaf_view(&a.layout) {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    if leaf_a.has_nulls {
+        return Ok(None);
+    }
+    let s = value as i32;
+    let n = leaf_a.len;
+    let aa = match &leaf_a.buffer {
+        LeafBuffer::I32(v) => v.as_slice(),
+        _ => return Ok(None),
+    };
+    let mut out_vec = vec![0i32; n];
+    match op {
+        BinOp::Mul => crate::kernels::mul_i32_scalar_slice(aa, s, &mut out_vec),
+        BinOp::Add => {
+            for i in 0..n {
+                out_vec[i] = aa[i].wrapping_add(s);
+            }
+        }
+        BinOp::Sub => {
+            for i in 0..n {
+                out_vec[i] = aa[i].wrapping_sub(s);
+            }
+        }
+        _ => return Ok(None),
+    }
+    let mut out_leaf = Leaf::new(DType::Int32);
+    out_leaf.len = n;
+    out_leaf.has_nulls = false;
+    out_leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    out_leaf.buffer = LeafBuffer::I32(Arc::new(out_vec));
+    Ok(Some(build_listoffset2d_from_leaf(offsets, out_leaf, DType::Int32)))
 }
 
 fn rect2d_shape(layout: &Layout) -> Option<(usize, usize, &Vec<i64>)> {

@@ -27,6 +27,9 @@ def test_compile_expr_binop_and_neighbors_edges():
     assert _compile_expr(t.body[0].value, "batch") is None  # type: ignore[attr-defined]
 
     t = ast.parse("batch.sum()")
+    assert _compile_expr(t.body[0].value, "batch") == {"op": "reduce", "reduce": "sum"}  # type: ignore[attr-defined]
+
+    t = ast.parse("batch.mean()")
     assert _compile_expr(t.body[0].value, "batch") is None  # type: ignore[attr-defined]
 
 

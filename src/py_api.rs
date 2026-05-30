@@ -67,8 +67,9 @@ enum PlanOp {
     MulScalar { value: f64, is_int: bool },
     DivScalar { value: f64, is_int: bool },
     ModScalar { value: f64, is_int: bool },
+    MulScalarSumAll { value: f64, is_int: bool },
     NeighborsKnnSelf { k: usize, dim: isize, loop_: bool },
-    ReduceCur { op: ReduceOp, dim: isize },
+    ReduceCur { op: ReduceOp, dim: Option<isize> },
     DfGetTmp { level0: String, col: String },
     ReduceTmp { op: ReduceOp, dim: isize },
     DfSetTmp { level0: String, col: String },
@@ -151,6 +152,9 @@ impl PyCompiledPlan {
                 "mul_scalar" => ops.push(PlanOp::MulScalar { value: val_f64()?, is_int }),
                 "div_scalar" => ops.push(PlanOp::DivScalar { value: val_f64()?, is_int }),
                 "mod_scalar" => ops.push(PlanOp::ModScalar { value: val_f64()?, is_int }),
+                "mul_scalar_sum_all" => {
+                    ops.push(PlanOp::MulScalarSumAll { value: val_f64()?, is_int });
+                }
                 "neighbors_knn_self" => {
                     let k: usize = d
                         .get_item("k")?
@@ -173,10 +177,10 @@ impl PyCompiledPlan {
                         .ok_or_else(|| PyValueError::new_err("reduce op missing 'reduce'."))?
                         .extract()
                         .map_err(|_| PyValueError::new_err("reduce op 'reduce' must be a string."))?;
-                    let dim: isize = d
+                    let dim: Option<isize> = d
                         .get_item("dim")?
-                        .ok_or_else(|| PyValueError::new_err("reduce op missing 'dim'."))?
-                        .extract()
+                        .map(|x| x.extract::<isize>())
+                        .transpose()
                         .map_err(|_| PyValueError::new_err("reduce op 'dim' must be an int."))?;
                     let rop = match which.as_str() {
                         "sum" => ReduceOp::Sum,
@@ -332,6 +336,15 @@ impl PyCompiledPlan {
                     })?;
                     cur_arr = Some(a);
                 }
+                PlanOp::MulScalarSumAll { value, is_int } => {
+                    let a0 = cur_arr.take().ok_or_else(|| PyValueError::new_err("mul_scalar_sum_all requires array batch."))?;
+                    if !is_int {
+                        return Err(PyValueError::new_err("mul_scalar_sum_all requires int scalar."));
+                    }
+                    let s = *value as i32;
+                    let sum = py.allow_threads(move || ops::mul_scalar_sum_all_i64(&a0, s))?;
+                    cur_scalar = Some(sum.to_object(py));
+                }
                 PlanOp::NeighborsKnnSelf { k, dim, loop_ } => {
                     let a0 = cur_arr.take().ok_or_else(|| PyValueError::new_err("neighbors requires array batch."))?;
                     let kk = *k;
@@ -356,7 +369,7 @@ impl PyCompiledPlan {
                 }
                 PlanOp::ReduceTmp { op, dim } => {
                     let a = tmp.take().ok_or_else(|| PyValueError::new_err("reduce_tmp: missing tmp value."))?;
-                    match reduce::reduce(py, &a, *dim, *op)? {
+                    match reduce::reduce(py, &a, Some(*dim), *op)? {
                         ReduceOutput::Array(out) => tmp = Some(out),
                         ReduceOutput::Scalar(_) => return Err(PyValueError::new_err("reduce_tmp produced scalar; not supported for df assignment.")),
                     }
@@ -447,11 +460,28 @@ fn run_plan_array_rust(ops_plan: &[PlanOp], mut cur: GrumpyArray) -> PyResult<Gr
                     cur = ops::elementwise(&cur, &rhs, BinOp::Mod)?;
                 }
             }
+            PlanOp::MulScalarSumAll { value, is_int } => {
+                if !is_int {
+                    return Err(PyValueError::new_err("mul_scalar_sum_all requires int scalar."));
+                }
+                let s = *value as i32;
+                let sum = ops::mul_scalar_sum_all_i64(&cur, s)?;
+                return Err(PyValueError::new_err(format!(
+                    "mul_scalar_sum_all produced scalar {sum}; array pipeline cannot consume scalars."
+                )));
+            }
             PlanOp::NeighborsKnnSelf { k, dim, loop_ } => {
                 cur = neigh_ops::neighbors(&cur, &cur, Some(*k), None, *dim, *loop_)?;
             }
             PlanOp::ReduceCur { op, dim } => {
-                cur = reduce::reduce_array(&cur, *dim, *op)?;
+                match dim {
+                    Some(d) => cur = reduce::reduce_array(&cur, *d, *op)?,
+                    None => {
+                        return Err(PyValueError::new_err(
+                            "reduce without dim in array Rust plan is not supported.",
+                        ));
+                    }
+                }
             }
             _ => {
                 return Err(PyValueError::new_err(
@@ -738,7 +768,8 @@ impl PyGrumpyArray {
         Self { inner }
     }
 
-    fn sum(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
+    #[pyo3(signature = (dim=None))]
+    fn sum(&self, py: Python<'_>, dim: Option<isize>) -> PyResult<PyObject> {
         match reduce::reduce(py, &self.inner, dim, ReduceOp::Sum)? {
             ReduceOutput::Scalar(x) => Ok(x),
             ReduceOutput::Array(arr) => Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py)),
@@ -746,28 +777,28 @@ impl PyGrumpyArray {
     }
 
     fn mean(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
-        match reduce::reduce(py, &self.inner, dim, ReduceOp::Mean)? {
+        match reduce::reduce(py, &self.inner, Some(dim), ReduceOp::Mean)? {
             ReduceOutput::Scalar(x) => Ok(x),
             ReduceOutput::Array(arr) => Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py)),
         }
     }
 
     fn min(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
-        match reduce::reduce(py, &self.inner, dim, ReduceOp::Min)? {
+        match reduce::reduce(py, &self.inner, Some(dim), ReduceOp::Min)? {
             ReduceOutput::Scalar(x) => Ok(x),
             ReduceOutput::Array(arr) => Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py)),
         }
     }
 
     fn max(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
-        match reduce::reduce(py, &self.inner, dim, ReduceOp::Max)? {
+        match reduce::reduce(py, &self.inner, Some(dim), ReduceOp::Max)? {
             ReduceOutput::Scalar(x) => Ok(x),
             ReduceOutput::Array(arr) => Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py)),
         }
     }
 
     fn ptp(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
-        match reduce::reduce(py, &self.inner, dim, ReduceOp::Ptp)? {
+        match reduce::reduce(py, &self.inner, Some(dim), ReduceOp::Ptp)? {
             ReduceOutput::Scalar(x) => Ok(x),
             ReduceOutput::Array(arr) => Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py)),
         }
@@ -1664,114 +1695,32 @@ fn rect2d_i32_view<'a>(layout: &'a Layout) -> PyResult<(&'a [i64], &'a [i32])> {
 
 #[cfg(target_arch = "aarch64")]
 fn sum_i32_to_i64_neon(a: &[i32]) -> i64 {
-    use std::arch::aarch64::*;
-    let n = a.len();
-    let mut acc0 = unsafe { vdupq_n_s64(0) };
-    let mut acc1 = unsafe { vdupq_n_s64(0) };
-    let mut i = 0usize;
-    unsafe {
-        while i + 4 <= n {
-            let va = vld1q_s32(a.as_ptr().add(i));
-            let lo = vmovl_s32(vget_low_s32(va));
-            let hi = vmovl_s32(vget_high_s32(va));
-            acc0 = vaddq_s64(acc0, lo);
-            acc1 = vaddq_s64(acc1, hi);
-            i += 4;
-        }
-    }
-    let mut sum = unsafe {
-        let acc = vaddq_s64(acc0, acc1);
-        vgetq_lane_s64(acc, 0) + vgetq_lane_s64(acc, 1)
-    };
-    while i < n {
-        sum += a[i] as i64;
-        i += 1;
-    }
-    sum
+    crate::kernels::sum_i32_to_i64(a)
 }
 
 #[cfg(not(target_arch = "aarch64"))]
 fn sum_i32_to_i64_neon(a: &[i32]) -> i64 {
-    a.iter().map(|&x| x as i64).sum()
+    crate::kernels::sum_i32_to_i64(a)
 }
 
 #[cfg(target_arch = "aarch64")]
 fn sum_i32_mul_neon(a: &[i32], b: &[i32]) -> i64 {
-    use std::arch::aarch64::*;
-    debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let mut acc0 = unsafe { vdupq_n_s64(0) };
-    let mut acc1 = unsafe { vdupq_n_s64(0) };
-    let mut i = 0usize;
-    unsafe {
-        while i + 4 <= n {
-            let va = vld1q_s32(a.as_ptr().add(i));
-            let vb = vld1q_s32(b.as_ptr().add(i));
-            let lo = vmull_s32(vget_low_s32(va), vget_low_s32(vb));
-            let hi = vmull_s32(vget_high_s32(va), vget_high_s32(vb));
-            acc0 = vaddq_s64(acc0, lo);
-            acc1 = vaddq_s64(acc1, hi);
-            i += 4;
-        }
-    }
-    let mut sum = unsafe {
-        let acc = vaddq_s64(acc0, acc1);
-        vgetq_lane_s64(acc, 0) + vgetq_lane_s64(acc, 1)
-    };
-    while i < n {
-        sum += (a[i].wrapping_mul(b[i])) as i64;
-        i += 1;
-    }
-    sum
+    crate::kernels::sum_i32_mul_to_i64(a, b)
 }
 
 #[cfg(not(target_arch = "aarch64"))]
 fn sum_i32_mul_neon(a: &[i32], b: &[i32]) -> i64 {
-    let mut acc: i64 = 0;
-    for i in 0..a.len() {
-        acc = acc.wrapping_add((a[i].wrapping_mul(b[i])) as i64);
-    }
-    acc
+    crate::kernels::sum_i32_mul_to_i64(a, b)
 }
 
 #[cfg(target_arch = "aarch64")]
 fn sum_i32_add_neon(a: &[i32], b: &[i32]) -> i64 {
-    use std::arch::aarch64::*;
-    debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let mut acc0 = unsafe { vdupq_n_s64(0) };
-    let mut acc1 = unsafe { vdupq_n_s64(0) };
-    let mut i = 0usize;
-    unsafe {
-        while i + 4 <= n {
-            let va = vld1q_s32(a.as_ptr().add(i));
-            let vb = vld1q_s32(b.as_ptr().add(i));
-            let vs = vaddq_s32(va, vb);
-            let lo = vmovl_s32(vget_low_s32(vs));
-            let hi = vmovl_s32(vget_high_s32(vs));
-            acc0 = vaddq_s64(acc0, lo);
-            acc1 = vaddq_s64(acc1, hi);
-            i += 4;
-        }
-    }
-    let mut sum = unsafe {
-        let acc = vaddq_s64(acc0, acc1);
-        vgetq_lane_s64(acc, 0) + vgetq_lane_s64(acc, 1)
-    };
-    while i < n {
-        sum += (a[i].wrapping_add(b[i])) as i64;
-        i += 1;
-    }
-    sum
+    crate::kernels::sum_i32_add_to_i64(a, b)
 }
 
 #[cfg(not(target_arch = "aarch64"))]
 fn sum_i32_add_neon(a: &[i32], b: &[i32]) -> i64 {
-    let mut acc: i64 = 0;
-    for i in 0..a.len() {
-        acc = acc.wrapping_add((a[i].wrapping_add(b[i])) as i64);
-    }
-    acc
+    crate::kernels::sum_i32_add_to_i64(a, b)
 }
 
 fn leaf_to_numpy_1d_typed(
@@ -3191,6 +3140,54 @@ pub fn array(
 }
 
 #[pyfunction]
+#[pyo3(signature = (a, b, out=None))]
+pub fn multiply(
+    a: PyRef<'_, PyGrumpyArray>,
+    b: PyRef<'_, PyGrumpyArray>,
+    mut out: Option<PyRefMut<'_, PyGrumpyArray>>,
+) -> PyResult<PyGrumpyArray> {
+    if let Some(ref mut o) = out {
+        ops::elementwise_into(&mut o.inner, &a.inner, &b.inner, BinOp::Mul)?;
+        Ok(PyGrumpyArray { inner: o.inner.clone() })
+    } else {
+        let inner = ops::elementwise(&a.inner, &b.inner, BinOp::Mul)?;
+        Ok(PyGrumpyArray { inner })
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, out=None))]
+pub fn add_arrays(
+    a: PyRef<'_, PyGrumpyArray>,
+    b: PyRef<'_, PyGrumpyArray>,
+    mut out: Option<PyRefMut<'_, PyGrumpyArray>>,
+) -> PyResult<PyGrumpyArray> {
+    if let Some(ref mut o) = out {
+        ops::elementwise_into(&mut o.inner, &a.inner, &b.inner, BinOp::Add)?;
+        Ok(PyGrumpyArray { inner: o.inner.clone() })
+    } else {
+        let inner = ops::elementwise(&a.inner, &b.inner, BinOp::Add)?;
+        Ok(PyGrumpyArray { inner })
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, out=None))]
+pub fn subtract(
+    a: PyRef<'_, PyGrumpyArray>,
+    b: PyRef<'_, PyGrumpyArray>,
+    mut out: Option<PyRefMut<'_, PyGrumpyArray>>,
+) -> PyResult<PyGrumpyArray> {
+    if let Some(ref mut o) = out {
+        ops::elementwise_into(&mut o.inner, &a.inner, &b.inner, BinOp::Sub)?;
+        Ok(PyGrumpyArray { inner: o.inner.clone() })
+    } else {
+        let inner = ops::elementwise(&a.inner, &b.inner, BinOp::Sub)?;
+        Ok(PyGrumpyArray { inner })
+    }
+}
+
+#[pyfunction]
 #[pyo3(signature = (arrays, dim=0))]
 pub fn cat(py: Python<'_>, arrays: Vec<PyRef<'_, PyGrumpyArray>>, dim: isize) -> PyResult<PyGrumpyArray> {
     if arrays.is_empty() {
@@ -3511,6 +3508,9 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompiledPlan>()?;
     m.add_class::<PyCompiledBatchesIter>()?;
     m.add_function(wrap_pyfunction!(array, m)?)?;
+    m.add_function(wrap_pyfunction!(multiply, m)?)?;
+    m.add_function(wrap_pyfunction!(add_arrays, m)?)?;
+    m.add_function(wrap_pyfunction!(subtract, m)?)?;
     m.add_function(wrap_pyfunction!(cat, m)?)?;
     m.add_function(wrap_pyfunction!(full_like, m)?)?;
     m.add_function(wrap_pyfunction!(zeros_like, m)?)?;

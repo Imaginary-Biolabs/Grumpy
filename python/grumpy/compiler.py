@@ -103,7 +103,7 @@ def compile_pipeline(fns: list[Callable[[Any], Any]]) -> Callable[[Any], Any]:
         nonlocal pending_ops
         if not pending_ops:
             return
-        plan = _core.CompiledPlan(pending_ops)
+        plan = _core.CompiledPlan(_fuse_elementwise_ops(pending_ops))
         pending_ops = []
 
         def run_plan(x):
@@ -311,6 +311,8 @@ def _try_compile(fn: Callable[[Any], Any]) -> _CompileResult:
     if not ops:
         return _CompileResult(None, "No compilable operations found.")
 
+    ops = _fuse_elementwise_ops(ops)
+
     try:
         plan = _core.CompiledPlan(ops)
     except Exception as e:
@@ -358,17 +360,45 @@ def _compile_expr(expr: ast.AST, cur_name: str) -> Optional[dict[str, Any]]:
                 return None
             return {"op": "neighbors_knn_self", "k": int(k), "dim": int(dim), "loop": bool(loopv)}
 
-    # batch.sum(dim=...), batch.mean(dim=...), batch.min(dim=...), batch.max(dim=...), batch.ptp(dim=...)
+    # batch.sum(dim=...) or batch.sum(), batch.mean(dim=...), ...
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
         if isinstance(expr.func.value, ast.Name) and expr.func.value.id == cur_name:
             red = expr.func.attr
             if red in ("sum", "mean", "min", "max", "ptp"):
                 dim = _call_dim(expr)
+                if red == "sum" and dim is None:
+                    return {"op": "reduce", "reduce": "sum"}
                 if dim is None:
                     return None
                 return {"op": "reduce", "reduce": red, "dim": int(dim)}
 
     return None
+
+
+def _fuse_elementwise_ops(ops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fuse common op sequences into single kernels."""
+    fused: list[dict[str, Any]] = []
+    i = 0
+    while i < len(ops):
+        if (
+            i + 1 < len(ops)
+            and ops[i].get("op") == "mul_scalar"
+            and ops[i + 1].get("op") == "reduce"
+            and ops[i + 1].get("reduce") == "sum"
+            and "dim" not in ops[i + 1]
+        ):
+            fused.append(
+                {
+                    "op": "mul_scalar_sum_all",
+                    "value": ops[i]["value"],
+                    "is_int": ops[i]["is_int"],
+                }
+            )
+            i += 2
+            continue
+        fused.append(ops[i])
+        i += 1
+    return fused
 
 
 def _parse_batch_attr_chain(node: ast.AST, cur_name: str) -> Optional[list[str]]:

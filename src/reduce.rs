@@ -83,7 +83,7 @@ pub fn reduce_array(arr: &GrumpyArray, dim: isize, op: ReduceOp) -> PyResult<Gru
     Ok(GrumpyArray { dtype: out_dt, layout: out_layout })
 }
 
-pub fn reduce(py: Python<'_>, arr: &GrumpyArray, dim: isize, op: ReduceOp) -> PyResult<ReduceOutput> {
+pub fn reduce(py: Python<'_>, arr: &GrumpyArray, dim: Option<isize>, op: ReduceOp) -> PyResult<ReduceOutput> {
     let norm_layout;
     let layout: &Layout = match &arr.layout {
         Layout::OffsetView(v) => {
@@ -93,25 +93,39 @@ pub fn reduce(py: Python<'_>, arr: &GrumpyArray, dim: isize, op: ReduceOp) -> Py
         _ => &arr.layout,
     };
 
-    // dim is interpreted like NumPy axis (0 is outermost).
-    // For list-chains: depth == number of list levels; valid axes are 0..=depth (inclusive),
-    // where axis==depth reduces the leaf values inside the deepest list level.
     let depth = crate::layout::list_chain_depth(layout)
         .ok_or_else(|| PyValueError::new_err("reduce currently only supports pure list-chain arrays."))?;
+
+    // Sum/mean over all leaves (no dim): flatten reduction for 2D list->leaf.
+    if dim.is_none() {
+        if depth == 1 {
+            if let Some(scalar) = reduce_listoffset2d_all_fast(py, layout, arr.dtype, op)? {
+                return Ok(ReduceOutput::Scalar(scalar));
+            }
+        }
+        if depth == 0 && op == ReduceOp::Sum {
+            return Ok(ReduceOutput::Scalar(reduce_leaf_to_scalar(py, layout, arr.dtype, op)?));
+        }
+        return Err(PyValueError::new_err(
+            "Reduction over all axes (no dim) is only supported for sum on list->leaf arrays.",
+        ));
+    }
+    let dim = dim.unwrap();
 
     let axis = normalize_axis(dim, depth)?;
 
     if depth == 0 {
-        // 1D leaf: reduce over axis=0 => scalar
         if axis != 0 {
             return Err(PyValueError::new_err("Invalid dim for 1D reduction."));
         }
         return Ok(ReduceOutput::Scalar(reduce_leaf_to_scalar(py, layout, arr.dtype, op)?));
     }
 
-    // Fast path: rectangular 2D list->leaf with all-valid leaf.
     if depth == 1 {
         if let Some(out) = reduce_rect2d_fast(layout, arr.dtype, dim, op)? {
+            return Ok(ReduceOutput::Array(out));
+        }
+        if let Some(out) = reduce_ragged2d_dim1_fast(layout, arr.dtype, dim, op)? {
             return Ok(ReduceOutput::Array(out));
         }
         return match axis {
@@ -881,6 +895,76 @@ fn concat_axis0_layouts(layouts: &[Layout]) -> PyResult<Layout> {
         }
         _ => Err(PyValueError::new_err("concat_axis0_layouts: unsupported layout kind.")),
     }
+}
+
+fn listoffset2d_leaf_view(layout: &Layout) -> Option<(&[i64], &Leaf)> {
+    let lo = match layout {
+        Layout::ListOffset(lo) => lo,
+        _ => return None,
+    };
+    let leaf = match lo.content.as_ref() {
+        Layout::Leaf(l) => l,
+        _ => return None,
+    };
+    Some((lo.offsets.as_slice(), leaf))
+}
+
+fn reduce_listoffset2d_all_fast(
+    py: Python<'_>,
+    layout: &Layout,
+    dt: DType,
+    op: ReduceOp,
+) -> PyResult<Option<PyObject>> {
+    if op != ReduceOp::Sum {
+        return Ok(None);
+    }
+    let (_off, leaf) = match listoffset2d_leaf_view(layout) {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    if leaf.has_nulls || dt != DType::Int32 {
+        return Ok(None);
+    }
+    let v = match &leaf.buffer {
+        LeafBuffer::I32(buf) => buf.as_slice(),
+        _ => return Ok(None),
+    };
+    let sum = crate::kernels::sum_i32_to_i64(v);
+    Ok(Some(sum.to_object(py)))
+}
+
+fn reduce_ragged2d_dim1_fast(
+    layout: &Layout,
+    dt: DType,
+    dim: isize,
+    op: ReduceOp,
+) -> PyResult<Option<GrumpyArray>> {
+    let dim_u = if dim < 0 { (1isize + dim + 1) as usize } else { dim as usize };
+    if dim_u != 1 || op != ReduceOp::Sum || dt != DType::Int32 {
+        return Ok(None);
+    }
+    let (offsets, leaf) = match listoffset2d_leaf_view(layout) {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    if leaf.has_nulls {
+        return Ok(None);
+    }
+    let v = match &leaf.buffer {
+        LeafBuffer::I32(buf) => buf.as_slice(),
+        _ => return Ok(None),
+    };
+    let nrows = offsets.len().saturating_sub(1);
+    let mut out = out_leaf_for_2d(nrows, DType::Int64)?;
+    let o = match &mut out.buffer {
+        LeafBuffer::I64(x) => Arc::make_mut(x),
+        _ => unreachable!(),
+    };
+    crate::kernels::sum_i32_row_sums_to_i64(v, offsets, o);
+    Ok(Some(GrumpyArray {
+        dtype: DType::Int64,
+        layout: Layout::Leaf(out),
+    }))
 }
 
 fn rect2d_shape(layout: &Layout) -> Option<(usize, usize, &[i64], &Leaf)> {
