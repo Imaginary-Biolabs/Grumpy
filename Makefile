@@ -1,4 +1,4 @@
-.PHONY: develop test coverage docs bench bench-all clean
+.PHONY: develop test coverage docs bench bench-all wheel wheel-install clean
 
 develop:
 	maturin develop --release
@@ -22,6 +22,12 @@ bench-all:
 	  echo "=== $$f ==="; \
 	  python "$$f" || exit 1; \
 	done
+
+wheel:
+	maturin build --release --locked --compatibility pypi -o dist
+
+wheel-install: wheel
+	pip install dist/grumpy-*.whl --force-reinstall
 
 clean:
 	rm -rf dist/ target/wheels/ site/ htmlcov/ .coverage .pytest_cache
