@@ -25,6 +25,7 @@ python/grumpy/_core*.pyd
 
 # Local benchmark / test dataset artifacts
 *.gr
+coverage.xml
 
 # IDE / OS (non-dot paths)
 *.swp

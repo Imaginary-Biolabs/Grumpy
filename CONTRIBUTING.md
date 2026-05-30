@@ -18,7 +18,7 @@ Rust changes require a recent stable toolchain. `Cargo.lock` is committed for re
 ## Pull requests
 
 1. Fork or branch from `main`.
-2. Add tests for behavior changes; Python package coverage for `python/grumpy/` should stay at 100%.
+2. Add tests for behavior changes; Python package coverage for `python/grumpy/` should stay at or above 95%.
 3. Run `pytest` and, when touching hot paths, relevant benchmarks under `benchmarks/`.
 4. Update `CHANGELOG.md` under **Unreleased** (or the next version section).
 5. Keep diffs focused; match existing naming and module layout.

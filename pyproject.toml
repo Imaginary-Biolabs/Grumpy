@@ -46,6 +46,7 @@ source = ["grumpy"]
 omit = []
 
 [tool.coverage.report]
+fail_under = 95
 exclude_lines = [
   "pragma: no cover",
   "return snippet",

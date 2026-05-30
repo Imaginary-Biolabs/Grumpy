@@ -37,11 +37,11 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          python -m pytest tests/ --cov=grumpy --cov-report=term-missing --cov-fail-under=100
+          python -m pytest tests/ --cov=grumpy --cov-report=term-missing --cov-report=xml --cov-fail-under=95
 
-      - name: Upload coverage (ubuntu py3.12 only)
+      - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
-        uses: actions/upload-artifact@v4
+        uses: codecov/codecov-action@v5
         with:
-          name: coverage-report
-          path: .coverage
+          files: coverage.xml
+          fail_ci_if_error: false

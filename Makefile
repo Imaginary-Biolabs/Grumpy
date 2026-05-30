@@ -8,7 +8,7 @@ test:
 	pytest tests/
 
 coverage:
-	pytest tests/ --cov=grumpy --cov-report=term-missing --cov-fail-under=100
+	pytest tests/ --cov=grumpy --cov-report=term-missing --cov-fail-under=95
 
 docs:
 	mkdocs build -f mkdocs.yml

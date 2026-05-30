@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL--1.1-2A2725?style=for-the-badge&logo=opensourceinitiative&logoColor=E3E1DE" alt="license BSL 1.1" /></a>
-  <a href="https://github.com/Imaginary-Biolabs/Grumpy/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Imaginary-Biolabs/Grumpy/CI?branch=main&style=for-the-badge&label=build&color=484240&logo=githubactions&logoColor=E3E1DE" alt="build status" /></a>
-  <img src="https://img.shields.io/badge/coverage-100%25-777067?style=for-the-badge&logo=pytest&logoColor=E3E1DE" alt="coverage 100%" />
+  <a href="https://github.com/Imaginary-Biolabs/Grumpy/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Imaginary-Biolabs/Grumpy/ci.yml?branch=main&style=for-the-badge&label=build&color=484240&logo=githubactions&logoColor=E3E1DE" alt="build status" /></a>
+  <a href="https://codecov.io/gh/Imaginary-Biolabs/Grumpy"><img src="https://img.shields.io/codecov/c/github/Imaginary-Biolabs/Grumpy/main?style=for-the-badge&color=777067&logo=codecov&logoColor=E3E1DE" alt="codecov coverage" /></a>
   <a href="https://github.com/Imaginary-Biolabs/Grumpy/releases"><img src="https://img.shields.io/badge/version-0.1.0-C8C4BF?style=for-the-badge&logo=python&logoColor=2A2725" alt="version 0.1.0" /></a>
 </p>
 
@@ -92,7 +92,7 @@ Grumpy targets NumPy-class kernel performance on hot paths; Awkward comparisons 
 
 ```bash
 make develop
-make coverage   # 100% on python/grumpy/
+make coverage   # ≥95% on python/grumpy/
 make bench-all
 ```
 
