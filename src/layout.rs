@@ -1374,28 +1374,16 @@ fn try_build_leaf_i32_from_pylist_fast(list: &Bound<'_, PyList>) -> PyResult<Opt
     Ok(Some(leaf))
 }
 
-fn try_build_rect2d_listoffset_i32_fast(list: &Bound<'_, PyList>) -> PyResult<Option<ListOffset>> {
+fn try_build_listoffset_i32_from_pylist_fast(
+    list: &Bound<'_, PyList>,
+    require_uniform_cols: bool,
+) -> PyResult<Option<ListOffset>> {
     let nrows = list.len();
     if nrows == 0 {
         return Ok(None);
     }
-    let row0 = match list.get_item(0) {
-        Ok(x) => x,
-        Err(_) => return Ok(None),
-    };
-    let row0_list = match row0.downcast::<PyList>() {
-        Ok(x) => x,
-        Err(_) => return Ok(None),
-    };
-    let ncols = row0_list.len();
-    if ncols == 0 {
-        return Ok(None);
-    }
 
-    let mut offsets = Vec::with_capacity(nrows + 1);
-    offsets.push(0);
-    let mut values = Vec::with_capacity(nrows * ncols);
-
+    let mut row_lens = Vec::with_capacity(nrows);
     for i in 0..nrows {
         let row = match list.get_item(i) {
             Ok(x) => x,
@@ -1405,20 +1393,38 @@ fn try_build_rect2d_listoffset_i32_fast(list: &Bound<'_, PyList>) -> PyResult<Op
             Ok(x) => x,
             Err(_) => return Ok(None),
         };
-        if row_list.len() != ncols {
+        row_lens.push(row_list.len());
+    }
+
+    if require_uniform_cols {
+        let ncols = row_lens[0];
+        if ncols == 0 {
             return Ok(None);
         }
-        for j in 0..ncols {
-            let item = match row_list.get_item(j) {
-                Ok(x) => x,
-                Err(_) => return Ok(None),
-            };
+        if row_lens.iter().any(|&len| len != ncols) {
+            return Ok(None);
+        }
+    }
+
+    let total: usize = row_lens.iter().sum();
+    let mut offsets = Vec::with_capacity(nrows + 1);
+    offsets.push(0);
+    let mut values = Vec::with_capacity(total);
+
+    for i in 0..nrows {
+        let row = list.get_item(i)?;
+        let row_list = row.downcast::<PyList>().map_err(|_| {
+            PyValueError::new_err("Internal error: expected list row.")
+        })?;
+        let row_len = row_lens[i];
+        for j in 0..row_len {
+            let item = row_list.get_item(j)?;
             let Some(v) = (unsafe { extract_pyint_i32(item.as_ptr()) }) else {
                 return Ok(None);
             };
             values.push(v);
         }
-        offsets.push(offsets[i] + ncols as i64);
+        offsets.push(offsets[i] + row_len as i64);
     }
 
     let n = values.len();
@@ -1432,6 +1438,14 @@ fn try_build_rect2d_listoffset_i32_fast(list: &Bound<'_, PyList>) -> PyResult<Op
         offsets: Arc::new(offsets),
         content: Box::new(Layout::Leaf(leaf)),
     }))
+}
+
+fn try_build_rect2d_listoffset_i32_fast(list: &Bound<'_, PyList>) -> PyResult<Option<ListOffset>> {
+    try_build_listoffset_i32_from_pylist_fast(list, true)
+}
+
+fn try_build_ragged_listoffset_i32_fast(list: &Bound<'_, PyList>) -> PyResult<Option<ListOffset>> {
+    try_build_listoffset_i32_from_pylist_fast(list, false)
 }
 
 fn try_build_from_numpy(_py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType) -> PyResult<Option<Layout>> {
@@ -1507,7 +1521,10 @@ fn try_build_leaf_i32_from_pylist(_py: Python<'_>, seq: &Bound<'_, PySequence>) 
 
 fn try_build_rect2d_listoffset_i32(_py: Python<'_>, seq: &Bound<'_, PySequence>) -> PyResult<Option<ListOffset>> {
     if let Ok(list) = seq.downcast::<PyList>() {
-        return try_build_rect2d_listoffset_i32_fast(list);
+        if let Some(lo) = try_build_rect2d_listoffset_i32_fast(list)? {
+            return Ok(Some(lo));
+        }
+        return try_build_ragged_listoffset_i32_fast(list);
     }
     let nrows = seq.len()?;
     if nrows == 0 {
@@ -1568,6 +1585,9 @@ fn build_layout(py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType) -> PyResul
                     let row0 = list.get_item(0)?;
                     if row0.downcast::<PyList>().is_ok() {
                         if let Some(lo) = try_build_rect2d_listoffset_i32_fast(list)? {
+                            return Ok(Layout::ListOffset(lo));
+                        }
+                        if let Some(lo) = try_build_ragged_listoffset_i32_fast(list)? {
                             return Ok(Layout::ListOffset(lo));
                         }
                     } else if let Some(leaf) = try_build_leaf_i32_from_pylist_fast(list)? {

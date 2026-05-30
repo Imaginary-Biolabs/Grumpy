@@ -14,8 +14,8 @@ docs:
 	mkdocs build -f mkdocs.yml
 
 bench:
+	python benchmarks/benchmark_ragged_api.py
 	python benchmarks/benchmark_elementwise.py
-	python benchmarks/benchmark_awkward_elementwise.py
 
 bench-all:
 	@for f in benchmarks/benchmark_*.py; do \
