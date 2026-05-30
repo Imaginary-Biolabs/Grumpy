@@ -3427,7 +3427,11 @@ pub fn einsum(py: Python<'_>, subscripts: String, operands: &Bound<'_, pyo3::typ
         let arr: PyRef<'_, PyGrumpyArray> = item.extract()?;
         ops.push(arr.inner.clone());
     }
-    match einsum_ops::einsum(py, &subscripts, &ops)? {
+    let result = match einsum_ops::einsum(py, &subscripts, &ops) {
+        Ok(r) => r,
+        Err(_) => einsum_ops::einsum_numpy_fallback(py, &subscripts, &ops)?,
+    };
+    match result {
         einsum_ops::TensorOut::Scalar(o) => Ok(o),
         einsum_ops::TensorOut::Array(a) => Ok(Py::new(py, PyGrumpyArray { inner: a })?.into_py(py)),
     }

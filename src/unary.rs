@@ -1,5 +1,5 @@
 use crate::dtype::DType;
-use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
+use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
@@ -26,9 +26,6 @@ pub enum UnaryOp {
 }
 
 pub fn unary(py: Python<'_>, arr: &GrumpyArray, op: UnaryOp) -> PyResult<GrumpyArray> {
-    if arr.layout.has_union() {
-        return Err(PyValueError::new_err("Unary ops on union layouts are not implemented yet."));
-    }
     let out_dt = unary_out_dtype(arr.dtype, op)?;
     let out_layout = unary_layout(py, &arr.layout, arr.dtype, out_dt, op)?;
     Ok(GrumpyArray { dtype: out_dt, layout: out_layout })
@@ -75,7 +72,16 @@ fn unary_layout(py: Python<'_>, layout: &Layout, in_dt: DType, out_dt: DType, op
                 content: Box::new(content),
             }))
         }
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err("Unary ops on union layouts are not implemented yet.")),
+        Layout::UnionScalarList(u) => {
+            let scalars = unary_leaf(py, &u.scalars, in_dt, out_dt, op)?;
+            let list_content = unary_layout(py, u.lists.content.as_ref(), in_dt, out_dt, op)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars,
+                lists: ListOffset { offsets: u.lists.offsets.clone(), content: Box::new(list_content) },
+            }))
+        }
     }
 }
 

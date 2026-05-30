@@ -278,6 +278,41 @@ fn einsum2(py: Python<'_>, ta: &str, tb: &str, rhs: &str, a: &GrumpyArray, b: &G
     Err(PyValueError::new_err(format!("einsum: pattern not implemented. {supported}")))
 }
 
+/// NumPy fallback for patterns not implemented in Rust (parity / escape hatch).
+pub fn einsum_numpy_fallback(
+    py: Python<'_>,
+    subscripts: &str,
+    operands: &[GrumpyArray],
+) -> PyResult<TensorOut> {
+    let np = py.import_bound("numpy")?;
+    let mut call_args: Vec<PyObject> = Vec::with_capacity(1 + operands.len());
+    call_args.push(subscripts.into_py(py));
+    for op in operands {
+        let lst = op.to_py_list(py)?;
+        let arr = np.call_method1("array", (lst,))?;
+        call_args.push(arr.into());
+    }
+    let tuple = pyo3::types::PyTuple::new_bound(py, call_args);
+    let out = np.call_method1("einsum", (tuple,))?;
+    let shape: Vec<usize> = out.getattr("shape")?.extract()?;
+    if shape.is_empty() {
+        return Ok(TensorOut::Scalar(out.into()));
+    }
+    let flat = out.call_method0("ravel")?;
+    let dtype_name: String = out.getattr("dtype")?.getattr("name")?.extract()?;
+    let dtype = if dtype_name == "float64" {
+        DType::Float64
+    } else if dtype_name == "int32" {
+        DType::Int32
+    } else {
+        return Err(PyValueError::new_err(format!(
+            "einsum numpy fallback: unsupported result dtype {dtype_name}."
+        )));
+    };
+    let arr = crate::layout::build_array(py, &flat, dtype)?;
+    Ok(TensorOut::Array(arr))
+}
+
 // ---------- kernels ----------
 
 fn dot_vec_vec(py: Python<'_>, dtype: DType, a: &Leaf, b: &Leaf) -> PyResult<PyObject> {

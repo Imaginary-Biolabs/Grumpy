@@ -299,6 +299,11 @@ impl LeafBuffer {
             (LeafBuffer::F64(o), LeafBuffer::F64(s)) => { Arc::make_mut(o).extend(std::iter::repeat(s[0]).take(count)); Ok(()) }
             (LeafBuffer::Bool(o), LeafBuffer::Bool(s)) => { Arc::make_mut(o).extend(std::iter::repeat(s[0]).take(count)); Ok(()) }
             (LeafBuffer::Char(o), LeafBuffer::Char(s)) => { Arc::make_mut(o).extend(std::iter::repeat(s[0]).take(count)); Ok(()) }
+            (LeafBuffer::String(o), LeafBuffer::String(s)) => {
+                let val = s[0].clone();
+                Arc::make_mut(o).extend(std::iter::repeat(val).take(count));
+                Ok(())
+            }
             _ => Err(PyValueError::new_err("Internal error: dtype mismatch in extend_repeat_first.")),
         }
     }
@@ -729,9 +734,17 @@ pub fn take_range(layout: &Layout, start: usize, end: usize) -> PyResult<Layout>
                 content: ix.content.clone(),
             }))
         }
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err(
-            "take_range is not supported for union layouts in fast path.",
-        )),
+        Layout::UnionScalarList(u) => {
+            if end > u.len() {
+                return Err(PyValueError::new_err("Index out of bounds."));
+            }
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags[start..end].to_vec(),
+                index: u.index[start..end].to_vec(),
+                scalars: u.scalars.clone(),
+                lists: u.lists.clone(),
+            }))
+        }
     }
 }
 
@@ -775,9 +788,24 @@ pub fn drop_axis0_select_element(layout: &Layout, idx: usize) -> PyResult<Layout
             }
             Ok(Layout::Leaf(take_leaf_indices(l, &[idx])?))
         }
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err(
-            "drop_axis0_select_element is not supported for union layouts in fast path.",
-        )),
+        Layout::UnionScalarList(u) => {
+            if idx >= u.len() {
+                return Err(PyValueError::new_err("Index out of bounds."));
+            }
+            match u.tags[idx] {
+                0 => {
+                    let ix = u.index[idx] as usize;
+                    Ok(Layout::Leaf(take_leaf_indices(&u.scalars, &[ix])?))
+                }
+                1 => {
+                    let li = u.index[idx] as usize;
+                    let start = u.lists.offsets[li] as usize;
+                    let end = u.lists.offsets[li + 1] as usize;
+                    take_range(u.lists.content.as_ref(), start, end)
+                }
+                _ => Err(PyValueError::new_err("Invalid union tag.")),
+            }
+        }
     }
 }
 

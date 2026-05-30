@@ -1,5 +1,5 @@
 use crate::dtype::DType;
-use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
+use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
@@ -31,31 +31,21 @@ pub enum LogicOp {
 }
 
 pub fn compare(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, op: CmpOp) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() || b.layout.has_union() {
-        return Err(PyValueError::new_err("Comparisons on union layouts are not implemented yet."));
-    }
-    // For now: require identical dtype (like our elementwise ops).
-    if a.dtype != b.dtype {
-        return Err(PyValueError::new_err(
-            "Comparison requires matching dtypes (casting not implemented yet).",
-        ));
-    }
-    let layout = compare_layout(py, &a.layout, &b.layout, a.dtype, op)?;
+    let (a2, b2) = if a.dtype != b.dtype {
+        crate::cast::cast_array_pair(a, b)?
+    } else {
+        (a.clone(), b.clone())
+    };
+    let layout = compare_layout(py, &a2.layout, &b2.layout, a2.dtype, op)?;
     Ok(GrumpyArray { dtype: DType::Bool, layout })
 }
 
 pub fn predicate(py: Python<'_>, a: &GrumpyArray, op: PredOp) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() {
-        return Err(PyValueError::new_err("Predicates on union layouts are not implemented yet."));
-    }
     let layout = pred_layout(py, &a.layout, a.dtype, op)?;
     Ok(GrumpyArray { dtype: DType::Bool, layout })
 }
 
 pub fn logical_bin(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, op: LogicOp) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() || b.layout.has_union() {
-        return Err(PyValueError::new_err("Logical ops on union layouts are not implemented yet."));
-    }
     if a.dtype != DType::Bool || b.dtype != DType::Bool {
         return Err(PyValueError::new_err("logical_* requires bool arrays."));
     }
@@ -64,9 +54,6 @@ pub fn logical_bin(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, op: LogicOp
 }
 
 pub fn logical_not(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() {
-        return Err(PyValueError::new_err("logical_not on union layouts is not implemented yet."));
-    }
     if a.dtype != DType::Bool {
         return Err(PyValueError::new_err("logical_not requires bool array."));
     }
@@ -92,6 +79,19 @@ fn logical_layout(py: Python<'_>, a: &Layout, b: &Layout, op: LogicOp) -> PyResu
             }
             let content = logical_layout(py, oa.content.as_ref(), ob.content.as_ref(), op)?;
             Ok(Layout::ListOffset(ListOffset { offsets: oa.offsets.clone(), content: Box::new(content) }))
+        }
+        (Layout::UnionScalarList(ua), Layout::UnionScalarList(ub)) => {
+            if ua.tags != ub.tags || ua.index != ub.index || ua.lists.offsets != ub.lists.offsets {
+                return Err(PyValueError::new_err("Logical op requires identical union structure."));
+            }
+            let scalars = logical_leaf(py, &ua.scalars, &ub.scalars, op)?;
+            let list_content = logical_layout(py, ua.lists.content.as_ref(), ub.lists.content.as_ref(), op)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: ua.tags.clone(),
+                index: ua.index.clone(),
+                scalars,
+                lists: ListOffset { offsets: ua.lists.offsets.clone(), content: Box::new(list_content) },
+            }))
         }
         _ => Err(PyValueError::new_err("Logical op requires matching layouts for now.")),
     }
@@ -128,7 +128,32 @@ fn logical_not_layout(py: Python<'_>, a: &Layout) -> PyResult<Layout> {
             let content = logical_not_layout(py, lo.content.as_ref())?;
             Ok(Layout::ListOffset(ListOffset { offsets: lo.offsets.clone(), content: Box::new(content) }))
         }
-        _ => Err(PyValueError::new_err("logical_not requires leaf or list layout.")),
+        Layout::UnionScalarList(u) => {
+            let scalars = logical_not_leaf(py, &u.scalars)?;
+            let list_content = logical_not_layout(py, u.lists.content.as_ref())?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars,
+                lists: ListOffset { offsets: u.lists.offsets.clone(), content: Box::new(list_content) },
+            }))
+        }
+        Layout::OffsetView(v) => {
+            let content = logical_not_layout(py, v.content.as_ref())?;
+            Ok(Layout::OffsetView(crate::layout::OffsetView {
+                offsets: v.offsets.clone(),
+                start: v.start,
+                stop: v.stop,
+                content: Box::new(content),
+            }))
+        }
+        Layout::Indexed(ix) => {
+            let content = logical_not_layout(py, ix.content.as_ref())?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ix.index.clone(),
+                content: Box::new(content),
+            }))
+        }
     }
 }
 
@@ -155,6 +180,41 @@ fn compare_layout(py: Python<'_>, a: &Layout, b: &Layout, dt: DType, op: CmpOp) 
             }
             let content = compare_layout(py, oa.content.as_ref(), ob.content.as_ref(), dt, op)?;
             Ok(Layout::ListOffset(ListOffset { offsets: oa.offsets.clone(), content: Box::new(content) }))
+        }
+        (Layout::UnionScalarList(ua), Layout::UnionScalarList(ub)) => {
+            if ua.tags != ub.tags || ua.index != ub.index || ua.lists.offsets != ub.lists.offsets {
+                return Err(PyValueError::new_err("Comparison requires identical union structure."));
+            }
+            let scalars = compare_leaf(py, &ua.scalars, &ub.scalars, dt, op)?;
+            let list_content = compare_layout(py, ua.lists.content.as_ref(), ub.lists.content.as_ref(), dt, op)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: ua.tags.clone(),
+                index: ua.index.clone(),
+                scalars,
+                lists: ListOffset { offsets: ua.lists.offsets.clone(), content: Box::new(list_content) },
+            }))
+        }
+        (Layout::OffsetView(va), Layout::OffsetView(vb)) => {
+            if va.start != vb.start || va.stop != vb.stop || va.offsets != vb.offsets {
+                return Err(PyValueError::new_err("Comparison requires identical offset views."));
+            }
+            let content = compare_layout(py, va.content.as_ref(), vb.content.as_ref(), dt, op)?;
+            Ok(Layout::OffsetView(crate::layout::OffsetView {
+                offsets: va.offsets.clone(),
+                start: va.start,
+                stop: vb.stop,
+                content: Box::new(content),
+            }))
+        }
+        (Layout::Indexed(ia), Layout::Indexed(ib)) => {
+            if ia.index != ib.index {
+                return Err(PyValueError::new_err("Comparison requires identical index vectors."));
+            }
+            let content = compare_layout(py, ia.content.as_ref(), ib.content.as_ref(), dt, op)?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ia.index.clone(),
+                content: Box::new(content),
+            }))
         }
         _ => Err(PyValueError::new_err("Comparison requires matching layouts for now.")),
     }
@@ -219,6 +279,22 @@ fn compare_leaf(_py: Python<'_>, a: &Leaf, b: &Leaf, dt: DType, op: CmpOp) -> Py
                 o[i] = cmp_bool_f64(x, y, op) as u8;
             }
         }
+        DType::String => {
+            let aa = match &a.buffer { LeafBuffer::String(v) => v.as_slice(), _ => unreachable!() };
+            let bb = match &b.buffer { LeafBuffer::String(v) => v.as_slice(), _ => unreachable!() };
+            for i in 0..n {
+                if !out_valid[i] { continue; }
+                let ord = aa[i].cmp(&bb[i]);
+                o[i] = match op {
+                    CmpOp::Eq => (ord == std::cmp::Ordering::Equal) as u8,
+                    CmpOp::Ne => (ord != std::cmp::Ordering::Equal) as u8,
+                    CmpOp::Lt => (ord == std::cmp::Ordering::Less) as u8,
+                    CmpOp::Le => (ord != std::cmp::Ordering::Greater) as u8,
+                    CmpOp::Gt => (ord == std::cmp::Ordering::Greater) as u8,
+                    CmpOp::Ge => (ord != std::cmp::Ordering::Less) as u8,
+                };
+            }
+        }
         _ => return Err(PyValueError::new_err("Comparison not implemented for this dtype.")),
     }
     Ok(out)
@@ -231,7 +307,32 @@ fn pred_layout(py: Python<'_>, a: &Layout, dt: DType, op: PredOp) -> PyResult<La
             let content = pred_layout(py, lo.content.as_ref(), dt, op)?;
             Ok(Layout::ListOffset(ListOffset { offsets: lo.offsets.clone(), content: Box::new(content) }))
         }
-        _ => Err(PyValueError::new_err("Predicate requires leaf or list layout.")),
+        Layout::UnionScalarList(u) => {
+            let scalars = pred_leaf(py, &u.scalars, dt, op)?;
+            let list_content = pred_layout(py, u.lists.content.as_ref(), dt, op)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars,
+                lists: ListOffset { offsets: u.lists.offsets.clone(), content: Box::new(list_content) },
+            }))
+        }
+        Layout::OffsetView(v) => {
+            let content = pred_layout(py, v.content.as_ref(), dt, op)?;
+            Ok(Layout::OffsetView(crate::layout::OffsetView {
+                offsets: v.offsets.clone(),
+                start: v.start,
+                stop: v.stop,
+                content: Box::new(content),
+            }))
+        }
+        Layout::Indexed(ix) => {
+            let content = pred_layout(py, ix.content.as_ref(), dt, op)?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ix.index.clone(),
+                content: Box::new(content),
+            }))
+        }
     }
 }
 

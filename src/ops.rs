@@ -279,39 +279,39 @@ pub fn elementwise_with_scalar(
 }
 
 pub fn elementwise(a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyResult<GrumpyArray> {
+    let out_dtype = elementwise_out_dtype(a.dtype, b.dtype, op)?;
+    let (a2, b2) = if a.dtype != b.dtype {
+        crate::cast::cast_array_pair(a, b)?
+    } else {
+        (a.clone(), b.clone())
+    };
     // Rectangular 2D fast path (ListOffset -> Leaf) for common dtypes, no nulls.
-    if let Some(out) = elementwise_rect2d_fast(a, b, op)? {
+    if let Some(out) = elementwise_rect2d_fast(&a2, &b2, op)? {
         return Ok(out);
     }
     // Same-offset 2D list->leaf (ragged or rectangular): one flat leaf pass.
-    if let Some(out) = elementwise_same_listoffset2d_fast(a, b, op)? {
+    if let Some(out) = elementwise_same_listoffset2d_fast(&a2, &b2, op)? {
         return Ok(out);
     }
     // Ragged 2D fast path (ListOffset -> Leaf) including per-row broadcast (len==1).
-    if let Some(out) = elementwise_ragged2d_fast(a, b, op)? {
+    if let Some(out) = elementwise_ragged2d_fast(&a2, &b2, op)? {
         return Ok(out);
     }
     // If the two layouts match exactly (including unions), we can run the generic recursive kernel
     // (no broadcasting). This is the Awkward-like "same structure" elementwise case.
-    if layouts_compatible(&a.layout, &b.layout) {
-        let out_dtype = elementwise_out_dtype(a.dtype, b.dtype, op)?;
-        let layout = elementwise_layout(&a.layout, &b.layout, a.dtype, b.dtype, out_dtype, op)?;
+    if layouts_compatible(&a2.layout, &b2.layout) {
+        let layout = elementwise_layout(&a2.layout, &b2.layout, a2.dtype, b2.dtype, out_dtype, op)?;
         return Ok(GrumpyArray { dtype: out_dtype, layout });
     }
 
     // Broadcasting path: currently only supported for pure list-chains (no unions).
-    if a.layout.has_union() || b.layout.has_union() {
+    if a2.layout.has_union() || b2.layout.has_union() {
         return Err(PyValueError::new_err(
             "Broadcasting on union layouts is not supported. If both operands have the same union structure, it is supported.",
         ));
     }
 
-    // Dtype rules (milestone-6 minimal):
-    // - For add/sub/mul/mod/remainder: require same dtype and numeric.
-    // - For div: allow float dtypes; for int/uint produce float64 (like NumPy true_divide).
-    let out_dtype = elementwise_out_dtype(a.dtype, b.dtype, op)?;
-
-    let layout = elementwise_layout_broadcast(&a.layout, &b.layout, a.dtype, b.dtype, out_dtype, op)?;
+    let layout = elementwise_layout_broadcast(&a2.layout, &b2.layout, a2.dtype, b2.dtype, out_dtype, op)?;
     Ok(GrumpyArray { dtype: out_dtype, layout })
 }
 
@@ -413,13 +413,13 @@ pub fn mul_sum_all_i64(a: &GrumpyArray, b: &GrumpyArray) -> PyResult<i64> {
 fn elementwise_out_dtype(a: DType, b: DType, op: BinOp) -> PyResult<DType> {
     match op {
         BinOp::Div => {
-            if a != b {
-                return Err(PyValueError::new_err(
-                    "Division currently requires matching dtypes (casting not implemented yet).",
-                ));
-            }
-            match a {
-                DType::Float16 | DType::Float32 | DType::Float64 => Ok(a),
+            let promoted = if a == b {
+                a
+            } else {
+                crate::cast::promote_binary(a, b)?
+            };
+            match promoted {
+                DType::Float16 | DType::Float32 | DType::Float64 => Ok(promoted),
                 DType::Int8
                 | DType::Int16
                 | DType::Int32
@@ -436,20 +436,34 @@ fn elementwise_out_dtype(a: DType, b: DType, op: BinOp) -> PyResult<DType> {
                 )),
             }
         }
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::Remainder => {
-            if a != b {
-                return Err(PyValueError::new_err(
-                    "Elementwise operation requires matching dtypes (casting not implemented yet).",
-                ));
+        BinOp::Add => {
+            if a == DType::String && b == DType::String {
+                return Ok(DType::String);
             }
-            match a {
+            let promoted = crate::cast::promote_binary(a, b)?;
+            match promoted {
+                DType::Bool => Err(PyValueError::new_err(
+                    "Arithmetic ops are not supported for dtype=bool (cast to an integer dtype first).",
+                )),
+                DType::Char => Err(PyValueError::new_err(
+                    "Operation not supported for char dtype (use string).",
+                )),
+                DType::String => Err(PyValueError::new_err(
+                    "Only add is supported for string dtype.",
+                )),
+                _ => Ok(promoted),
+            }
+        }
+        BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::Remainder => {
+            let promoted = crate::cast::promote_binary(a, b)?;
+            match promoted {
                 DType::Bool => Err(PyValueError::new_err(
                     "Arithmetic ops are not supported for dtype=bool (cast to an integer dtype first).",
                 )),
                 DType::Char | DType::String => Err(PyValueError::new_err(
                     "Operation not supported for non-numeric dtypes.",
                 )),
-                _ => Ok(a),
+                _ => Ok(promoted),
             }
         }
     }
@@ -2053,7 +2067,29 @@ fn elementwise_leaf(
         DType::Bool => LeafBuffer::Bool(Arc::new(vec![0u8; n])),
         DType::Char => LeafBuffer::Char(Arc::new(vec![0u32; n])),
         DType::String => {
-            return Err(PyValueError::new_err("Elementwise ops are not implemented for dtype=string."));
+            if op != BinOp::Add {
+                return Err(PyValueError::new_err(
+                    "Only add (concatenation) is supported for dtype=string.",
+                ));
+            }
+            let aa = match &a.buffer {
+                LeafBuffer::String(v) => v.as_slice(),
+                _ => unreachable!(),
+            };
+            let bb = match &b.buffer {
+                LeafBuffer::String(v) => v.as_slice(),
+                _ => unreachable!(),
+            };
+            let mut out_s: Vec<String> = Vec::with_capacity(n);
+            for i in 0..n {
+                if !all_valid && !out.validity[i] {
+                    out_s.push(String::new());
+                    continue;
+                }
+                out_s.push(format!("{}{}", aa[i], bb[i]));
+            }
+            out.buffer = LeafBuffer::String(Arc::new(out_s));
+            return Ok(out);
         }
     };
 

@@ -9,9 +9,6 @@ use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 pub fn unique(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() {
-        return Err(PyValueError::new_err("unique() on union layouts is not implemented yet."));
-    }
     let leaf = find_leaf(&a.layout)?;
     match a.dtype {
         DType::Int32 => unique_i32(py, leaf),
@@ -20,6 +17,7 @@ pub fn unique(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
         DType::UInt64 => unique_u64(py, leaf),
         DType::Bool => unique_bool(py, leaf),
         DType::Char => unique_char(py, leaf),
+        DType::String => unique_string(py, leaf),
         DType::Float32 => unique_f32(py, leaf),
         DType::Float64 => unique_f64(py, leaf),
         _ => Err(PyValueError::new_err("unique() not implemented for this dtype.")),
@@ -27,15 +25,14 @@ pub fn unique(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
 }
 
 pub fn isin(a: &GrumpyArray, test: &GrumpyArray) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() || test.layout.has_union() {
-        return Err(PyValueError::new_err("isin() on union layouts is not implemented yet."));
-    }
-    if a.dtype != test.dtype {
-        return Err(PyValueError::new_err("isin() requires matching dtypes for now."));
-    }
-    let test_leaf = find_leaf(&test.layout)?;
-    let set = build_membership_set(test.dtype, test_leaf)?;
-    let out_layout = isin_layout(&a.layout, a.dtype, &set)?;
+    let (a2, test2) = if a.dtype != test.dtype {
+        crate::cast::cast_array_pair(a, test)?
+    } else {
+        (a.clone(), test.clone())
+    };
+    let test_leaf = find_leaf(&test2.layout)?;
+    let set = build_membership_set(test2.dtype, test_leaf)?;
+    let out_layout = isin_layout(&a2.layout, a2.dtype, &set)?;
     Ok(GrumpyArray {
         dtype: DType::Bool,
         layout: out_layout,
@@ -43,42 +40,45 @@ pub fn isin(a: &GrumpyArray, test: &GrumpyArray) -> PyResult<GrumpyArray> {
 }
 
 pub fn setunion(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() || b.layout.has_union() {
-        return Err(PyValueError::new_err("setunion() on union layouts is not implemented yet."));
-    }
-    if a.dtype != b.dtype {
-        return Err(PyValueError::new_err("setunion() requires matching dtypes for now."));
-    }
+    let (a2, b2) = if a.dtype != b.dtype {
+        crate::cast::cast_array_pair(a, b)?
+    } else {
+        (a.clone(), b.clone())
+    };
     // NumPy union1d is unique(concatenate(a,b)).
-    let la = find_leaf(&a.layout)?;
-    let lb = find_leaf(&b.layout)?;
-    match a.dtype {
+    let la = find_leaf(&a2.layout)?;
+    let lb = find_leaf(&b2.layout)?;
+    match a2.dtype {
         DType::Float32 => {
             let mut v = collect_f32(la);
             v.extend(collect_f32(lb));
-            unique_f32_from_values(py, a.dtype, &v)
+            unique_f32_from_values(py, a2.dtype, &v)
         }
         DType::Float64 => {
             let mut v = collect_f64(la);
             v.extend(collect_f64(lb));
-            unique_f64_from_values(py, a.dtype, &v)
+            unique_f64_from_values(py, a2.dtype, &v)
+        }
+        DType::String => {
+            let mut v = collect_string(la);
+            v.extend(collect_string(lb));
+            unique_string_from_values(py, &v)
         }
         _ => {
             // generic: unique(concat) via hash then sort
-            let mut vals = collect_scalar_bits(a.dtype, la)?;
-            vals.extend(collect_scalar_bits(a.dtype, lb)?);
-            unique_from_scalar_bits(py, a.dtype, &vals)
+            let mut vals = collect_scalar_bits(a2.dtype, la)?;
+            vals.extend(collect_scalar_bits(a2.dtype, lb)?);
+            unique_from_scalar_bits(py, a2.dtype, &vals)
         }
     }
 }
 
 pub fn setdiff(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() || b.layout.has_union() {
-        return Err(PyValueError::new_err("setdiff() on union layouts is not implemented yet."));
-    }
-    if a.dtype != b.dtype {
-        return Err(PyValueError::new_err("setdiff() requires matching dtypes for now."));
-    }
+    let (a2, b2) = if a.dtype != b.dtype {
+        crate::cast::cast_array_pair(a, b)?
+    } else {
+        (a.clone(), b.clone())
+    };
     // NumPy setdiff1d is: unique(a) filtered by isin(..., invert=True) where NaN never matches.
     let ua = unique(py, a)?;
     let ub = unique(py, b)?;
@@ -104,23 +104,22 @@ pub fn setdiff(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<Gru
                     out.push(x);
                 }
             }
-            unique_from_scalar_bits(py, a.dtype, &out)
+            unique_from_scalar_bits(py, a2.dtype, &out)
         }
     }
 }
 
 pub fn setxor(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() || b.layout.has_union() {
-        return Err(PyValueError::new_err("setxor() on union layouts is not implemented yet."));
-    }
-    if a.dtype != b.dtype {
-        return Err(PyValueError::new_err("setxor() requires matching dtypes for now."));
-    }
-    let ua = unique(py, a)?;
-    let ub = unique(py, b)?;
+    let (a2, b2) = if a.dtype != b.dtype {
+        crate::cast::cast_array_pair(a, b)?
+    } else {
+        (a.clone(), b.clone())
+    };
+    let ua = unique(py, &a2)?;
+    let ub = unique(py, &b2)?;
     let la = find_leaf(&ua.layout)?;
     let lb = find_leaf(&ub.layout)?;
-    match a.dtype {
+    match a2.dtype {
         DType::Float32 => setxor_f32(py, la, lb),
         DType::Float64 => setxor_f64(py, la, lb),
         _ => {
@@ -144,7 +143,7 @@ pub fn setxor(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<Grum
                     j += 1;
                 }
             }
-            unique_from_scalar_bits(py, a.dtype, &out)
+            unique_from_scalar_bits(py, a2.dtype, &out)
         }
     }
 }
@@ -157,7 +156,13 @@ fn find_leaf<'a>(layout: &'a Layout) -> PyResult<&'a Leaf> {
         Layout::ListOffset(lo) => find_leaf(lo.content.as_ref()),
         Layout::Indexed(ix) => find_leaf(ix.content.as_ref()),
         Layout::OffsetView(v) => find_leaf(v.content.as_ref()),
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err("Union not supported.")),
+        Layout::UnionScalarList(u) => {
+            if u.scalars.len > 0 {
+                Ok(&u.scalars)
+            } else {
+                find_leaf(u.lists.content.as_ref())
+            }
+        }
     }
 }
 
@@ -265,6 +270,41 @@ fn unique_char(_py: Python<'_>, leaf: &Leaf) -> PyResult<GrumpyArray> {
     v.sort();
     v.dedup();
     new_leaf_char(v)
+}
+fn collect_string(leaf: &Leaf) -> Vec<String> {
+    let v = match &leaf.buffer {
+        LeafBuffer::String(v) => v.as_slice(),
+        _ => &[],
+    };
+    let mut out = Vec::new();
+    out.reserve(leaf.len);
+    for i in 0..leaf.len {
+        if leaf.validity[i] {
+            out.push(v[i].clone());
+        }
+    }
+    out
+}
+fn unique_string(_py: Python<'_>, leaf: &Leaf) -> PyResult<GrumpyArray> {
+    unique_string_from_values(_py, &collect_string(leaf))
+}
+fn unique_string_from_values(_py: Python<'_>, values: &[String]) -> PyResult<GrumpyArray> {
+    let mut v = values.to_vec();
+    v.sort();
+    v.dedup();
+    new_leaf_string(v)
+}
+fn new_leaf_string(v: Vec<String>) -> PyResult<GrumpyArray> {
+    let n = v.len();
+    let mut leaf = Leaf::new(DType::String);
+    leaf.len = n;
+    leaf.has_nulls = false;
+    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    leaf.buffer = LeafBuffer::String(Arc::new(v));
+    Ok(GrumpyArray {
+        dtype: DType::String,
+        layout: Layout::Leaf(leaf),
+    })
 }
 fn unique_bool(_py: Python<'_>, leaf: &Leaf) -> PyResult<GrumpyArray> {
     let mut v = collect_bool(leaf);
@@ -604,6 +644,7 @@ enum MembershipSet {
     U64(FxHashSet<u64>),
     Bool(FxHashSet<u8>),
     Char(FxHashSet<u32>),
+    String(FxHashSet<String>),
     F32(FxHashSet<u32>), // bits, with 0 normalized; NaNs excluded
     F64(FxHashSet<u64>), // bits, with 0 normalized; NaNs excluded
 }
@@ -690,6 +731,16 @@ fn build_membership_set(dt: DType, leaf: &Leaf) -> PyResult<MembershipSet> {
             }
             Ok(MembershipSet::Char(s))
         }
+        (DType::String, LeafBuffer::String(v)) => {
+            let mut s = FxHashSet::default();
+            s.reserve(leaf.len.min(131_072));
+            for i in 0..leaf.len {
+                if leaf.validity[i] {
+                    s.insert(v[i].clone());
+                }
+            }
+            Ok(MembershipSet::String(s))
+        }
         (DType::Float32, LeafBuffer::F32(v)) => {
             let mut s = FxHashSet::default();
             s.reserve(leaf.len.min(131_072));
@@ -752,7 +803,19 @@ fn isin_layout(layout: &Layout, dt: DType, set: &MembershipSet) -> PyResult<Layo
                 content: Box::new(content),
             }))
         }
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err("Union not supported.")),
+        Layout::UnionScalarList(u) => {
+            let scalars = isin_leaf(&u.scalars, dt, set)?;
+            let list_content = isin_layout(u.lists.content.as_ref(), dt, set)?;
+            Ok(Layout::UnionScalarList(crate::layout::UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars,
+                lists: ListOffset {
+                    offsets: u.lists.offsets.clone(),
+                    content: Box::new(list_content),
+                },
+            }))
+        }
     }
 }
 
@@ -792,6 +855,13 @@ fn isin_leaf(leaf: &Leaf, dt: DType, set: &MembershipSet) -> PyResult<Leaf> {
         }
         (DType::Char, MembershipSet::Char(s), LeafBuffer::Char(v)) => {
             for i in 0..n { if leaf.validity[i] { oo[i] = s.contains(&v[i]) as u8; } }
+        }
+        (DType::String, MembershipSet::String(s), LeafBuffer::String(v)) => {
+            for i in 0..n {
+                if leaf.validity[i] {
+                    oo[i] = s.contains(&v[i]) as u8;
+                }
+            }
         }
         (DType::Float32, MembershipSet::F32(s), LeafBuffer::F32(v)) => {
             for i in 0..n {
