@@ -8,7 +8,7 @@
 
 ## Reporting a vulnerability
 
-Please report security issues privately to the Imaginary Biolabs security contact listed on [imaginary.bio](https://www.imaginary.bio) rather than opening a public GitHub issue.
+Please report security issues privately via <a href="mailto:contact&#64;imaginary&#46;bio?subject=Grumpy%20security%20report">security contact</a> rather than opening a public GitHub issue.
 
 Include:
 
