@@ -81,7 +81,6 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          paths: [python]
           options:
             docstring_style: numpy
             show_source: false
@@ -93,6 +92,7 @@ plugins:
             allow_inspection: true
             preload_modules:
               - grumpy
+              - grumpy._core
 
 validation:
   links:
