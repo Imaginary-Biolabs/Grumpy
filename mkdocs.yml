@@ -103,6 +103,3 @@ strict: true
 
 hooks:
   - docs/hooks.py
-
-watch:
-  - docs/generated

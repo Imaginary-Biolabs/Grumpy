@@ -24,8 +24,8 @@ dependencies = ["numpy>=1.23"]
 dev = [
   "pytest>=7",
   "pytest-cov>=4",
-  "mkdocs>=1.5",
-  "mkdocs-material>=9",
+  "mkdocs>=1.5,<2",
+  "mkdocs-material>=9,<10",
   "mkdocstrings[python]>=0.27",
   "plotly>=5",
   "awkward>=2.6",
