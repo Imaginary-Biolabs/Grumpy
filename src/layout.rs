@@ -262,6 +262,82 @@ impl LeafBuffer {
         }
     }
 
+    pub fn concat(&self, other: &Self) -> PyResult<Self> {
+        match (self, other) {
+            (LeafBuffer::I8(a), LeafBuffer::I8(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::I8(Arc::new(out)))
+            }
+            (LeafBuffer::I16(a), LeafBuffer::I16(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::I16(Arc::new(out)))
+            }
+            (LeafBuffer::I32(a), LeafBuffer::I32(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::I32(Arc::new(out)))
+            }
+            (LeafBuffer::I64(a), LeafBuffer::I64(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::I64(Arc::new(out)))
+            }
+            (LeafBuffer::U8(a), LeafBuffer::U8(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::U8(Arc::new(out)))
+            }
+            (LeafBuffer::U16(a), LeafBuffer::U16(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::U16(Arc::new(out)))
+            }
+            (LeafBuffer::U32(a), LeafBuffer::U32(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::U32(Arc::new(out)))
+            }
+            (LeafBuffer::U64(a), LeafBuffer::U64(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::U64(Arc::new(out)))
+            }
+            (LeafBuffer::F16(a), LeafBuffer::F16(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::F16(Arc::new(out)))
+            }
+            (LeafBuffer::F32(a), LeafBuffer::F32(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::F32(Arc::new(out)))
+            }
+            (LeafBuffer::F64(a), LeafBuffer::F64(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::F64(Arc::new(out)))
+            }
+            (LeafBuffer::Bool(a), LeafBuffer::Bool(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::Bool(Arc::new(out)))
+            }
+            (LeafBuffer::Char(a), LeafBuffer::Char(b)) => {
+                let mut out = a.to_vec();
+                out.extend_from_slice(b);
+                Ok(LeafBuffer::Char(Arc::new(out)))
+            }
+        (LeafBuffer::String(a), LeafBuffer::String(b)) => {
+            let mut out = a.to_vec();
+            out.extend(b.iter().cloned());
+            Ok(LeafBuffer::String(Arc::new(out)))
+        }
+            _ => Err(PyValueError::new_err("Internal error: dtype mismatch in leaf concat.")),
+        }
+    }
+
     pub fn push_from_index(&mut self, src: &LeafBuffer, idx: usize) -> PyResult<()> {
         match (self, src) {
             (LeafBuffer::I8(o), LeafBuffer::I8(s)) => { Arc::make_mut(o).push(s[idx]); Ok(()) }
@@ -613,6 +689,11 @@ impl UnionScalarList {
         Arc::make_mut(&mut self.lists.offsets);
         self.lists.content.uniquify_buffers();
     }
+
+    /// Slice ``[start, stop)`` along the union outer axis, compacting scalar/list pools.
+    pub fn take_range(&self, start: usize, stop: usize) -> PyResult<Self> {
+        take_union_scalar_list_range(self, start, stop)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -734,18 +815,166 @@ pub fn take_range(layout: &Layout, start: usize, end: usize) -> PyResult<Layout>
                 content: ix.content.clone(),
             }))
         }
-        Layout::UnionScalarList(u) => {
-            if end > u.len() {
-                return Err(PyValueError::new_err("Index out of bounds."));
+        Layout::UnionScalarList(u) => u.take_range(start, end).map(Layout::UnionScalarList),
+    }
+}
+
+/// Concatenate layout segments along the innermost leaf axis (used by union list compaction).
+pub fn concat_layout_segments(segments: &[Layout]) -> PyResult<Layout> {
+    if segments.is_empty() {
+        return Err(PyValueError::new_err("Cannot concat empty layout segments."));
+    }
+    if segments.len() == 1 {
+        return Ok(segments[0].clone());
+    }
+    let dt = match &segments[0] {
+        Layout::Leaf(l) => l.dtype,
+        Layout::ListOffset(lo) => leaf_dtype(lo.content.as_ref())?,
+        _ => {
+            return Err(PyValueError::new_err(
+                "concat_layout_segments: unsupported layout kind.",
+            ))
+        }
+    };
+    let mut cur = segments[0].clone();
+    for seg in &segments[1..] {
+        cur = concat_two_layout_segments(&cur, seg, dt)?;
+    }
+    Ok(cur)
+}
+
+fn leaf_dtype(layout: &Layout) -> PyResult<DType> {
+    match layout {
+        Layout::Leaf(l) => Ok(l.dtype),
+        Layout::ListOffset(lo) => leaf_dtype(lo.content.as_ref()),
+        Layout::OffsetView(v) => leaf_dtype(v.content.as_ref()),
+        Layout::Indexed(ix) => leaf_dtype(ix.content.as_ref()),
+        Layout::UnionScalarList(u) => Ok(u.scalars.dtype),
+    }
+}
+
+fn concat_two_layout_segments(a: &Layout, b: &Layout, dt: DType) -> PyResult<Layout> {
+    match (a, b) {
+        (Layout::Leaf(la), Layout::Leaf(lb)) => {
+            if la.dtype != lb.dtype {
+                return Err(PyValueError::new_err("concat leaf dtype mismatch."));
             }
-            Ok(Layout::UnionScalarList(UnionScalarList {
-                tags: u.tags[start..end].to_vec(),
-                index: u.index[start..end].to_vec(),
-                scalars: u.scalars.clone(),
-                lists: u.lists.clone(),
+            let mut out = Leaf::new(dt);
+            out.len = la.len + lb.len;
+            out.has_nulls = la.has_nulls || lb.has_nulls;
+            let mut validity = (*la.validity).clone();
+            validity.extend_from_bitslice(lb.validity.as_bitslice());
+            out.validity = Arc::new(validity);
+            out.buffer = la.buffer.concat(&lb.buffer)?;
+            Ok(Layout::Leaf(out))
+        }
+        (Layout::ListOffset(oa), Layout::ListOffset(ob)) => {
+            let mut offsets = oa.offsets.to_vec();
+            let shift = *offsets.last().unwrap_or(&0);
+            for &o in ob.offsets.iter().skip(1) {
+                offsets.push(shift + o);
+            }
+            let content = concat_two_layout_segments(oa.content.as_ref(), ob.content.as_ref(), dt)?;
+            Ok(Layout::ListOffset(ListOffset {
+                offsets: Arc::new(offsets),
+                content: Box::new(content),
             }))
         }
+        _ => Err(PyValueError::new_err(
+            "concat_layout_segments: incompatible layout kinds.",
+        )),
     }
+}
+
+fn take_union_scalar_list_range(u: &UnionScalarList, start: usize, end: usize) -> PyResult<UnionScalarList> {
+    if start > end {
+        return Err(PyValueError::new_err("Invalid range."));
+    }
+    if end > u.len() {
+        return Err(PyValueError::new_err("Index out of bounds."));
+    }
+    if start == end {
+        let scalars = Leaf::new(u.scalars.dtype);
+        let lists = ListOffset {
+            offsets: Arc::new(vec![0i64]),
+            content: Box::new(Layout::Leaf(Leaf::new(u.scalars.dtype))),
+        };
+        return Ok(UnionScalarList {
+            tags: Vec::new(),
+            index: Vec::new(),
+            scalars,
+            lists,
+        });
+    }
+    let sub_tags = u.tags[start..end].to_vec();
+    let sub_old_index = &u.index[start..end];
+
+    use std::collections::HashMap;
+    let mut scalar_remap: HashMap<usize, i64> = HashMap::new();
+    let mut list_remap: HashMap<usize, i64> = HashMap::new();
+    let mut scalar_old: Vec<usize> = Vec::new();
+    let mut list_old: Vec<usize> = Vec::new();
+
+    for i in 0..sub_tags.len() {
+        let tag = sub_tags[i];
+        let ix = sub_old_index[i] as usize;
+        if tag == 0 {
+            scalar_remap.entry(ix).or_insert_with(|| {
+                let n = scalar_old.len() as i64;
+                scalar_old.push(ix);
+                n
+            });
+        } else if tag == 1 {
+            list_remap.entry(ix).or_insert_with(|| {
+                let n = list_old.len() as i64;
+                list_old.push(ix);
+                n
+            });
+        } else {
+            return Err(PyValueError::new_err("Invalid union tag."));
+        }
+    }
+
+    let scalars = take_leaf_indices(&u.scalars, &scalar_old)?;
+
+    let mut new_list_offsets = vec![0i64];
+    let mut content_segs: Vec<Layout> = Vec::with_capacity(list_old.len());
+    let mut acc = 0i64;
+    for &li in &list_old {
+        let s = u.lists.offsets[li] as usize;
+        let e = u.lists.offsets[li + 1] as usize;
+        let seg = take_range(u.lists.content.as_ref(), s, e)?;
+        acc += (e - s) as i64;
+        new_list_offsets.push(acc);
+        content_segs.push(seg);
+    }
+    let list_content = if content_segs.is_empty() {
+        u.lists.content.as_ref().clone()
+    } else {
+        concat_layout_segments(&content_segs)?
+    };
+    let lists = ListOffset {
+        offsets: Arc::new(new_list_offsets),
+        content: Box::new(list_content),
+    };
+
+    let mut new_index = Vec::with_capacity(sub_tags.len());
+    for i in 0..sub_tags.len() {
+        let tag = sub_tags[i];
+        let ix = sub_old_index[i] as usize;
+        new_index.push(if tag == 0 {
+            scalar_remap[&ix]
+        } else {
+            list_remap[&ix]
+        });
+    }
+
+    Ok(UnionScalarList {
+        tags: sub_tags,
+        index: new_index,
+        scalars,
+        lists,
+    })
 }
 
 pub fn drop_axis0_select_element(layout: &Layout, idx: usize) -> PyResult<Layout> {

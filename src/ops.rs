@@ -247,7 +247,43 @@ pub fn elementwise_scalar_inplace(
                 apply_layout_visible_range(&mut v.content, dt, op, value, is_int, s, e)
             }
             Layout::Indexed(_) => Ok(false), // cannot easily map visible range
-            Layout::UnionScalarList(_) => Ok(false), // scalar ops on union not supported in compiled in-place path
+            Layout::UnionScalarList(u) => {
+                if outer_stop > u.len() {
+                    return Err(PyValueError::new_err("Union range out of bounds."));
+                }
+                for i in outer_start..outer_stop {
+                    match u.tags[i] {
+                        0 => {
+                            let ix = u.index[i] as usize;
+                            apply_leaf_range(
+                                &mut u.scalars,
+                                dt,
+                                op,
+                                value,
+                                is_int,
+                                ix,
+                                ix + 1,
+                            )?;
+                        }
+                        1 => {
+                            let li = u.index[i] as usize;
+                            let s = u.lists.offsets[li] as usize;
+                            let e = u.lists.offsets[li + 1] as usize;
+                            apply_layout_visible_range(
+                                &mut u.lists.content,
+                                dt,
+                                op,
+                                value,
+                                is_int,
+                                s,
+                                e,
+                            )?;
+                        }
+                        _ => return Err(PyValueError::new_err("Invalid union tag.")),
+                    }
+                }
+                Ok(true)
+            }
         }
     }
 
@@ -1397,6 +1433,23 @@ fn concat_axis0_layouts(layouts: &[Layout]) -> PyResult<Layout> {
     if layouts.is_empty() {
         return Err(PyValueError::new_err("Internal error: cannot concat empty layouts."));
     }
+    let has_union = layouts.iter().any(|l| matches!(l, Layout::UnionScalarList(_)));
+    if has_union {
+        let normalized: Vec<Layout> = layouts
+            .iter()
+            .map(|l| match l {
+                Layout::UnionScalarList(_) => Ok(l.clone()),
+                Layout::ListOffset(lo) => {
+                    let dt = union_scalar_dtype_from_list(lo)?;
+                    Ok(Layout::UnionScalarList(lift_listoffset_to_union(lo, dt)))
+                }
+                _ => Err(PyValueError::new_err(
+                    "concat axis 0: cannot mix union arrays with this layout kind.",
+                )),
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        return concat_union_scalar_lists_axis0(&normalized);
+    }
     match &layouts[0] {
         Layout::Leaf(first) => {
             let dt = first.dtype;
@@ -1489,6 +1542,87 @@ fn concat_axis0_layouts(layouts: &[Layout]) -> PyResult<Layout> {
         }
         _ => Err(PyValueError::new_err("concat_axis0_layouts: unsupported layout kind.")),
     }
+}
+
+fn union_scalar_dtype_from_list(lo: &ListOffset) -> PyResult<DType> {
+    match lo.content.as_ref() {
+        Layout::Leaf(l) => Ok(l.dtype),
+        Layout::ListOffset(inner) => union_scalar_dtype_from_list(inner),
+        _ => Err(PyValueError::new_err(
+            "concat axis 0: cannot infer dtype for list layout.",
+        )),
+    }
+}
+
+fn lift_listoffset_to_union(lo: &ListOffset, dt: DType) -> UnionScalarList {
+    let n = lo.len();
+    UnionScalarList {
+        tags: vec![1u8; n],
+        index: (0..n as i64).collect(),
+        scalars: Leaf::new(dt),
+        lists: lo.clone(),
+    }
+}
+
+fn concat_union_scalar_lists_axis0(layouts: &[Layout]) -> PyResult<Layout> {
+    let mut unions: Vec<&UnionScalarList> = Vec::with_capacity(layouts.len());
+    for l in layouts {
+        match l {
+            Layout::UnionScalarList(u) => unions.push(u),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "Internal error: concat mixed layout kinds.",
+                ))
+            }
+        }
+    }
+    if unions.is_empty() {
+        return Err(PyValueError::new_err("Internal error: cannot concat empty layouts."));
+    }
+    let mut all_tags: Vec<u8> = Vec::new();
+    let mut all_index: Vec<i64> = Vec::new();
+    let mut scalar_segs: Vec<Layout> = Vec::with_capacity(unions.len());
+    let mut list_segs: Vec<Layout> = Vec::with_capacity(unions.len());
+    let mut scalar_base = 0i64;
+    let mut list_base = 0i64;
+    for u in &unions {
+        for i in 0..u.len() {
+            all_tags.push(u.tags[i]);
+            all_index.push(match u.tags[i] {
+                0 => scalar_base + u.index[i],
+                1 => list_base + u.index[i],
+                _ => {
+                    return Err(PyValueError::new_err("Invalid union tag."));
+                }
+            });
+        }
+        scalar_base += u.scalars.len as i64;
+        list_base += u.lists.len() as i64;
+        scalar_segs.push(Layout::Leaf(u.scalars.clone()));
+        list_segs.push(Layout::ListOffset(u.lists.clone()));
+    }
+    let scalars = match concat_axis0_layouts(&scalar_segs)? {
+        Layout::Leaf(l) => l,
+        _ => {
+            return Err(PyValueError::new_err(
+                "Internal error: union scalar concat did not produce a leaf.",
+            ))
+        }
+    };
+    let lists = match concat_axis0_layouts(&list_segs)? {
+        Layout::ListOffset(lo) => lo,
+        _ => {
+            return Err(PyValueError::new_err(
+                "Internal error: union list concat did not produce ListOffset.",
+            ))
+        }
+    };
+    Ok(Layout::UnionScalarList(UnionScalarList {
+        tags: all_tags,
+        index: all_index,
+        scalars,
+        lists,
+    }))
 }
 
 /// Concatenate two arrays along axis 0 (pure list-chains).

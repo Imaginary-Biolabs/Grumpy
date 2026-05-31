@@ -818,10 +818,54 @@ fn load_layout_take_range(
         LayoutMeta::Indexed { .. } => Err(PyValueError::new_err(
             "Indexed layout streaming slice is not supported.",
         )),
-        LayoutMeta::UnionScalarList { .. } => Err(PyValueError::new_err(
-            "UnionScalarList streaming slice is not supported.",
-        )),
+        LayoutMeta::UnionScalarList {
+            tags,
+            index,
+            scalars,
+            lists,
+        } => load_union_scalar_list_take_range(
+            store,
+            dt,
+            tags,
+            index,
+            scalars,
+            lists,
+            start,
+            end,
+        ),
     }
+}
+
+fn load_union_scalar_list_take_range(
+    store: &ReadableWritableListableStorage,
+    dt: DType,
+    tags_path: &str,
+    index_path: &str,
+    scalars_meta: &LayoutMeta,
+    lists_meta: &LayoutMeta,
+    start: usize,
+    end: usize,
+) -> PyResult<Layout> {
+    let all_tags = read_vec::<u8>(store, tags_path)?;
+    let all_index = read_vec::<i64>(store, index_path)?;
+    if end > all_tags.len() {
+        return Err(PyValueError::new_err("Union slice out of bounds."));
+    }
+    let full_scalars = match load_layout(store, dt, scalars_meta)? {
+        Layout::Leaf(l) => l,
+        _ => return Err(PyValueError::new_err("Invalid union scalars layout in file.")),
+    };
+    let full_lists = match load_layout(store, dt, lists_meta)? {
+        Layout::ListOffset(lo) => lo,
+        _ => return Err(PyValueError::new_err("Invalid union lists layout in file.")),
+    };
+    let u = UnionScalarList {
+        tags: all_tags,
+        index: all_index,
+        scalars: full_scalars,
+        lists: full_lists,
+    };
+    Ok(Layout::UnionScalarList(u.take_range(start, end)?))
 }
 
 /// Count entities at ``target_depth`` within each axis-0 row (reads offset buffers only).

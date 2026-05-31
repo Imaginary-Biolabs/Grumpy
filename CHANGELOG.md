@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `gr.save(generator, ...)` incremental writes via `append_batch` (load + concat + rewrite per batch).
 - `chunk_dim` on save: target a schema level or numeric depth for Zarr chunk sizing.
 - `compiled_stream_apply` uses partial batch loads (parity with `Stream.__iter__`).
+- **`UnionScalarList`**: compact axis-0 slice, streaming load/save, scalar in-place ops, sum/mean, unique, shuffle, axis-0 concat/append (with list-chain lifting).
 
 ### Changed
 

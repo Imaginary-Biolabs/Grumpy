@@ -316,6 +316,21 @@ pub fn permutation(rng: &mut GrumpyRng, x: &GrumpyArray, dim: isize) -> PyResult
 
 pub fn shuffle(rng: &mut GrumpyRng, x: &mut GrumpyArray, dim: isize) -> PyResult<()> {
     x.uniquify_buffers();
+    if let Layout::UnionScalarList(u) = &mut x.layout {
+        let axis = normalize_axis(dim, 0)?;
+        if axis != 0 {
+            return Err(PyValueError::new_err(
+                "shuffle on union arrays supports dim=0 only for now.",
+            ));
+        }
+        let n = u.len();
+        let idx = sample_indices(rng.rng(), n, n, false)?;
+        let old_tags = std::mem::replace(&mut u.tags, Vec::with_capacity(n));
+        let old_index = std::mem::replace(&mut u.index, Vec::with_capacity(n));
+        u.tags = idx.iter().map(|&i| old_tags[i]).collect();
+        u.index = idx.iter().map(|&i| old_index[i]).collect();
+        return Ok(());
+    }
     let out = permutation(rng, x, dim)?;
     x.layout = out.layout;
     Ok(())

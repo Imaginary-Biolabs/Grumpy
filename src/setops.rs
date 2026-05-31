@@ -9,6 +9,9 @@ use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 pub fn unique(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
+    if a.layout.has_union() {
+        return unique_union(py, a);
+    }
     let leaf = find_leaf(&a.layout)?;
     match a.dtype {
         DType::Int32 => unique_i32(py, leaf),
@@ -149,6 +152,140 @@ pub fn setxor(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<Grum
 }
 
 // -------- helpers: layout traversal / leaf building --------
+
+fn unique_union(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
+    match a.dtype {
+        DType::Int32 => {
+            let vals = collect_union_i32(&a.layout);
+            unique_i32_from_values(py, a.dtype, &vals)
+        }
+        DType::Int64 => {
+            let vals = collect_union_i64(&a.layout);
+            unique_i64_from_values(py, a.dtype, &vals)
+        }
+        DType::Float64 => {
+            let vals = collect_union_f64(&a.layout);
+            unique_f64_from_values(py, a.dtype, &vals)
+        }
+        _ => Err(PyValueError::new_err(
+            "unique() on union arrays supports int32/int64/float64 for now.",
+        )),
+    }
+}
+
+fn collect_union_i32(layout: &Layout) -> Vec<i32> {
+    let mut out = Vec::new();
+    walk_union_collect(layout, &mut |v_i64, _v_f64| {
+        out.push(v_i64 as i32);
+        Ok(())
+    })
+    .ok();
+    out
+}
+
+fn collect_union_i64(layout: &Layout) -> Vec<i64> {
+    let mut out = Vec::new();
+    walk_union_collect(layout, &mut |v_i64, _v_f64| {
+        out.push(v_i64);
+        Ok(())
+    })
+    .ok();
+    out
+}
+
+fn collect_union_f64(layout: &Layout) -> Vec<f64> {
+    let mut out = Vec::new();
+    walk_union_collect(layout, &mut |_v_i64, v_f64| {
+        out.push(v_f64);
+        Ok(())
+    })
+    .ok();
+    out
+}
+
+fn walk_union_collect(
+    layout: &Layout,
+    f: &mut dyn FnMut(i64, f64) -> PyResult<()>,
+) -> PyResult<()> {
+    use crate::layout::drop_axis0_select_element;
+    match layout {
+        Layout::Leaf(l) => {
+            for i in 0..l.len {
+                if !l.validity[i] {
+                    continue;
+                }
+                match &l.buffer {
+                    LeafBuffer::I32(v) => f(v[i] as i64, v[i] as f64)?,
+                    LeafBuffer::I64(v) => f(v[i], v[i] as f64)?,
+                    LeafBuffer::F64(v) => f(v[i] as i64, v[i])?,
+                    _ => {}
+                }
+            }
+        }
+        Layout::ListOffset(lo) => {
+            for i in 0..lo.len() {
+                walk_union_collect(&drop_axis0_select_element(layout, i)?, f)?;
+            }
+        }
+        Layout::OffsetView(v) => {
+            for i in 0..v.len() {
+                walk_union_collect(&drop_axis0_select_element(layout, i)?, f)?;
+            }
+        }
+        Layout::Indexed(ix) => {
+            for i in 0..ix.len() {
+                walk_union_collect(&drop_axis0_select_element(layout, i)?, f)?;
+            }
+        }
+        Layout::UnionScalarList(u) => {
+            for i in 0..u.len() {
+                walk_union_collect(&drop_axis0_select_element(layout, i)?, f)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unique_i32_from_values(_py: Python<'_>, dt: DType, vals: &[i32]) -> PyResult<GrumpyArray> {
+    let mut set: FxHashSet<i32> = FxHashSet::default();
+    let mut out: Vec<i32> = Vec::new();
+    for &v in vals {
+        if set.insert(v) {
+            out.push(v);
+        }
+    }
+    out.sort_unstable();
+    let mut leaf = Leaf::new(dt);
+    leaf.len = out.len();
+    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; out.len()]);
+    leaf.has_nulls = false;
+    leaf.buffer = LeafBuffer::I32(Arc::new(out));
+    Ok(GrumpyArray {
+        dtype: dt,
+        layout: Layout::Leaf(leaf),
+    })
+}
+
+fn unique_i64_from_values(py: Python<'_>, dt: DType, vals: &[i64]) -> PyResult<GrumpyArray> {
+    let _ = py;
+    let mut set: FxHashSet<i64> = FxHashSet::default();
+    let mut out: Vec<i64> = Vec::new();
+    for &v in vals {
+        if set.insert(v) {
+            out.push(v);
+        }
+    }
+    out.sort_unstable();
+    let mut leaf = Leaf::new(dt);
+    leaf.len = out.len();
+    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; out.len()]);
+    leaf.has_nulls = false;
+    leaf.buffer = LeafBuffer::I64(Arc::new(out));
+    Ok(GrumpyArray {
+        dtype: dt,
+        layout: Layout::Leaf(leaf),
+    })
+}
 
 fn find_leaf<'a>(layout: &'a Layout) -> PyResult<&'a Leaf> {
     match layout {

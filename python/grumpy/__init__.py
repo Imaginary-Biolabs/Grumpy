@@ -5,7 +5,7 @@ mutable arrays, Zarr-backed I/O, and optional compilation of streaming transform
 
 Known limitations
 -----------------
-- ``UnionScalarList`` layouts are not supported for most ops (use pure list-chains).
+- ``UnionScalarList`` layouts support streaming, scalar ops, sum/mean, unique, shuffle, and append save; many other kernels still require pure list-chains.
 - Streaming supports axis-0 and ``batch_on`` batching, shuffle, DDP, and I/O prefetch.
 - ``gr.compile`` accepts a restricted subset of Python (see :func:`compile`).
 """

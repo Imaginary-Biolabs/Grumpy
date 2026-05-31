@@ -59,7 +59,8 @@ for batch in st[0:4]:
 
 ### Limitations
 
-- `UnionScalarList` and `Indexed` layouts are not supported for streaming slice loads.
+- **`UnionScalarList`** layouts at the dataset root are loaded via compact slice; nested unions inside list-chains follow the same partial path when batched.
+- **`Indexed`** layouts are not supported for streaming slice loads.
 
 ## Parallel apply
 

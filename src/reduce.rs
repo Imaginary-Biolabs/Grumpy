@@ -14,7 +14,7 @@
 //! - Add parity tests for deep list-chains and for streamed `OffsetView` batches.
 
 use crate::dtype::DType;
-use crate::layout::{offsetview_to_listoffset, GrumpyArray, Layout, Leaf, LeafBuffer};
+use crate::layout::{offsetview_to_listoffset, drop_axis0_select_element, GrumpyArray, Layout, Leaf, LeafBuffer, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use half::f16;
@@ -92,6 +92,10 @@ pub fn reduce(py: Python<'_>, arr: &GrumpyArray, dim: Option<isize>, op: ReduceO
         }
         _ => &arr.layout,
     };
+
+    if layout.has_union() {
+        return reduce_union(py, arr, dim, op);
+    }
 
     let depth = crate::layout::list_chain_depth(layout)
         .ok_or_else(|| PyValueError::new_err("reduce currently only supports pure list-chain arrays."))?;
@@ -1790,4 +1794,177 @@ fn reduce_2d_dim0_to_leaf(layout: &Layout, dt: DType, op: ReduceOp) -> PyResult<
     Ok(GrumpyArray { dtype: out_dt, layout: Layout::Leaf(out) })
 }
 
+fn reduce_union(py: Python<'_>, arr: &GrumpyArray, dim: Option<isize>, op: ReduceOp) -> PyResult<ReduceOutput> {
+    match dim {
+        None => match op {
+            ReduceOp::Sum => {
+                let total = sum_layout_values(&arr.layout, arr.dtype)?;
+                Ok(ReduceOutput::Scalar(wrap_reduce_scalar(py, arr.dtype, total)?))
+            }
+            ReduceOp::Mean => {
+                let (total, count) = sum_layout_values_with_count(&arr.layout, arr.dtype)?;
+                if count == 0 {
+                    return Err(PyValueError::new_err("mean of empty array."));
+                }
+                Ok(ReduceOutput::Scalar(wrap_reduce_scalar(
+                    py,
+                    arr.dtype,
+                    total / count as f64,
+                )?))
+            }
+            _ => Err(PyValueError::new_err(
+                "Union arrays currently support sum/mean without dim only.",
+            )),
+        },
+        Some(d) => {
+            let axis = if d < 0 { 0isize + d + 1 } else { d } as usize;
+            if axis != 0 {
+                return Err(PyValueError::new_err(
+                    "Union reduce currently supports dim=0 only.",
+                ));
+            }
+            match op {
+                ReduceOp::Sum => reduce_union_axis0(py, arr),
+                _ => Err(PyValueError::new_err(
+                    "Union reduce dim=0 currently supports sum only.",
+                )),
+            }
+        }
+    }
+}
+
+fn reduce_union_axis0(_py: Python<'_>, arr: &GrumpyArray) -> PyResult<ReduceOutput> {
+    let n = arr.len();
+    let mut tags = Vec::with_capacity(n);
+    let mut index = Vec::with_capacity(n);
+    let mut scalars = Leaf::new(arr.dtype);
+    scalars.len = n;
+    scalars.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    scalars.has_nulls = false;
+    scalars.buffer = LeafBuffer::new(arr.dtype);
+
+    for i in 0..n {
+        let sub = drop_axis0_select_element(&arr.layout, i)?;
+        let val = sum_layout_values(&sub, arr.dtype)?;
+        push_scalar_to_leaf(&mut scalars, arr.dtype, val)?;
+        tags.push(0);
+        index.push(i as i64);
+    }
+
+    let lists = crate::layout::ListOffset {
+        offsets: Arc::new(vec![0i64]),
+        content: Box::new(Layout::Leaf(Leaf::new(arr.dtype))),
+    };
+    Ok(ReduceOutput::Array(GrumpyArray {
+        dtype: arr.dtype,
+        layout: Layout::UnionScalarList(UnionScalarList {
+            tags,
+            index,
+            scalars,
+            lists,
+        }),
+    }))
+}
+
+fn sum_layout_values(layout: &Layout, dt: DType) -> PyResult<f64> {
+    let (sum, _count) = sum_layout_values_with_count(layout, dt)?;
+    Ok(sum)
+}
+
+fn sum_layout_values_with_count(layout: &Layout, dt: DType) -> PyResult<(f64, usize)> {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    walk_layout_sum(layout, dt, &mut |v| {
+        sum += v;
+        count += 1;
+        Ok(())
+    })?;
+    Ok((sum, count))
+}
+
+fn walk_layout_sum(
+    layout: &Layout,
+    dt: DType,
+    f: &mut dyn FnMut(f64) -> PyResult<()>,
+) -> PyResult<()> {
+    match layout {
+        Layout::Leaf(l) => {
+            for i in 0..l.len {
+                if l.validity[i] {
+                    f(read_leaf_as_f64(dt, &l.buffer, i)?)?;
+                }
+            }
+        }
+        Layout::ListOffset(lo) => {
+            for i in 0..lo.len() {
+                let s = lo.offsets[i] as usize;
+                let e = lo.offsets[i + 1] as usize;
+                walk_layout_sum(
+                    &crate::layout::take_range(lo.content.as_ref(), s, e)?,
+                    dt,
+                    f,
+                )?;
+            }
+        }
+        Layout::OffsetView(v) => {
+            for i in 0..v.len() {
+                walk_layout_sum(&drop_axis0_select_element(layout, i)?, dt, f)?;
+            }
+        }
+        Layout::Indexed(ix) => {
+            for i in 0..ix.len() {
+                walk_layout_sum(&drop_axis0_select_element(layout, i)?, dt, f)?;
+            }
+        }
+        Layout::UnionScalarList(u) => {
+            for i in 0..u.len() {
+                walk_layout_sum(&drop_axis0_select_element(layout, i)?, dt, f)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_leaf_as_f64(dt: DType, buf: &LeafBuffer, i: usize) -> PyResult<f64> {
+    Ok(match (dt, buf) {
+        (DType::Int32, LeafBuffer::I32(v)) => v[i] as f64,
+        (DType::Int64, LeafBuffer::I64(v)) => v[i] as f64,
+        (DType::Float32, LeafBuffer::F32(v)) => v[i] as f64,
+        (DType::Float64, LeafBuffer::F64(v)) => v[i],
+        _ => {
+            return Err(PyValueError::new_err(
+                "Union sum currently supports int32/int64/float32/float64.",
+            ))
+        }
+    })
+}
+
+fn push_scalar_to_leaf(leaf: &mut Leaf, dt: DType, val: f64) -> PyResult<()> {
+    match (&mut leaf.buffer, dt) {
+        (LeafBuffer::I32(v), DType::Int32) => Arc::make_mut(v).push(val as i32),
+        (LeafBuffer::I64(v), DType::Int64) => Arc::make_mut(v).push(val as i64),
+        (LeafBuffer::F32(v), DType::Float32) => Arc::make_mut(v).push(val as f32),
+        (LeafBuffer::F64(v), DType::Float64) => Arc::make_mut(v).push(val),
+        _ => {
+            return Err(PyValueError::new_err(
+                "Union sum currently supports int32/int64/float32/float64.",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn wrap_reduce_scalar(py: Python<'_>, dt: DType, val: f64) -> PyResult<PyObject> {
+    Ok(match dt {
+        DType::Int32 => (val as i32).into_py(py),
+        DType::Int64 => (val as i64).into_py(py),
+        DType::Float32 => (val as f32).into_py(py),
+        DType::Float64 => val.into_py(py),
+        _ => {
+            return Err(PyValueError::new_err(
+                "Union sum currently supports int32/int64/float32/float64.",
+            ))
+        }
+    })
+}
 

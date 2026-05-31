@@ -33,5 +33,5 @@ x.mean(dim=1).to_list()
 
 ## Known limitations
 
-- **`UnionScalarList`** (mixed scalar/list depth) is not supported for most kernels.
-- Prefer pure **list-chains** for best performance and compatibility.
+- **`UnionScalarList`** (mixed scalar/list depth) is supported for elementwise/unary/compare ops on matching structure, scalar multiply, sum/mean, unique, shuffle, streaming slice loads, and axis-0 concat/append.
+- Prefer pure **list-chains** for reductions beyond sum, neighbors, einsum, and full schema validation.

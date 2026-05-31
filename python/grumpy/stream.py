@@ -14,7 +14,7 @@ Features
 
 Known limitations
 -----------------
-- ``UnionScalarList`` and ``Indexed`` layouts are not supported for streaming slice loads.
+- ``UnionScalarList`` and ``Indexed`` layouts: streaming slice loads support unions; ``Indexed`` is still unsupported.
 - Compiled Rust scheduling supports a restricted opcode set (see ``compiler.py``).
 """
 
