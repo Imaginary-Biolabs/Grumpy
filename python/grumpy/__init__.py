@@ -500,3 +500,16 @@ def logical_xor(a: GrumpyArray, b: GrumpyArray) -> GrumpyArray:
 def logical_not(a: GrumpyArray) -> GrumpyArray:
     return a.logical_not()
 
+
+def _apply_function_docs() -> None:
+    for name, text in FUNCTION_DOCS.items():
+        fn = globals().get(name)
+        if fn is not None and callable(fn):
+            fn.__doc__ = text
+
+
+from ._docinit import FUNCTION_DOCS  # noqa: E402
+from ._docinject import inject_all  # noqa: E402
+
+inject_all()
+_apply_function_docs()

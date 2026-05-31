@@ -32,10 +32,29 @@ class _CompileResult:
 
 class CompiledTransform:
     """
-    Wrapper returned by @gr.compile.
+    Callable wrapper that runs a compiled Rust plan when possible.
 
-    If compilation succeeds, calling the wrapper runs a Rust-executed plan (GIL-released).
-    If compilation fails, it falls back to the original Python function and emits a one-time warning.
+    Instances are returned by :func:`compile` and used internally by
+    :meth:`~grumpy.stream.Stream.apply`.
+
+    Attributes
+    ----------
+    is_compiled : bool
+        Whether a Rust :class:`~grumpy._core.CompiledPlan` was built.
+    compile_error : str or None
+        Compilation failure message when ``is_compiled`` is ``False``.
+
+    Examples
+    --------
+    >>> import grumpy as gr
+    >>> @gr.compile
+    ... def scale(batch):
+    ...     return batch * 2
+    ...
+    >>> scale.is_compiled
+    True
+    >>> scale(gr.array([1, 2])).to_list()
+    [2, 4]
     """
 
     def __init__(self, fn: Callable[[Any], Any], result: _CompileResult):
@@ -51,13 +70,70 @@ class CompiledTransform:
 
     @property
     def is_compiled(self) -> bool:
+        """
+        Return ``True`` when a Rust :class:`~grumpy._core.CompiledPlan` was built.
+
+        Returns
+        -------
+        bool
+            Compilation success flag.
+
+        Examples
+        --------
+        >>> import grumpy as gr
+        >>> @gr.compile
+        ... def f(b): return b
+        ...
+        >>> f.is_compiled
+        True
+        """
         return self._plan is not None
 
     @property
     def compile_error(self) -> Optional[str]:
+        """
+        Return the compilation error message, or ``None`` on success.
+
+        Returns
+        -------
+        str or None
+            Error text when compilation failed.
+
+        Examples
+        --------
+        >>> import grumpy as gr
+        >>> @gr.compile
+        ... def ok(b): return b * 2
+        ...
+        >>> ok.compile_error is None
+        True
+        """
         return self._compile_error
 
     def __call__(self, batch):
+        """
+        Run the compiled plan or fall back to the original Python function.
+
+        Parameters
+        ----------
+        batch : GrumpyArray or GrumpyDataFrame
+            Input batch.
+
+        Returns
+        -------
+        GrumpyArray or GrumpyDataFrame
+            Transformed batch.
+
+        Examples
+        --------
+        >>> import grumpy as gr
+        >>> @gr.compile
+        ... def double(batch):
+        ...     return batch * 2
+        ...
+        >>> double(gr.array([1, 2])).to_list()
+        [2, 4]
+        """
         if self._plan is not None:
             return self._plan.run(batch)
         if (not self._warned) and self._compile_error:
@@ -73,26 +149,54 @@ class CompiledTransform:
 
 def compile(fn: Callable[[Any], Any]) -> CompiledTransform:
     """
-    Decorator that attempts to compile a restricted batch transform to a Rust-executed plan.
+    Compile a restricted batch transform into a Rust execution plan.
 
-    Supported (MVP):
-    - Straight-line code only (no if/for/while/try/with)
-    - Single parameter (batch)
-    - Rebinding `batch = ...` and final `return batch`
-    - Operations:
-      - `batch <op> scalar` where op in {+,-,*,/,%,remainder}
-      - `gr.neighbors(batch, batch, k=..., dim=..., loop=...)`
+    Parameters
+    ----------
+    fn : callable
+        Function ``fn(batch) -> batch`` with straight-line Python only.
+
+    Returns
+    -------
+    CompiledTransform
+        Callable wrapper that executes the plan when compilation succeeds.
+
+    Examples
+    --------
+    >>> import grumpy as gr
+    >>> @gr.compile
+    ... def scale(batch):
+    ...     batch = batch * 2
+    ...     return batch
+    ...
+    >>> scale(gr.array([1, 2])).to_list()
+    [2, 4]
     """
     res = _try_compile(fn)
     return CompiledTransform(fn, res)
 
 def compile_pipeline(fns: list[Callable[[Any], Any]]) -> Callable[[Any], Any]:
     """
-    Compile and fuse a list of transforms into one or more CompiledPlan segments.
+    Compile and fuse a sequence of batch transforms.
 
-    - Consecutive compilable transforms are fused into a single _core.CompiledPlan.
-    - Uncompilable transforms run as Python callables (with one-time warning describing why).
-    - Output order and semantics match sequential application.
+    Parameters
+    ----------
+    fns : list[callable]
+        Transform functions applied in order.
+
+    Returns
+    -------
+    callable
+        Single callable that runs fused compiled segments and Python fallbacks.
+
+    Examples
+    --------
+    >>> import grumpy as gr
+    >>> def a(b): return b * 2
+    >>> def b(b): return b + 1
+    >>> run = gr.compiler.compile_pipeline([a, b])
+    >>> run(gr.array([1])).to_list()
+    [3]
     """
 
     segments: list[Callable[[Any], Any]] = []
@@ -133,6 +237,30 @@ def compile_pipeline(fns: list[Callable[[Any], Any]]) -> Callable[[Any], Any]:
 
 @dataclass(frozen=True)
 class PipelineInfo:
+    """
+    Result of :func:`compile_pipeline_info`.
+
+    Attributes
+    ----------
+    run_all : callable
+        Callable that applies the compiled and Python fallback segments.
+    fully_compiled : bool
+        ``True`` when every transform compiled into fused Rust ops.
+    fused_ops : list[dict] or None
+        Fused opcode list when ``fully_compiled`` is ``True``.
+
+    Examples
+    --------
+    >>> import grumpy as gr
+    >>> @gr.compile
+    ... def f(batch):
+    ...     return batch * 2
+    ...
+    >>> info = gr.compiler.compile_pipeline_info([f])
+    >>> info.fully_compiled
+    True
+    """
+
     run_all: Callable[[Any], Any]
     fully_compiled: bool
     fused_ops: Optional[list[dict[str, Any]]]
@@ -140,8 +268,28 @@ class PipelineInfo:
 
 def compile_pipeline_info(fns: list[Callable[[Any], Any]]) -> PipelineInfo:
     """
-    Like compile_pipeline, but also returns whether the full pipeline is a single fused plan,
-    and (if so) the fused raw op dict list.
+    Compile a pipeline and report fusion metadata.
+
+    Parameters
+    ----------
+    fns : list[callable]
+        Transform functions applied in order.
+
+    Returns
+    -------
+    PipelineInfo
+        ``run_all`` callable, ``fully_compiled`` flag, and optional fused op list.
+
+    Examples
+    --------
+    >>> import grumpy as gr
+    >>> @gr.compile
+    ... def f(batch):
+    ...     return batch * 2
+    ...
+    >>> info = gr.compiler.compile_pipeline_info([f])
+    >>> info.fully_compiled
+    True
     """
     segments: list[Callable[[Any], Any]] = []
     pending_ops: list[dict[str, Any]] = []

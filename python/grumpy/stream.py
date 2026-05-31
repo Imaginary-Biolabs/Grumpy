@@ -48,6 +48,16 @@ class Stream:
     ``__len__`` uses on-disk metadata (``stored_len``) without loading leaf buffers.
     Each batch is loaded with ``load_slice`` so repeated iteration does not keep the
     full dataset in memory; per-batch I/O still depends on the stored layout.
+
+    Examples
+    --------
+    >>> import grumpy as gr
+    >>> gr.save(gr.array(list(range(100))), 'data.gr')
+    >>> st = gr.stream('data.gr', batch_size=32)
+    >>> len(st)
+    4
+    >>> next(iter(st)).to_list()[:3]
+    [0, 1, 2]
     """
 
     path: str
@@ -59,6 +69,21 @@ class Stream:
             raise ValueError("batch_size must be > 0")
 
     def __len__(self) -> int:
+        """
+        Return the number of batches without loading leaf data.
+
+        Returns
+        -------
+        int
+            Batch count derived from on-disk axis-0 metadata.
+
+        Examples
+        --------
+        >>> import grumpy as gr
+        >>> gr.save(gr.array(list(range(10))), 'tmp.gr')
+        >>> len(gr.stream('tmp.gr', batch_size=4))
+        3
+        """
         from ._core import stored_len
 
         n = stored_len(self.path)
@@ -67,6 +92,20 @@ class Stream:
         return _ceil_div(n, self.batch_size)
 
     def __iter__(self) -> Iterator:
+        """
+        Yield consecutive axis-0 batches loaded from disk.
+
+        Yields
+        ------
+        GrumpyArray or GrumpyDataFrame
+            Batch covering a slice of axis 0.
+
+        Examples
+        --------
+        >>> import grumpy as gr
+        >>> for batch in gr.stream('data.gr', batch_size=32):
+        ...     train(batch)
+        """
         from ._core import load_slice, stored_len
 
         n = stored_len(self.path)
@@ -98,6 +137,17 @@ class Stream:
             ``True``/``'force'``, ``False``/``'never'``, or ``'auto'`` (compile when possible).
         scheduler:
             ``'auto'``, ``'python'`` (thread pool), or ``'rust'`` (Rayon for fully compiled ops).
+
+        Returns
+        -------
+        StreamApply
+            Lazy iterable of transformed batches.
+
+        Examples
+        --------
+        >>> import grumpy as gr
+        >>> st = gr.stream('data.gr', batch_size=32)
+        >>> out = st.apply(lambda b: b * 2, cpu=4, compile='auto')
         """
         if cpu < 1:
             raise ValueError("cpu must be >= 1")
@@ -112,7 +162,31 @@ class Stream:
 
 @dataclass(frozen=True)
 class StreamApply(Iterable[T]):
-    """Lazy iterable of transformed batches produced from a :class:`Stream`."""
+    """
+    Lazy iterable of transformed batches produced from a :class:`Stream`.
+
+    Parameters
+    ----------
+    base : Stream
+        Source stream over a saved dataset.
+    fns : list[callable]
+        Batch transforms applied in order.
+    cpu : int, default 1
+        Worker count for parallel apply.
+    prefetch : int, optional
+        Max in-flight batches (defaults to ``2 * cpu``).
+    compile : bool or str, default ``'auto'``
+        Compilation mode passed to the compiler.
+    scheduler : str, default ``'auto'``
+        ``'auto'``, ``'python'``, or ``'rust'`` scheduling backend.
+
+    Examples
+    --------
+    >>> import grumpy as gr
+    >>> st = gr.stream('data.gr', batch_size=32)
+    >>> for batch in st.apply(lambda b: b * 2):
+    ...     process(batch)
+    """
 
     base: Stream
     fns: list[Callable[[T], T]]
@@ -122,6 +196,21 @@ class StreamApply(Iterable[T]):
     scheduler: str = "auto"
 
     def __iter__(self) -> Iterator[T]:
+        """
+        Yield transformed batches from the underlying stream.
+
+        Yields
+        ------
+        GrumpyArray or GrumpyDataFrame
+            Transformed batch.
+
+        Examples
+        --------
+        >>> import grumpy as gr
+        >>> st = gr.stream('data.gr', batch_size=32)
+        >>> for batch in st.apply(lambda b: b * 2):
+        ...     process(batch)
+        """
         compile_mode = self.compile
         if compile_mode is True:
             compile_mode = "force"

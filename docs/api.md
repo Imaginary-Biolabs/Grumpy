@@ -24,6 +24,8 @@ Reference documentation is generated from Python docstrings in the `grumpy` pack
     options:
       show_root_heading: false
       heading_level: 3
+      allow_inspection: true
+      force_inspection: true
       members:
         - GrumpyArray
         - DType

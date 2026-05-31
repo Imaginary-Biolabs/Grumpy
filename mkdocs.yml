@@ -90,8 +90,9 @@ plugins:
             separate_signature: true
             show_if_no_docstring: true
             show_root_toc_entry: false
+            allow_inspection: true
             preload_modules:
-              - grumpy._core
+              - grumpy
 
 validation:
   links:
