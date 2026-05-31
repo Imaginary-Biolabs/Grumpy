@@ -45,7 +45,9 @@ jobs:
           python -m pip install "mkdocs>=1.5" "mkdocs-material>=9" "mkdocstrings[python]>=0.27"
 
       - name: Build extension
-        run: maturin develop --release
+        run: |
+          maturin build --release -o dist
+          python -m pip install dist/*.whl
 
       - name: Build site
         env:
