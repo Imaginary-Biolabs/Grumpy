@@ -17,6 +17,7 @@ mod einsum;
 mod neighbors;
 mod dataframe;
 mod io;
+mod random;
 mod py_api;
 
 use pyo3::prelude::*;

@@ -34,6 +34,8 @@ use crate::einsum as einsum_ops;
 use crate::neighbors as neigh_ops;
 use crate::dataframe as df_ops;
 use crate::io as io_ops;
+use crate::random::{self, GrumpyRng};
+use std::cell::RefCell;
 use std::sync::Arc;
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
@@ -46,6 +48,130 @@ use rayon::ThreadPoolBuilder;
 #[pyclass(name = "GrumpyArray")]
 pub struct PyGrumpyArray {
     inner: GrumpyArray,
+}
+
+#[pyclass(name = "Generator")]
+pub struct PyGenerator {
+    inner: RefCell<GrumpyRng>,
+}
+
+fn with_rng<F, R>(seed: Option<u64>, rng: Option<PyRef<'_, PyGenerator>>, f: F) -> PyResult<R>
+where
+    F: FnOnce(&mut GrumpyRng) -> PyResult<R>,
+{
+    if let Some(r) = rng {
+        return f(&mut *r.inner.borrow_mut());
+    }
+    if let Some(s) = seed {
+        let mut local = GrumpyRng::new(s);
+        return f(&mut local);
+    }
+    Err(PyValueError::new_err(
+        "Provide seed=... or rng=... for this operation.",
+    ))
+}
+
+#[pymethods]
+impl PyGenerator {
+    #[new]
+    #[pyo3(signature = (seed=0))]
+    fn new(seed: u64) -> Self {
+        Self {
+            inner: RefCell::new(GrumpyRng::new(seed)),
+        }
+    }
+
+    #[pyo3(signature = (a, size, replace=true, dim=0))]
+    fn choice(
+        &self,
+        py: Python<'_>,
+        a: PyRef<'_, PyGrumpyArray>,
+        size: Bound<'_, PyAny>,
+        replace: bool,
+        dim: isize,
+    ) -> PyResult<PyGrumpyArray> {
+        let parsed = random::parse_choice_size(py, &size)?;
+        let out = random::choice(
+            &mut *self.inner.borrow_mut(),
+            &a.inner,
+            dim,
+            parsed,
+            replace,
+        )?;
+        Ok(PyGrumpyArray { inner: out })
+    }
+
+    #[pyo3(signature = (a, low=0.0, high=1.0))]
+    fn uniform_like(&self, a: PyRef<'_, PyGrumpyArray>, low: f64, high: f64) -> PyResult<PyGrumpyArray> {
+        let out = random::uniform_like(&mut *self.inner.borrow_mut(), &a.inner, low, high)?;
+        Ok(PyGrumpyArray { inner: out })
+    }
+
+    fn random_like(&self, a: PyRef<'_, PyGrumpyArray>) -> PyResult<PyGrumpyArray> {
+        let out = random::random_like(&mut *self.inner.borrow_mut(), &a.inner)?;
+        Ok(PyGrumpyArray { inner: out })
+    }
+
+    #[pyo3(signature = (a, loc=0.0, scale=1.0))]
+    fn normal_like(&self, a: PyRef<'_, PyGrumpyArray>, loc: f64, scale: f64) -> PyResult<PyGrumpyArray> {
+        let out = random::normal_like(&mut *self.inner.borrow_mut(), &a.inner, loc, scale)?;
+        Ok(PyGrumpyArray { inner: out })
+    }
+
+    #[pyo3(signature = (a, low, high, dtype=None))]
+    fn integers_like(
+        &self,
+        a: PyRef<'_, PyGrumpyArray>,
+        low: i64,
+        high: i64,
+        dtype: Option<PyDType>,
+    ) -> PyResult<PyGrumpyArray> {
+        let dt = dtype.map(|d| d.dt).unwrap_or(DType::Int64);
+        let out = random::integers_like(
+            &mut *self.inner.borrow_mut(),
+            &a.inner,
+            low,
+            high,
+            dt,
+        )?;
+        Ok(PyGrumpyArray { inner: out })
+    }
+
+    #[pyo3(signature = (low, high, size, dtype=None))]
+    fn integers(
+        &self,
+        low: i64,
+        high: i64,
+        size: usize,
+        dtype: Option<PyDType>,
+    ) -> PyResult<PyGrumpyArray> {
+        let dt = dtype.map(|d| d.dt).unwrap_or(DType::Int64);
+        let out = random::integers(
+            &mut *self.inner.borrow_mut(),
+            low,
+            high,
+            size,
+            dt,
+        )?;
+        Ok(PyGrumpyArray { inner: out })
+    }
+
+    #[pyo3(signature = (a, dim=0))]
+    fn permutation(&self, a: PyRef<'_, PyGrumpyArray>, dim: isize) -> PyResult<PyGrumpyArray> {
+        let out = random::permutation(&mut *self.inner.borrow_mut(), &a.inner, dim)?;
+        Ok(PyGrumpyArray { inner: out })
+    }
+
+    #[pyo3(signature = (a, dim=0))]
+    fn shuffle(&self, mut a: PyRefMut<'_, PyGrumpyArray>, dim: isize) -> PyResult<()> {
+        random::shuffle(&mut *self.inner.borrow_mut(), &mut a.inner, dim)
+    }
+}
+
+#[pyfunction]
+#[pyo3(name = "rng", signature = (seed=0))]
+fn py_rng(seed: u64) -> PyGenerator {
+    PyGenerator::new(seed)
 }
 
 #[pyclass(name = "GrumpyDataFrame")]
@@ -1369,6 +1495,96 @@ impl PyGrumpyArray {
 
     fn mod_(&self, py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<Self> {
         apply_elementwise_binop(py, &self.inner, &other, BinOp::Mod).map(|inner| Self { inner })
+    }
+
+    #[pyo3(signature = (size, replace=true, dim=0, seed=None, rng=None))]
+    fn choice(
+        &self,
+        py: Python<'_>,
+        size: Bound<'_, PyAny>,
+        replace: bool,
+        dim: isize,
+        seed: Option<u64>,
+        rng: Option<PyRef<'_, PyGenerator>>,
+    ) -> PyResult<Self> {
+        let parsed = random::parse_choice_size(py, &size)?;
+        with_rng(seed, rng, |g| {
+            random::choice(g, &self.inner, dim, parsed, replace).map(|inner| Self { inner })
+        })
+    }
+
+    #[pyo3(signature = (dim=0, seed=None, rng=None))]
+    fn permutation(
+        &self,
+        dim: isize,
+        seed: Option<u64>,
+        rng: Option<PyRef<'_, PyGenerator>>,
+    ) -> PyResult<Self> {
+        with_rng(seed, rng, |g| {
+            random::permutation(g, &self.inner, dim).map(|inner| Self { inner })
+        })
+    }
+
+    #[pyo3(signature = (dim=0, seed=None, rng=None))]
+    fn shuffle(
+        &mut self,
+        dim: isize,
+        seed: Option<u64>,
+        rng: Option<PyRef<'_, PyGenerator>>,
+    ) -> PyResult<()> {
+        with_rng(seed, rng, |g| random::shuffle(g, &mut self.inner, dim))
+    }
+
+    #[pyo3(signature = (low=0.0, high=1.0, seed=None, rng=None))]
+    fn uniform_like(
+        &self,
+        low: f64,
+        high: f64,
+        seed: Option<u64>,
+        rng: Option<PyRef<'_, PyGenerator>>,
+    ) -> PyResult<Self> {
+        with_rng(seed, rng, |g| {
+            random::uniform_like(g, &self.inner, low, high).map(|inner| Self { inner })
+        })
+    }
+
+    #[pyo3(signature = (seed=None, rng=None))]
+    fn random_like(
+        &self,
+        seed: Option<u64>,
+        rng: Option<PyRef<'_, PyGenerator>>,
+    ) -> PyResult<Self> {
+        with_rng(seed, rng, |g| {
+            random::random_like(g, &self.inner).map(|inner| Self { inner })
+        })
+    }
+
+    #[pyo3(signature = (loc=0.0, scale=1.0, seed=None, rng=None))]
+    fn normal_like(
+        &self,
+        loc: f64,
+        scale: f64,
+        seed: Option<u64>,
+        rng: Option<PyRef<'_, PyGenerator>>,
+    ) -> PyResult<Self> {
+        with_rng(seed, rng, |g| {
+            random::normal_like(g, &self.inner, loc, scale).map(|inner| Self { inner })
+        })
+    }
+
+    #[pyo3(signature = (low, high, dtype=None, seed=None, rng=None))]
+    fn integers_like(
+        &self,
+        low: i64,
+        high: i64,
+        dtype: Option<PyDType>,
+        seed: Option<u64>,
+        rng: Option<PyRef<'_, PyGenerator>>,
+    ) -> PyResult<Self> {
+        let dt = dtype.map(|d| d.dt).unwrap_or(DType::Int64);
+        with_rng(seed, rng, |g| {
+            random::integers_like(g, &self.inner, low, high, dt).map(|inner| Self { inner })
+        })
     }
 }
 
@@ -3506,11 +3722,13 @@ pub fn dataframe(py: Python<'_>, mapping: Bound<'_, PyAny>, schema: Option<Bound
 
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDType>()?;
+    m.add_class::<PyGenerator>()?;
     m.add_class::<PyGrumpyArray>()?;
     m.add_class::<PyGrumpyDataFrame>()?;
     m.add_class::<PyDataFrameAccessor>()?;
     m.add_class::<PyCompiledPlan>()?;
     m.add_class::<PyCompiledBatchesIter>()?;
+    m.add_function(wrap_pyfunction!(py_rng, m)?)?;
     m.add_function(wrap_pyfunction!(array, m)?)?;
     m.add_function(wrap_pyfunction!(multiply, m)?)?;
     m.add_function(wrap_pyfunction!(add_arrays, m)?)?;

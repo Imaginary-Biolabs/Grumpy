@@ -17,6 +17,7 @@ from ._version import __version__
 from ._core import (
     DType,
     GrumpyArray,
+    Generator,
     array as _array,
     multiply as _multiply,
     add_arrays as _add_arrays,
@@ -51,6 +52,7 @@ from ._core import (
     dataframe as _dataframe,
     save as _save,
     load as _load,
+    rng as _rng,
 )
 
 from . import compiler as _compiler_mod
@@ -295,6 +297,12 @@ def load(path: str):
 def stream(path: str, batch_size: int = 32, drop_last: bool = False) -> Stream:
     return Stream(path=path, batch_size=batch_size, drop_last=drop_last)
 
+
+def rng(seed: int = 0) -> Generator:
+    """Create a reproducible random :class:`~grumpy.Generator`."""
+    return _rng(seed)
+
+
 def sin(x: GrumpyArray) -> GrumpyArray:
     return x.sin()
 
@@ -402,6 +410,8 @@ __all__ = [
     "save",
     "load",
     "stream",
+    "rng",
+    "Generator",
     "Stream",
     "StreamApply",
     "sin",
