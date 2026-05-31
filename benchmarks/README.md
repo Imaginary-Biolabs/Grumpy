@@ -82,4 +82,20 @@ The API benchmark accepts `--json PATH` and writes a structured report:
 }
 ```
 
-Use this file to drive docs site charts or CI trend tracking.
+Use this file to drive docs homepage charts or CI trend tracking.
+
+## Docs homepage chart
+
+The representative chart on the [docs landing page](https://imaginary-biolabs.github.io/Grumpy/) is rebuilt on every `mkdocs build` via `docs/hooks.py`:
+
+```bash
+maturin develop --release
+pip install -e ".[dev]" plotly awkward
+mkdocs build -f mkdocs.yml
+```
+
+Or regenerate the chart only:
+
+```bash
+python benchmarks/generate_perf_charts.py
+```

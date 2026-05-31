@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "benchmarks/**"
       - "python/**"
       - "src/**"
       - "LICENSE-FAQ.md"
@@ -40,13 +41,19 @@ jobs:
       - name: Install docs dependencies
         run: |
           python -m pip install -U pip
-          python -m pip install maturin numpy
+          python -m pip install maturin numpy plotly awkward
           python -m pip install "mkdocs>=1.5" "mkdocs-material>=9" "mkdocstrings[python]>=0.27"
 
       - name: Build extension
         run: maturin develop --release
 
       - name: Build site
+        env:
+          GRUMPY_BENCH_NROWS: "2048"
+          GRUMPY_BENCH_NCOLS: "128"
+          GRUMPY_BENCH_NFANCY: "2048"
+          GRUMPY_BENCH_WARMUP: "2"
+          GRUMPY_BENCH_REPEATS: "5"
         run: mkdocs build --strict
 
       - uses: actions/upload-pages-artifact@v3

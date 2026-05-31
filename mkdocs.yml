@@ -100,3 +100,9 @@ validation:
     unrecognized_links: ignore
 
 strict: true
+
+hooks:
+  - docs/hooks.py
+
+watch:
+  - docs/generated

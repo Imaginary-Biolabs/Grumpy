@@ -27,6 +27,8 @@ dev = [
   "mkdocs>=1.5",
   "mkdocs-material>=9",
   "mkdocstrings[python]>=0.27",
+  "plotly>=5",
+  "awkward>=2.6",
 ]
 benchmark = [
   "awkward>=2.6",

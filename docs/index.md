@@ -14,3 +14,11 @@
 - [Compilation](compilation.md)
 - [GPU Acceleration](gpu-acceleration.md)
 - [API Reference](api.md)
+
+## Performance
+
+Representative **public API** timings on slightly ragged data (Grumpy, Awkward) vs rectangular NumPy with the same leaf count. Bar groups are **Grumpy · NumPy · Awkward**; lower is better. Charts are regenerated on each docs build.
+
+<iframe class="perf-chart-frame perf-chart-frame--home" src="generated/performance/summary.html" title="Representative benchmarks"></iframe>
+
+Full suite: [`benchmarks/benchmark_ragged_api.py`](https://github.com/Imaginary-Biolabs/Grumpy/blob/main/benchmarks/benchmark_ragged_api.py) — see [benchmarks/README.md](https://github.com/Imaginary-Biolabs/Grumpy/blob/main/benchmarks/README.md) for setup and other benchmarks.

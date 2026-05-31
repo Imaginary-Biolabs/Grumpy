@@ -1,4 +1,4 @@
-.PHONY: develop test coverage docs docs-serve bench bench-all wheel wheel-install clean
+.PHONY: develop test coverage docs docs-charts docs-serve bench bench-all wheel wheel-install clean
 
 develop:
 	maturin develop --release
@@ -12,6 +12,9 @@ coverage:
 
 docs:
 	mkdocs build -f mkdocs.yml
+
+docs-charts:
+	python benchmarks/generate_perf_charts.py
 
 docs-serve:
 	mkdocs serve -f mkdocs.yml

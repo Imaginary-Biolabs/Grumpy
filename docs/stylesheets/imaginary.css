@@ -718,3 +718,30 @@
   background: #3d5a48;
   color: var(--gr-sand-50);
 }
+
+/* ── Performance page (Plotly chart embeds) ── */
+.perf-chart-frame {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-height: 420px;
+  height: 460px;
+  margin: 1.25rem 0 2rem;
+  border: 1px solid var(--gr-sand-300);
+  border-radius: 6px;
+  background: var(--gr-sand-50);
+}
+
+[data-md-color-scheme="imaginary-dark"] .perf-chart-frame {
+  border-color: var(--gr-ink-600);
+  background: var(--gr-ink-800);
+}
+
+.md-typeset .perf-chart-frame {
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.perf-chart-frame--home {
+  margin-top: 0.75rem;
+}
