@@ -1,0 +1,34 @@
+{#-
+  Grumpy footer: brand block, links, copyright, and social icons.
+-#}
+<footer class="md-footer">
+  <div class="gr-footer">
+    <div class="gr-footer__inner md-grid">
+      <div class="gr-footer__brand">
+        <span class="gr-footer__logo">{% include "partials/brand-icon.html" %}</span>
+        <div class="gr-footer__brand-text">
+          <span class="gr-footer__name">{{ config.site_name }}</span>
+          <span class="gr-footer__byline">Documentation · Imaginary Biolabs</span>
+        </div>
+      </div>
+      <nav class="gr-footer__links" aria-label="Footer">
+        <a href="{{ nav.homepage.url | url }}">Home</a>
+        <a href="{{ config.repo_url }}" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://www.imaginary.bio" target="_blank" rel="noopener">Imaginary Biolabs</a>
+        <a href="{{ 'license-faq/' | url }}">License FAQ</a>
+      </nav>
+    </div>
+    <div class="gr-footer__meta md-grid">
+      <div class="gr-footer__copyright">
+        {% if config.copyright %}
+          {{ config.copyright }}
+        {% endif %}
+      </div>
+      {% if config.extra.social %}
+        <div class="gr-footer__social">
+          {% include "partials/social.html" %}
+        </div>
+      {% endif %}
+    </div>
+  </div>
+</footer>

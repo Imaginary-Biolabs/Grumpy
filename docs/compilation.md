@@ -1,4 +1,4 @@
-# Compilation and parallel apply
+# Compilation
 
 ## `@gr.compile`
 

@@ -2,20 +2,40 @@
 
 {% block htmltitle %}
   {%- if page.meta and page.meta.title -%}
-    {{ page.meta.title }} · {{ config.site_name }}
+    <title>{{ page.meta.title }} · {{ config.site_name }}</title>
   {%- elif page.title and not page.is_homepage -%}
-    {{ page.title }} · {{ config.site_name }}
+    <title>{{ page.title | striptags }} · {{ config.site_name }}</title>
   {%- else -%}
-    {{ config.site_name }} · {{ config.site_description }}
+    <title>{{ config.site_name }}</title>
   {%- endif -%}
 {% endblock %}
 
 {% block content %}
   {% if page.is_homepage %}
-  <div class="gr-hero">
-    <img src="{{ 'assets/grumpy_icon.svg' | url }}" alt="Grumpy icon" />
-    <p class="gr-hero-tagline">{{ config.site_description }}</p>
-  </div>
+  {% set tagline_parts = config.site_description.split(" on ", 1) %}
+  <header class="gr-home-hero">
+    <div class="gr-home-mark" aria-hidden="true">
+      <img
+        class="gr-brand-mark gr-brand-mark--page gr-brand-mark--on-light"
+        src="{{ 'assets/grumpy_logo_vertical_light.svg' | url }}"
+        alt=""
+      />
+      <img
+        class="gr-brand-mark gr-brand-mark--page gr-brand-mark--on-dark"
+        src="{{ 'assets/grumpy_logo_vertical_dark.svg' | url }}"
+        alt=""
+      />
+    </div>
+    <p class="gr-home-tagline">
+      <span>{{ tagline_parts[0] }}</span>
+      {% if tagline_parts | length > 1 %}
+      <span>on {{ tagline_parts[1] }}</span>
+      {% endif %}
+    </p>
+    <p class="gr-home-lead">
+      <strong>Grumpy</strong> is a high-performance Python library (Rust core) for numerical computing on <strong>ragged and nested</strong> data — Awkward-like layouts with strong typing, explicit nullability, mutable arrays, and Zarr-backed I/O.
+    </p>
+  </header>
   {% endif %}
   {{ super() }}
 {% endblock %}

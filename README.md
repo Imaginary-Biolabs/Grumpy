@@ -1,8 +1,10 @@
 <p align="center">
-  <img src="docs/assets/grumpy_icon.svg" alt="Grumpy" width="72" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/grumpy_logo_horizontal_dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/grumpy_logo_horizontal_light.svg">
+    <img src="docs/assets/grumpy_logo_horizontal_light.svg" alt="Grumpy" width="280">
+  </picture>
 </p>
-
-<h1 align="center">Grumpy</h1>
 
 <p align="center">
   <strong>High-performance numerical computing on ragged and nested data</strong><br/>
@@ -72,9 +74,10 @@ for batch in gr.stream("data.gr", batch_size=32):
 
 - [Getting started](docs/getting-started.md)
 - [Arrays](docs/arrays.md)
-- [DataFrames & schema](docs/dataframes.md)
-- [I/O & streaming](docs/io-streaming.md)
+- [Dataframes](docs/dataframes.md)
+- [Saving and loading](docs/saving-loading.md)
 - [Compilation](docs/compilation.md)
+- [API Reference](docs/api.md)
 
 Build the site locally: `pip install -e ".[dev]" && mkdocs serve`.
 

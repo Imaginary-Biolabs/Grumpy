@@ -1,4 +1,4 @@
-# DataFrames and schema
+# Dataframes
 
 `gr.dataframe` groups named `GrumpyArray` columns. An optional **schema** enforces shared outer shapes per prefix.
 

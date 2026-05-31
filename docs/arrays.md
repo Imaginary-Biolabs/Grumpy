@@ -1,4 +1,4 @@
-# Arrays tutorial
+# Arrays
 
 Grumpy arrays represent **ragged nested lists** using a small layout tree (`ListOffset` → … → `Leaf`).
 
