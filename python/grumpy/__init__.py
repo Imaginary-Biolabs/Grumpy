@@ -17,6 +17,7 @@ from ._version import __version__
 from ._core import (
     DType,
     GrumpyArray,
+    GrumpyDataFrame,
     Generator,
     array as _array,
     multiply as _multiply,
@@ -51,6 +52,7 @@ from ._core import (
     neighbors as _neighbors,
     dataframe as _dataframe,
     save as _save,
+    append_batch as _append_batch,
     load as _load,
     rng as _rng,
 )
@@ -286,8 +288,26 @@ def dataframe(mapping: dict, schema=None):
     return _dataframe(mapping, schema)
 
 
-def save(obj, path: str, chunk_size: int = 1024):
-    return _save(obj, path, chunk_size)
+def save(obj, path: str, chunk_size: int = 1024, chunk_dim=None):
+    """Save a GrumpyArray/DataFrame, or incrementally write batches from a generator."""
+    import types
+
+    chunk_arg = None if chunk_dim is None else str(chunk_dim)
+    if isinstance(obj, (GrumpyArray, GrumpyDataFrame)):
+        return _save(obj, path, chunk_size, chunk_arg)
+    if isinstance(obj, types.GeneratorType) or (
+        hasattr(obj, "__iter__") and hasattr(obj, "__next__") and not isinstance(obj, (str, bytes))
+    ):
+        it = iter(obj)
+        try:
+            first = next(it)
+        except StopIteration as exc:
+            raise ValueError("save(generator): iterator produced no batches.") from exc
+        _save(first, path, chunk_size, chunk_arg)
+        for batch in it:
+            _append_batch(batch, path, chunk_size, chunk_arg)
+        return None
+    return _save(obj, path, chunk_size, chunk_arg)
 
 
 def load(path: str):
@@ -304,6 +324,7 @@ def stream(
     workers: int = 0,
     world_size: int = 1,
     rank: int = 0,
+    batch_indices: Optional[tuple[int, ...]] = None,
 ) -> Stream:
     return Stream(
         path=path,
@@ -315,6 +336,7 @@ def stream(
         workers=workers,
         world_size=world_size,
         rank=rank,
+        batch_indices=batch_indices,
     )
 
 

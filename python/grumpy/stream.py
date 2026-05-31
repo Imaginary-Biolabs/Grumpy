@@ -10,18 +10,17 @@ Features
 - DDP sharding via ``world_size`` / ``rank``
 - I/O prefetch via ``workers`` (distinct from ``StreamApply`` transform parallelism)
 - Partial batch reads (leaf ranges only) via the Rust ``StreamBatchesIter``
+- Subset iteration via ``st[index]`` (int, slice, or sequence of batch indices)
 
 Known limitations
 -----------------
 - ``UnionScalarList`` and ``Indexed`` layouts are not supported for streaming slice loads.
-- ``st[index]`` random access indexing is not implemented yet.
-- ``save(generator)`` incremental writes are not implemented yet.
 - Compiled Rust scheduling supports a restricted opcode set (see ``compiler.py``).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Optional, Sequence, TypeVar, Union
 
 from concurrent.futures import ThreadPoolExecutor
@@ -80,6 +79,7 @@ class Stream:
     workers: int = 0
     world_size: int = 1
     rank: int = 0
+    batch_indices: Optional[tuple[int, ...]] = None
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -93,6 +93,26 @@ class Stream:
         if self.shuffle is not None and self.seed is None:
             raise ValueError("seed is required when shuffle is set")
 
+    def _batch_indices_arg(self) -> Optional[list[int]]:
+        if self.batch_indices is None:
+            return None
+        return list(self.batch_indices)
+
+    def __getitem__(self, index: Union[int, slice, Sequence[int]]) -> "Stream":
+        """Return a stream over a subset of batches (after DDP sharding)."""
+        n = len(self)
+        if isinstance(index, int):
+            if index < 0:
+                index += n
+            if index < 0 or index >= n:
+                raise IndexError(f"batch index {index} out of range for stream of length {n}")
+            indices = (index,)
+        elif isinstance(index, slice):
+            indices = tuple(range(*index.indices(n)))
+        else:
+            indices = tuple(int(i) for i in index)
+        return replace(self, batch_indices=indices)
+
     def __len__(self) -> int:
         """Return the number of batches (after DDP sharding, before shuffle)."""
         from ._core import stream_len
@@ -104,6 +124,7 @@ class Stream:
             self.batch_on,
             self.world_size,
             self.rank,
+            self._batch_indices_arg(),
         )
 
     def __iter__(self) -> Iterator:
@@ -128,6 +149,7 @@ class Stream:
             self.workers,
             self.world_size,
             self.rank,
+            self._batch_indices_arg(),
         )
 
     def apply(
@@ -245,6 +267,13 @@ class StreamApply(Iterable[T]):
                 pre = self.prefetch if self.prefetch is not None else (2 * self.cpu)
                 if pre < 1:
                     pre = 1
+                shuffle_arg: Optional[str]
+                if self.base.shuffle is True:
+                    shuffle_arg = "true"
+                elif self.base.shuffle is False or self.base.shuffle is None:
+                    shuffle_arg = None
+                else:
+                    shuffle_arg = str(self.base.shuffle)
                 yield from _core.compiled_stream_apply(
                     self.base.path,
                     self.base.batch_size,
@@ -252,6 +281,12 @@ class StreamApply(Iterable[T]):
                     self.cpu,
                     pre,
                     pipeline_info.fused_ops,
+                    self.base.batch_on,
+                    shuffle_arg,
+                    self.base.seed,
+                    self.base.world_size,
+                    self.base.rank,
+                    self.base._batch_indices_arg(),
                 )
                 return
 

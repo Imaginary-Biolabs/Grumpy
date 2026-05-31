@@ -1491,6 +1491,20 @@ fn concat_axis0_layouts(layouts: &[Layout]) -> PyResult<Layout> {
     }
 }
 
+/// Concatenate two arrays along axis 0 (pure list-chains).
+pub fn concat_arrays_axis0(a: &GrumpyArray, b: &GrumpyArray) -> PyResult<GrumpyArray> {
+    if a.dtype != b.dtype {
+        return Err(PyValueError::new_err(
+            "concat axis 0 requires arrays with the same dtype.",
+        ));
+    }
+    let layout = concat_axis0_layouts(&[a.layout.clone(), b.layout.clone()])?;
+    Ok(GrumpyArray {
+        dtype: a.dtype,
+        layout,
+    })
+}
+
 fn elementwise_leaf_broadcast(
     a: &Leaf,
     b: &Leaf,

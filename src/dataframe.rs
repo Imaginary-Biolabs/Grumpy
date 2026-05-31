@@ -102,6 +102,28 @@ impl GrumpyDataFrame {
         self.canon.nrows.unwrap_or(0)
     }
 
+    pub fn concat_axis0(&self, other: &Self) -> PyResult<Self> {
+        if self.names != other.names {
+            return Err(PyValueError::new_err(
+                "concat axis 0 requires dataframes with the same column names.",
+            ));
+        }
+        if self.schema.is_some() != other.schema.is_some() {
+            return Err(PyValueError::new_err(
+                "concat axis 0 requires matching schema presence.",
+            ));
+        }
+        let mut cols: Vec<GrumpyArray> = Vec::with_capacity(self.cols.len());
+        for (a, b) in self.cols.iter().zip(other.cols.iter()) {
+            cols.push(crate::ops::concat_arrays_axis0(a, b)?);
+        }
+        Self::new(
+            self.names.clone(),
+            cols,
+            self.schema.clone().or_else(|| other.schema.clone()),
+        )
+    }
+
     pub fn to_pydict(&self, py: Python<'_>) -> PyResult<PyObject> {
         let d = PyDict::new_bound(py);
         for (name, col) in self.names.iter().zip(self.cols.iter()) {

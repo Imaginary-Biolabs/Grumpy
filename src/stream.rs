@@ -185,6 +185,20 @@ pub fn shuffle_within_batch(
     Ok(())
 }
 
+pub fn filter_batch_plan(plan: &BatchPlan, indices: &[usize]) -> PyResult<BatchPlan> {
+    let n = plan.batches.len();
+    let mut batches = Vec::with_capacity(indices.len());
+    for &i in indices {
+        if i >= n {
+            return Err(PyValueError::new_err(format!(
+                "batch index {i} out of range (num_batches={n})."
+            )));
+        }
+        batches.push(plan.batches[i].clone());
+    }
+    Ok(BatchPlan { batches })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -213,3 +213,79 @@ def test_drop_last_batch_on(tmp_path):
     # 9 molecules total, batch_size=5 -> [6,3]; drop_last drops final partial batch
     assert len(gr.stream(path, batch_size=5, batch_on="molecule", drop_last=True)) == 1
     assert len(gr.stream(path, batch_size=5, batch_on="molecule", drop_last=False)) == 2
+
+
+def test_stream_getitem_slice(tmp_path):
+    x = gr.array(list(range(12)), dtype=gr.int64)
+    path = str(tmp_path / "a.gr")
+    gr.save(x, path, chunk_size=4)
+    st = gr.stream(path, batch_size=3)
+    assert len(st) == 4
+    sub = st[1:3]
+    assert len(sub) == 2
+    batches = [b.to_list() for b in sub]
+    assert batches == [[3, 4, 5], [6, 7, 8]]
+
+
+def test_stream_getitem_int(tmp_path):
+    x = gr.array(list(range(10)), dtype=gr.int64)
+    path = str(tmp_path / "a.gr")
+    gr.save(x, path)
+    st = gr.stream(path, batch_size=2)
+    assert list(st[2])[0].to_list() == [4, 5]
+
+
+def test_save_generator_array(tmp_path):
+    path = str(tmp_path / "gen.gr")
+
+    def batches():
+        for i in range(5):
+            yield gr.array([[i]], dtype=gr.int64)
+
+    gr.save(batches(), path, chunk_size=2)
+    loaded = gr.load(path)
+    assert loaded.to_list() == [[0], [1], [2], [3], [4]]
+
+
+def test_save_generator_dataframe(tmp_path):
+    path = str(tmp_path / "gen_df.gr")
+
+    def batches():
+        for i in range(3):
+            yield gr.dataframe({"a": [i], "b": [i + 10]})
+
+    gr.save(batches(), path)
+    loaded = gr.load(path)
+    assert loaded.to_dict() == {"a": [0, 1, 2], "b": [10, 11, 12]}
+
+
+def test_chunk_dim_save(tmp_path):
+    x = gr.array([[i, i + 1] for i in range(20)], dtype=gr.int64)
+    path = str(tmp_path / "chunk.gr")
+    gr.save(x, path, chunk_size=4, chunk_dim=1)
+    loaded = gr.load(path)
+    assert loaded.to_list() == x.to_list()
+
+
+def test_compiled_stream_apply_partial_io(tmp_path):
+    x = gr.array(list(range(100)), dtype=gr.float64)
+    path = str(tmp_path / "a.gr")
+    gr.save(x, path, chunk_size=32)
+
+    def mul_only(batch):
+        batch = batch * 2.0
+        return batch
+
+    gr._core.reset_io_bytes_read()
+    st = gr.stream(path, batch_size=10)
+    out = list(st.apply(mul_only, cpu=2, compile=True, scheduler="rust", prefetch=0))
+    partial_bytes = gr._core.io_bytes_read()
+    assert len(out) == 10
+    assert out[0].to_list()[0] == 0.0
+
+    gr._core.reset_io_bytes_read()
+    gr._core.load_slice(path, 0, 100)
+    full_bytes = gr._core.io_bytes_read()
+    assert partial_bytes > 0
+    assert partial_bytes <= full_bytes * 2
+

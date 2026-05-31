@@ -30,7 +30,7 @@ from grumpy.stream import Stream, StreamApply, _ceil_div
 
 
 def test_version_and_public_exports():
-    assert gr.__version__ == "0.1.0"
+    assert gr.__version__ == "0.1.1"
     assert "compile" in gr.__all__
     assert callable(gr.compile)
 

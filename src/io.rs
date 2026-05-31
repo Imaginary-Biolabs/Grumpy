@@ -200,17 +200,46 @@ pub enum LayoutMeta {
 struct SaveCtx {
     next: usize,
     chunk_size: usize,
+    /// When set, only leaf/offset buffers at this list depth use ``chunk_size``; others use one chunk.
+    chunk_dim_depth: Option<usize>,
 }
 
-pub fn save_array(py: Python<'_>, arr: &GrumpyArray, path: &str, chunk_size: usize) -> PyResult<()> {
+impl SaveCtx {
+    fn effective_chunk_size(&self, depth: usize, n: usize) -> usize {
+        let n = n.max(1);
+        match self.chunk_dim_depth {
+            Some(target) if target == depth => self.chunk_size.max(1).min(n),
+            Some(_) => n,
+            None => self.chunk_size.max(1).min(n),
+        }
+    }
+}
+
+pub fn save_array(
+    py: Python<'_>,
+    arr: &GrumpyArray,
+    path: &str,
+    chunk_size: usize,
+    chunk_dim: Option<usize>,
+) -> PyResult<()> {
     let _ = py;
     ensure_dir(path)?;
     let store = store_fs(path)?;
     init_root_group(&store)?;
     init_group(&store, "/buffers")?;
-    let mut ctx = SaveCtx { next: 0, chunk_size: chunk_size.max(1) };
-    let layout = save_layout(&store, &mut ctx, arr.dtype, &arr.layout)?;
-    let meta = FileMeta { version: FORMAT_VERSION, root: RootMeta::Array { dtype: arr.dtype.into(), layout } };
+    let mut ctx = SaveCtx {
+        next: 0,
+        chunk_size: chunk_size.max(1),
+        chunk_dim_depth: chunk_dim,
+    };
+    let layout = save_layout(&store, &mut ctx, arr.dtype, &arr.layout, 0)?;
+    let meta = FileMeta {
+        version: FORMAT_VERSION,
+        root: RootMeta::Array {
+            dtype: arr.dtype.into(),
+            layout,
+        },
+    };
     write_meta(path, &meta)?;
     Ok(())
 }
@@ -229,20 +258,40 @@ pub fn load_array(py: Python<'_>, path: &str) -> PyResult<GrumpyArray> {
     }
 }
 
-pub fn save_dataframe(py: Python<'_>, df: &GrumpyDataFrame, path: &str, chunk_size: usize) -> PyResult<()> {
+pub fn save_dataframe(
+    py: Python<'_>,
+    df: &GrumpyDataFrame,
+    path: &str,
+    chunk_size: usize,
+    chunk_dim: Option<usize>,
+) -> PyResult<()> {
     let _ = py;
     ensure_dir(path)?;
     let store = store_fs(path)?;
     init_root_group(&store)?;
     init_group(&store, "/buffers")?;
-    let mut ctx = SaveCtx { next: 0, chunk_size: chunk_size.max(1) };
+    let mut ctx = SaveCtx {
+        next: 0,
+        chunk_size: chunk_size.max(1),
+        chunk_dim_depth: chunk_dim,
+    };
     let mut columns: Vec<ColumnMeta> = Vec::new();
     for (name, col) in df.names.iter().zip(df.cols.iter()) {
-        let layout = save_layout(&store, &mut ctx, col.dtype, &col.layout)?;
-        columns.push(ColumnMeta { name: name.clone(), dtype: col.dtype.into(), layout });
+        let layout = save_layout(&store, &mut ctx, col.dtype, &col.layout, 0)?;
+        columns.push(ColumnMeta {
+            name: name.clone(),
+            dtype: col.dtype.into(),
+            layout,
+        });
     }
     let schema_levels = df.schema.as_ref().map(|s| s.levels.clone());
-    let meta = FileMeta { version: FORMAT_VERSION, root: RootMeta::DataFrame { schema: schema_levels, columns } };
+    let meta = FileMeta {
+        version: FORMAT_VERSION,
+        root: RootMeta::DataFrame {
+            schema: schema_levels,
+            columns,
+        },
+    };
     write_meta(path, &meta)?;
     Ok(())
 }
@@ -321,56 +370,90 @@ fn axis0_len_from_layout_meta(
     }
 }
 
-fn save_layout(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, dt: DType, layout: &Layout) -> PyResult<LayoutMeta> {
+fn save_layout(
+    store: &ReadableWritableListableStorage,
+    ctx: &mut SaveCtx,
+    dt: DType,
+    layout: &Layout,
+    depth: usize,
+) -> PyResult<LayoutMeta> {
     match layout {
-        Layout::Leaf(leaf) => save_leaf(store, ctx, dt, leaf),
+        Layout::Leaf(leaf) => save_leaf(store, ctx, dt, leaf, depth),
         Layout::ListOffset(lo) => {
-            let offsets = write_vec_i64(store, ctx, "offsets", lo.offsets.as_slice())?;
-            let content = save_layout(store, ctx, dt, lo.content.as_ref())?;
-            Ok(LayoutMeta::ListOffset { offsets, content: Box::new(content) })
+            let offsets = write_vec_i64(store, ctx, "offsets", lo.offsets.as_slice(), depth)?;
+            let content = save_layout(store, ctx, dt, lo.content.as_ref(), depth + 1)?;
+            Ok(LayoutMeta::ListOffset {
+                offsets,
+                content: Box::new(content),
+            })
         }
         Layout::OffsetView(v) => {
-            let offsets = write_vec_i64(store, ctx, "offsets", v.offsets.as_slice())?;
-            let content = save_layout(store, ctx, dt, v.content.as_ref())?;
-            Ok(LayoutMeta::OffsetView { offsets, start: v.start, stop: v.stop, content: Box::new(content) })
+            let offsets = write_vec_i64(store, ctx, "offsets", v.offsets.as_slice(), depth)?;
+            let content = save_layout(store, ctx, dt, v.content.as_ref(), depth)?;
+            Ok(LayoutMeta::OffsetView {
+                offsets,
+                start: v.start,
+                stop: v.stop,
+                content: Box::new(content),
+            })
         }
         Layout::Indexed(ix) => {
-            let index = write_vec_i64(store, ctx, "index", ix.index.as_slice())?;
-            let content = save_layout(store, ctx, dt, ix.content.as_ref())?;
-            Ok(LayoutMeta::Indexed { index, content: Box::new(content) })
+            let index = write_vec_i64(store, ctx, "index", ix.index.as_slice(), depth)?;
+            let content = save_layout(store, ctx, dt, ix.content.as_ref(), depth)?;
+            Ok(LayoutMeta::Indexed {
+                index,
+                content: Box::new(content),
+            })
         }
         Layout::UnionScalarList(u) => {
-            let tags = write_vec_u8(store, ctx, "tags", &u.tags)?;
-            let index = write_vec_i64(store, ctx, "index", &u.index)?;
-            let scalars = save_leaf(store, ctx, dt, &u.scalars)?;
-            let lists = save_layout(store, ctx, dt, &Layout::ListOffset(u.lists.clone()))?;
-            Ok(LayoutMeta::UnionScalarList { tags, index, scalars: Box::new(scalars), lists: Box::new(lists) })
+            let tags = write_vec_u8(store, ctx, "tags", &u.tags, depth)?;
+            let index = write_vec_i64(store, ctx, "index", &u.index, depth)?;
+            let scalars = save_leaf(store, ctx, dt, &u.scalars, depth)?;
+            let lists = save_layout(
+                store,
+                ctx,
+                dt,
+                &Layout::ListOffset(u.lists.clone()),
+                depth,
+            )?;
+            Ok(LayoutMeta::UnionScalarList {
+                tags,
+                index,
+                scalars: Box::new(scalars),
+                lists: Box::new(lists),
+            })
         }
     }
 }
 
-fn save_leaf(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, dt: DType, leaf: &Leaf) -> PyResult<LayoutMeta> {
+fn save_leaf(
+    store: &ReadableWritableListableStorage,
+    ctx: &mut SaveCtx,
+    dt: DType,
+    leaf: &Leaf,
+    depth: usize,
+) -> PyResult<LayoutMeta> {
     let len = leaf.len;
     let validity_vec: Vec<bool> = leaf.validity.iter().by_vals().collect();
-    let validity = write_vec_bool(store, ctx, "validity", validity_vec.as_slice())?;
+    let validity = write_vec_bool(store, ctx, "validity", validity_vec.as_slice(), depth)?;
     let values = match (&leaf.buffer, dt) {
-        (LeafBuffer::I8(v), DType::Int8) => write_vec_i8(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::I16(v), DType::Int16) => write_vec_i16(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::I32(v), DType::Int32) => write_vec_i32(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::I64(v), DType::Int64) => write_vec_i64(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::U8(v), DType::UInt8) => write_vec_u8(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::U16(v), DType::UInt16) => write_vec_u16(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::U32(v), DType::UInt32) => write_vec_u32(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::U64(v), DType::UInt64) => write_vec_u64(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::F16(v), DType::Float16) => write_vec_u16(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::F32(v), DType::Float32) => write_vec_f32(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::F64(v), DType::Float64) => write_vec_f64(store, ctx, "values", v.as_slice())?,
+        (LeafBuffer::I8(v), DType::Int8) => write_vec_i8(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::I16(v), DType::Int16) => write_vec_i16(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::I32(v), DType::Int32) => write_vec_i32(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::I64(v), DType::Int64) => write_vec_i64(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::U8(v), DType::UInt8) => write_vec_u8(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::U16(v), DType::UInt16) => write_vec_u16(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::U32(v), DType::UInt32) => write_vec_u32(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::U64(v), DType::UInt64) => write_vec_u64(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::F16(v), DType::Float16) => write_vec_u16(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::F32(v), DType::Float32) => write_vec_f32(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::F64(v), DType::Float64) => write_vec_f64(store, ctx, "values", v.as_slice(), depth)?,
         (LeafBuffer::Bool(v), DType::Bool) => {
             let b: Vec<bool> = v.as_slice().iter().map(|&x| x != 0).collect();
-            write_vec_bool(store, ctx, "values", &b)?
+            write_vec_bool(store, ctx, "values", &b, depth)?
         }
-        (LeafBuffer::Char(v), DType::Char) => write_vec_u32(store, ctx, "values", v.as_slice())?,
-        (LeafBuffer::String(v), DType::String) => write_vec_string(store, ctx, "values", v.as_slice())?,
+        (LeafBuffer::Char(v), DType::Char) => write_vec_u32(store, ctx, "values", v.as_slice(), depth)?,
+        (LeafBuffer::String(v), DType::String) => write_vec_string(store, ctx, "values", v.as_slice(), depth)?,
         _ => return Err(PyValueError::new_err("Internal error: dtype mismatch in save_leaf.")),
     };
     Ok(LayoutMeta::Leaf { len, values, validity })
@@ -498,13 +581,14 @@ fn write_1d<T: ElementOwned>(
     dt: DataType,
     fill: FillValue,
     data: &[T],
+    depth: usize,
 ) -> PyResult<String>
 where
     T: Clone,
 {
     let path = next_path(ctx, prefix);
     let n = data.len();
-    let chunk = std::cmp::min(ctx.chunk_size, std::cmp::max(1, n));
+    let chunk = ctx.effective_chunk_size(depth, n);
     let nz = std::num::NonZeroU64::new(chunk as u64).unwrap();
     let chunk_grid = ChunkGrid::from(vec![nz]);
     let arr = ArrayBuilder::new(vec![n as u64], dt, chunk_grid, fill)
@@ -517,48 +601,48 @@ where
     Ok(path)
 }
 
+fn write_vec_i64(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[i64], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::Int64, FillValue::from(0i64), data, depth)
+}
+fn write_vec_i32(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[i32], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::Int32, FillValue::from(0i32), data, depth)
+}
+fn write_vec_i16(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[i16], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::Int16, FillValue::from(0i16), data, depth)
+}
+fn write_vec_i8(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[i8], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::Int8, FillValue::from(0i8), data, depth)
+}
+fn write_vec_u64(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[u64], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::UInt64, FillValue::from(0u64), data, depth)
+}
+fn write_vec_u32(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[u32], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::UInt32, FillValue::from(0u32), data, depth)
+}
+fn write_vec_u16(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[u16], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::UInt16, FillValue::from(0u16), data, depth)
+}
+fn write_vec_u8(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[u8], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::UInt8, FillValue::from(0u8), data, depth)
+}
+fn write_vec_f64(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[f64], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::Float64, FillValue::from(0.0f64), data, depth)
+}
+fn write_vec_f32(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[f32], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::Float32, FillValue::from(0.0f32), data, depth)
+}
+fn write_vec_bool(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[bool], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::Bool, FillValue::from(false), data, depth)
+}
+fn write_vec_string(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[String], depth: usize) -> PyResult<String> {
+    write_1d(store, ctx, prefix, DataType::String, FillValue::from(""), data, depth)
+}
+
 fn read_vec<T: ElementOwned>(store: &ReadableWritableListableStorage, path: &str) -> PyResult<Vec<T>> {
     let arr = Array::open(store.clone(), path).map_err(|e| PyValueError::new_err(format!("{e}")))?;
     let subset = arr.subset_all();
     arr.retrieve_array_subset_elements::<T>(&subset)
         .map_err(|e| PyValueError::new_err(format!("{e}")))
-}
-
-fn write_vec_i64(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[i64]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::Int64, FillValue::from(0i64), data)
-}
-fn write_vec_i32(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[i32]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::Int32, FillValue::from(0i32), data)
-}
-fn write_vec_i16(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[i16]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::Int16, FillValue::from(0i16), data)
-}
-fn write_vec_i8(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[i8]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::Int8, FillValue::from(0i8), data)
-}
-fn write_vec_u64(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[u64]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::UInt64, FillValue::from(0u64), data)
-}
-fn write_vec_u32(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[u32]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::UInt32, FillValue::from(0u32), data)
-}
-fn write_vec_u16(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[u16]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::UInt16, FillValue::from(0u16), data)
-}
-fn write_vec_u8(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[u8]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::UInt8, FillValue::from(0u8), data)
-}
-fn write_vec_f64(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[f64]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::Float64, FillValue::from(0.0f64), data)
-}
-fn write_vec_f32(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[f32]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::Float32, FillValue::from(0.0f32), data)
-}
-fn write_vec_bool(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[bool]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::Bool, FillValue::from(false), data)
-}
-fn write_vec_string(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, prefix: &str, data: &[String]) -> PyResult<String> {
-    write_1d(store, ctx, prefix, DataType::String, FillValue::from(""), data)
 }
 
 fn read_vec_bool(store: &ReadableWritableListableStorage, path: &str) -> PyResult<Vec<bool>> {
@@ -916,3 +1000,45 @@ fn count_list_elements_in_leaf_range(
     }
 }
 
+/// Append axis-0 rows to an existing saved array (load + concat + rewrite).
+pub fn append_array_axis0(
+    py: Python<'_>,
+    path: &str,
+    batch: &GrumpyArray,
+    chunk_size: usize,
+    chunk_dim: Option<usize>,
+) -> PyResult<()> {
+    let existing = load_array(py, path)?;
+    let merged = crate::ops::concat_arrays_axis0(&existing, batch)?;
+    save_array(py, &merged, path, chunk_size, chunk_dim)
+}
+
+/// Append axis-0 rows to an existing saved dataframe (load + concat + rewrite).
+pub fn append_dataframe_axis0(
+    py: Python<'_>,
+    path: &str,
+    batch: &GrumpyDataFrame,
+    chunk_size: usize,
+    chunk_dim: Option<usize>,
+) -> PyResult<()> {
+    let existing = load_dataframe(py, path)?;
+    let merged = existing.concat_axis0(batch)?;
+    save_dataframe(py, &merged, path, chunk_size, chunk_dim)
+}
+
+/// Resolve ``chunk_dim`` from an integer depth or schema level name.
+pub fn resolve_chunk_dim_depth(df_schema: Option<&Schema>, chunk_dim: &str) -> PyResult<usize> {
+    if let Ok(d) = chunk_dim.parse::<usize>() {
+        return Ok(d);
+    }
+    if let Some(schema) = df_schema {
+        for (lvl, names) in schema.levels.iter().enumerate() {
+            if names.iter().any(|n| n == chunk_dim) {
+                return Ok(lvl);
+            }
+        }
+    }
+    Err(PyValueError::new_err(format!(
+        "Unknown chunk_dim '{chunk_dim}'."
+    )))
+}

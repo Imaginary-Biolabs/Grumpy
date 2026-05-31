@@ -15,7 +15,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL--1.1-2A2725?style=for-the-badge&logo=opensourceinitiative&logoColor=E3E1DE" alt="license BSL 1.1" /></a>
   <a href="https://github.com/Imaginary-Biolabs/Grumpy/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Imaginary-Biolabs/Grumpy/ci.yml?branch=main&style=for-the-badge&label=build&color=484240&logo=githubactions&logoColor=E3E1DE" alt="build status" /></a>
   <a href="https://codecov.io/gh/Imaginary-Biolabs/Grumpy"><img src="https://img.shields.io/codecov/c/github/Imaginary-Biolabs/Grumpy/main?style=for-the-badge&color=777067&logo=codecov&logoColor=E3E1DE" alt="codecov coverage" /></a>
-  <a href="https://github.com/Imaginary-Biolabs/Grumpy/releases"><img src="https://img.shields.io/badge/version-0.1.0-C8C4BF?style=for-the-badge&logo=python&logoColor=2A2725" alt="version 0.1.0" /></a>
+  <a href="https://github.com/Imaginary-Biolabs/Grumpy/releases"><img src="https://img.shields.io/badge/version-0.1.1-C8C4BF?style=for-the-badge&logo=python&logoColor=2A2725" alt="version 0.1.1" /></a>
 </p>
 
 <p align="center">
@@ -33,7 +33,7 @@ It shares Awkward Array’s buffer-tree mental model, with deliberate difference
 
 - **Ragged arrays** — arbitrary nesting via `ListOffset` layouts; NumPy-like ops with broadcasting
 - **DataFrames** — named columns, optional multi-level **schema**, dot-notation access
-- **I/O** — save/load Zarr stores; axis-0 **streaming** with parallel `apply`
+- **I/O** — save/load Zarr stores; axis-0 **streaming** with partial batch reads, `batch_on`, shuffle, DDP, and parallel `apply`
 - **Compilation** — `@gr.compile` and `Stream.apply(compile="auto")` fuse supported transforms in Rust
 - **Neighbors** — kNN / radius graph edges for 0D and grouped 1D point clouds
 
@@ -66,7 +66,7 @@ df = gr.dataframe(
     {"id": ["a", "b"], "vals": [[1, 2], [3, 4, 5]]},
 )
 gr.save(df, "data.gr")
-for batch in gr.stream("data.gr", batch_size=32):
+for batch in gr.stream("data.gr", batch_size=32, workers=2):
     batch = batch * 2  # or @gr.compile transform
 ```
 

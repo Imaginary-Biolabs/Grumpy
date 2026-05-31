@@ -279,6 +279,7 @@ fn prepare_stream_plan_with_shuffle_level(
     seed: Option<u64>,
     world_size: usize,
     rank: usize,
+    batch_indices: Option<&[usize]>,
 ) -> PyResult<(io_ops::DatasetHandle, BatchPlan, bool, Option<String>, Option<u64>)> {
     let handle = io_ops::DatasetHandle::open(path)?;
     let is_df = matches!(handle.meta.root, io_ops::RootMeta::DataFrame { .. });
@@ -297,6 +298,9 @@ fn prepare_stream_plan_with_shuffle_level(
     }
     if world_size > 1 || rank > 0 {
         stream::shard_batch_plan(&mut plan, world_size.max(1), rank)?;
+    }
+    if let Some(indices) = batch_indices {
+        plan = stream::filter_batch_plan(&plan, indices)?;
     }
     Ok((handle, plan, is_df, shuffle_within, seed))
 }
@@ -761,15 +765,21 @@ fn run_plan_df_rust(ops_plan: &[PlanOp], mut cur: df_ops::GrumpyDataFrame) -> Py
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, batch_size, drop_last, cpu, _prefetch, spec))]
+#[pyo3(signature = (path, batch_size, drop_last, cpu, _prefetch, spec, batch_on=None, shuffle=None, seed=None, world_size=1, rank=0, batch_indices=None))]
 fn compiled_stream_apply(
-    py: Python<'_>,
+    _py: Python<'_>,
     path: String,
     batch_size: usize,
     drop_last: bool,
     cpu: usize,
     _prefetch: usize,
     spec: Bound<'_, PyAny>,
+    batch_on: Option<String>,
+    shuffle: Option<String>,
+    seed: Option<u64>,
+    world_size: usize,
+    rank: usize,
+    batch_indices: Option<Vec<usize>>,
 ) -> PyResult<PyCompiledBatchesIter> {
     if cpu < 1 {
         return Err(PyValueError::new_err("cpu must be >= 1"));
@@ -777,68 +787,73 @@ fn compiled_stream_apply(
     if batch_size == 0 {
         return Err(PyValueError::new_err("batch_size must be > 0"));
     }
-    let plan = PyCompiledPlan::new(spec)?;
-    // Try array first; if it fails, try dataframe.
-    if let Ok(arr) = io_ops::load_array(py, &path) {
-        let n = arr.len();
-        let end = if drop_last && (n % batch_size != 0) {
-            n - (n % batch_size)
-        } else {
-            n
-        };
-        let mut batches: Vec<GrumpyArray> = Vec::new();
-        let mut i = 0usize;
-        while i < end {
-            let j = (i + batch_size).min(end);
-            batches.push(slice_axis0_view(&arr, i, j)?);
-            i = j;
-        }
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(cpu)
-            .build()
-            .map_err(|e| PyValueError::new_err(format!("Failed to build thread pool ({e}).")))?;
-        let results: Vec<PyResult<GrumpyArray>> = pool.install(|| {
-            batches
-                .into_par_iter()
-                .map(|b| run_plan_array_rust(&plan.ops, b))
-                .collect()
-        });
-        let mut outs: Vec<GrumpyArray> = Vec::with_capacity(results.len());
-        for r in results {
-            outs.push(r?);
-        }
-        return Ok(PyCompiledBatchesIter { arr_batches: Some(outs), df_batches: None, pos: 0 });
-    }
-
-    let df = io_ops::load_dataframe(py, &path)?;
-    let n = df.nrows();
-    let end = if drop_last && (n % batch_size != 0) {
-        n - (n % batch_size)
-    } else {
-        n
-    };
-    let mut batches: Vec<df_ops::GrumpyDataFrame> = Vec::new();
-    let mut i = 0usize;
-    while i < end {
-        let j = (i + batch_size).min(end);
-        batches.push(df_slice_axis0_view(&df, i, j)?);
-        i = j;
-    }
+    let plan_ops = PyCompiledPlan::new(spec)?;
+    let shuffle_arg = shuffle.as_deref();
+    let (handle, plan, is_df, _shuffle_within, _seed) = prepare_stream_plan_with_shuffle_level(
+        &path,
+        batch_size,
+        drop_last,
+        batch_on.as_deref(),
+        shuffle_arg,
+        seed,
+        world_size,
+        rank,
+        batch_indices.as_deref(),
+    )?;
     let pool = ThreadPoolBuilder::new()
         .num_threads(cpu)
         .build()
         .map_err(|e| PyValueError::new_err(format!("Failed to build thread pool ({e}).")))?;
-    let results: Vec<PyResult<df_ops::GrumpyDataFrame>> = pool.install(|| {
-        batches
-            .into_par_iter()
-            .map(|b| run_plan_df_rust(&plan.ops, b))
+    if is_df {
+        let handle = handle.clone();
+        let results: Vec<PyResult<df_ops::GrumpyDataFrame>> = pool.install(|| {
+            plan.batches
+                .par_iter()
+                .map(|batch| {
+                    let payload = stream::load_batch(&handle, batch)?;
+                    match payload {
+                        stream::BatchPayload::DataFrame(df) => run_plan_df_rust(&plan_ops.ops, df),
+                        _ => Err(PyValueError::new_err(
+                            "Internal error: array payload for dataframe stream.",
+                        )),
+                    }
+                })
+                .collect()
+        });
+        let mut outs: Vec<df_ops::GrumpyDataFrame> = Vec::with_capacity(results.len());
+        for r in results {
+            outs.push(r?);
+        }
+        return Ok(PyCompiledBatchesIter {
+            arr_batches: None,
+            df_batches: Some(outs),
+            pos: 0,
+        });
+    }
+    let handle = handle.clone();
+    let results: Vec<PyResult<GrumpyArray>> = pool.install(|| {
+        plan.batches
+            .par_iter()
+            .map(|batch| {
+                let payload = stream::load_batch(&handle, batch)?;
+                match payload {
+                    stream::BatchPayload::Array(arr) => run_plan_array_rust(&plan_ops.ops, arr),
+                    _ => Err(PyValueError::new_err(
+                        "Internal error: dataframe payload for array stream.",
+                    )),
+                }
+            })
             .collect()
     });
-    let mut outs: Vec<df_ops::GrumpyDataFrame> = Vec::with_capacity(results.len());
+    let mut outs: Vec<GrumpyArray> = Vec::with_capacity(results.len());
     for r in results {
         outs.push(r?);
     }
-    Ok(PyCompiledBatchesIter { arr_batches: None, df_batches: Some(outs), pos: 0 })
+    Ok(PyCompiledBatchesIter {
+        arr_batches: Some(outs),
+        df_batches: None,
+        pos: 0,
+    })
 }
 
 fn df_get_level0_column(df: &df_ops::GrumpyDataFrame, level0: &str, colname: &str) -> PyResult<GrumpyArray> {
@@ -3875,6 +3890,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(neighbors, m)?)?;
     m.add_function(wrap_pyfunction!(dataframe, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
+    m.add_function(wrap_pyfunction!(append_batch, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(stored_len, m)?)?;
     m.add_function(wrap_pyfunction!(load_slice, m)?)?;
@@ -3907,7 +3923,7 @@ fn load_slice(py: Python<'_>, path: String, start: usize, stop: usize) -> PyResu
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, shuffle=None, seed=None, workers=0, world_size=1, rank=0))]
+#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, shuffle=None, seed=None, workers=0, world_size=1, rank=0, batch_indices=None))]
 fn stream_batches(
     path: String,
     batch_size: usize,
@@ -3918,6 +3934,7 @@ fn stream_batches(
     workers: usize,
     world_size: usize,
     rank: usize,
+    batch_indices: Option<Vec<usize>>,
 ) -> PyResult<PyStreamBatchesIter> {
     let (handle, plan, is_dataframe, shuffle_within, seed) = prepare_stream_plan_with_shuffle_level(
         &path,
@@ -3928,6 +3945,7 @@ fn stream_batches(
         seed,
         world_size,
         rank,
+        batch_indices.as_deref(),
     )?;
     let prefetch_rx = if workers > 0 {
         Some(spawn_prefetch_loader(handle.clone(), plan.clone(), workers))
@@ -3946,7 +3964,7 @@ fn stream_batches(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, world_size=1, rank=0))]
+#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, world_size=1, rank=0, batch_indices=None))]
 fn stream_len(
     path: String,
     batch_size: usize,
@@ -3954,11 +3972,15 @@ fn stream_len(
     batch_on: Option<String>,
     world_size: usize,
     rank: usize,
+    batch_indices: Option<Vec<usize>>,
 ) -> PyResult<usize> {
     let handle = io_ops::DatasetHandle::open(&path)?;
     let mut plan = stream::build_batch_plan(&handle, batch_size, drop_last, batch_on.as_deref())?;
     if world_size > 1 || rank > 0 {
         stream::shard_batch_plan(&mut plan, world_size.max(1), rank)?;
+    }
+    if let Some(indices) = batch_indices {
+        plan = stream::filter_batch_plan(&plan, &indices)?;
     }
     Ok(plan.batches.len())
 }
@@ -3974,15 +3996,57 @@ fn reset_io_bytes_read() {
 }
 
 #[pyfunction]
-#[pyo3(signature = (obj, path, chunk_size=1024usize))]
-fn save(py: Python<'_>, obj: Bound<'_, PyAny>, path: String, chunk_size: usize) -> PyResult<()> {
+#[pyo3(signature = (obj, path, chunk_size=1024usize, chunk_dim=None))]
+fn save(py: Python<'_>, obj: Bound<'_, PyAny>, path: String, chunk_size: usize, chunk_dim: Option<String>) -> PyResult<()> {
+    let depth = chunk_dim
+        .as_deref()
+        .map(|s| {
+            if obj.extract::<PyRef<'_, PyGrumpyArray>>().is_ok() {
+                io_ops::resolve_chunk_dim_depth(None, s)
+            } else if let Ok(df) = obj.extract::<PyRef<'_, PyGrumpyDataFrame>>() {
+                io_ops::resolve_chunk_dim_depth(df.inner.schema.as_ref(), s)
+            } else {
+                Err(PyValueError::new_err(
+                    "gr.save expects a GrumpyArray or GrumpyDataFrame.",
+                ))
+            }
+        })
+        .transpose()?;
     if let Ok(arr) = obj.extract::<PyRef<'_, PyGrumpyArray>>() {
-        return io_ops::save_array(py, &arr.inner, &path, chunk_size);
+        return io_ops::save_array(py, &arr.inner, &path, chunk_size, depth);
     }
     if let Ok(df) = obj.extract::<PyRef<'_, PyGrumpyDataFrame>>() {
-        return io_ops::save_dataframe(py, &df.inner, &path, chunk_size);
+        return io_ops::save_dataframe(py, &df.inner, &path, chunk_size, depth);
     }
     Err(PyValueError::new_err("gr.save expects a GrumpyArray or GrumpyDataFrame."))
+}
+
+#[pyfunction]
+#[pyo3(signature = (obj, path, chunk_size=1024usize, chunk_dim=None))]
+fn append_batch(py: Python<'_>, obj: Bound<'_, PyAny>, path: String, chunk_size: usize, chunk_dim: Option<String>) -> PyResult<()> {
+    let depth = chunk_dim
+        .as_deref()
+        .map(|s| {
+            if obj.extract::<PyRef<'_, PyGrumpyArray>>().is_ok() {
+                io_ops::resolve_chunk_dim_depth(None, s)
+            } else if let Ok(df) = obj.extract::<PyRef<'_, PyGrumpyDataFrame>>() {
+                io_ops::resolve_chunk_dim_depth(df.inner.schema.as_ref(), s)
+            } else {
+                Err(PyValueError::new_err(
+                    "gr.append_batch expects a GrumpyArray or GrumpyDataFrame.",
+                ))
+            }
+        })
+        .transpose()?;
+    if let Ok(arr) = obj.extract::<PyRef<'_, PyGrumpyArray>>() {
+        return io_ops::append_array_axis0(py, &path, &arr.inner, chunk_size, depth);
+    }
+    if let Ok(df) = obj.extract::<PyRef<'_, PyGrumpyDataFrame>>() {
+        return io_ops::append_dataframe_axis0(py, &path, &df.inner, chunk_size, depth);
+    }
+    Err(PyValueError::new_err(
+        "gr.append_batch expects a GrumpyArray or GrumpyDataFrame.",
+    ))
 }
 
 #[pyfunction]
