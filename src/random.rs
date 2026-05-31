@@ -43,6 +43,15 @@ impl GrumpyRng {
     fn rng(&mut self) -> &mut Pcg64 {
         &mut self.inner
     }
+
+    /// Fisher-Yates shuffle for a slice of indices (used by stream batch planning).
+    pub fn shuffle_usizes(&mut self, items: &mut [usize]) {
+        use rand::Rng;
+        for i in (1..items.len()).rev() {
+            let j = self.rng().gen_range(0..=i);
+            items.swap(i, j);
+        }
+    }
 }
 
 fn is_integer_dtype(dt: DType) -> bool {

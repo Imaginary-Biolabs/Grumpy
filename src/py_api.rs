@@ -14,6 +14,9 @@
 //!   - `PlanOp` + `python/grumpy/compiler.py` compilation rules
 //!   - `run_plan_*_rust` for Rust scheduling of fully compiled pipelines
 
+use crate::stream::{self, BatchPayload, BatchPlan};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread;
 use crate::dtype::{infer_dtype, inferclass_to_dtype, DType, PyDType};
 use crate::layout::{
     build_array, concat_to_py_list, coord_to_leaf_index, drop_axis0_select_element, fill_layout_like,
@@ -239,6 +242,115 @@ impl PyCompiledBatchesIter {
             ));
         }
         Ok(None)
+    }
+}
+
+#[pyclass(name = "StreamBatchesIter")]
+pub struct PyStreamBatchesIter {
+    handle: io_ops::DatasetHandle,
+    is_dataframe: bool,
+    plan: BatchPlan,
+    pos: usize,
+    shuffle_within: Option<String>,
+    seed: Option<u64>,
+    prefetch_rx: Option<Receiver<PyResult<BatchPayload>>>,
+}
+
+fn payload_to_py(py: Python<'_>, payload: BatchPayload, is_dataframe: bool) -> PyResult<PyObject> {
+    match payload {
+        BatchPayload::Array(arr) if !is_dataframe => {
+            Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py))
+        }
+        BatchPayload::DataFrame(df) => {
+            Ok(Py::new(py, PyGrumpyDataFrame { inner: df })?.into_py(py))
+        }
+        BatchPayload::Array(_) => Err(PyValueError::new_err(
+            "Internal error: array payload for dataframe stream.",
+        )),
+    }
+}
+
+fn prepare_stream_plan_with_shuffle_level(
+    path: &str,
+    batch_size: usize,
+    drop_last: bool,
+    batch_on: Option<&str>,
+    shuffle: Option<&str>,
+    seed: Option<u64>,
+    world_size: usize,
+    rank: usize,
+) -> PyResult<(io_ops::DatasetHandle, BatchPlan, bool, Option<String>, Option<u64>)> {
+    let handle = io_ops::DatasetHandle::open(path)?;
+    let is_df = matches!(handle.meta.root, io_ops::RootMeta::DataFrame { .. });
+    let mut plan = stream::build_batch_plan(&handle, batch_size, drop_last, batch_on)?;
+    let shuffle_within = shuffle.and_then(|s| {
+        if s == "true" || s == "batch" {
+            None
+        } else {
+            handle
+                .schema()
+                .and_then(|schema| schema.level_index(s).ok().map(|_| s.to_string()))
+        }
+    });
+    if shuffle.is_some() {
+        stream::shuffle_batch_plan(&mut plan, seed.unwrap_or(0));
+    }
+    if world_size > 1 || rank > 0 {
+        stream::shard_batch_plan(&mut plan, world_size.max(1), rank)?;
+    }
+    Ok((handle, plan, is_df, shuffle_within, seed))
+}
+
+fn spawn_prefetch_loader(
+    handle: io_ops::DatasetHandle,
+    plan: BatchPlan,
+    queue_depth: usize,
+) -> Receiver<PyResult<BatchPayload>> {
+    let (tx, rx): (SyncSender<PyResult<BatchPayload>>, Receiver<PyResult<BatchPayload>>) =
+        mpsc::sync_channel(queue_depth.max(1));
+    thread::spawn(move || {
+        for batch in plan.batches {
+            let result = stream::load_batch(&handle, &batch);
+            if tx.send(result).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+#[pymethods]
+impl PyStreamBatchesIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __len__(&self) -> usize {
+        self.plan.batches.len()
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        if slf.pos >= slf.plan.batches.len() {
+            return Ok(None);
+        }
+        let batch_idx = slf.pos;
+        let mut payload = if let Some(rx) = slf.prefetch_rx.as_ref() {
+            rx.recv()
+                .map_err(|e| PyValueError::new_err(format!("Prefetch loader failed: {e}")))??
+        } else {
+            let batch = &slf.plan.batches[batch_idx];
+            stream::load_batch(&slf.handle, batch)?
+        };
+        if let (Some(level), Some(seed)) = (&slf.shuffle_within, slf.seed) {
+            stream::shuffle_within_batch(
+                &mut payload,
+                level,
+                &slf.handle,
+                seed.wrapping_add(batch_idx as u64),
+            )?;
+        }
+        slf.pos += 1;
+        Ok(Some(payload_to_py(py, payload, slf.is_dataframe)?))
     }
 }
 
@@ -3728,6 +3840,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDataFrameAccessor>()?;
     m.add_class::<PyCompiledPlan>()?;
     m.add_class::<PyCompiledBatchesIter>()?;
+    m.add_class::<PyStreamBatchesIter>()?;
     m.add_function(wrap_pyfunction!(py_rng, m)?)?;
     m.add_function(wrap_pyfunction!(array, m)?)?;
     m.add_function(wrap_pyfunction!(multiply, m)?)?;
@@ -3765,6 +3878,10 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(stored_len, m)?)?;
     m.add_function(wrap_pyfunction!(load_slice, m)?)?;
+    m.add_function(wrap_pyfunction!(stream_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(stream_len, m)?)?;
+    m.add_function(wrap_pyfunction!(io_bytes_read, m)?)?;
+    m.add_function(wrap_pyfunction!(reset_io_bytes_read, m)?)?;
     m.add_function(wrap_pyfunction!(compiled_stream_apply, m)?)?;
     Ok(())
 }
@@ -3776,13 +3893,84 @@ fn stored_len(path: String) -> PyResult<usize> {
 
 #[pyfunction]
 fn load_slice(py: Python<'_>, path: String, start: usize, stop: usize) -> PyResult<PyObject> {
-    if let Ok(arr) = io_ops::load_array(py, &path) {
-        let sliced = slice_axis0_view(&arr, start, stop)?;
-        return Ok(Py::new(py, PyGrumpyArray { inner: sliced })?.into_py(py));
+    let handle = io_ops::DatasetHandle::open(&path)?;
+    match &handle.meta.root {
+        io_ops::RootMeta::Array { .. } => {
+            let sliced = io_ops::load_array_axis0_slice(&handle, start, stop)?;
+            Ok(Py::new(py, PyGrumpyArray { inner: sliced })?.into_py(py))
+        }
+        io_ops::RootMeta::DataFrame { .. } => {
+            let sliced = io_ops::load_dataframe_axis0_slice(&handle, start, stop)?;
+            Ok(Py::new(py, PyGrumpyDataFrame { inner: sliced })?.into_py(py))
+        }
     }
-    let df = io_ops::load_dataframe(py, &path)?;
-    let sliced = df_slice_axis0_view(&df, start, stop)?;
-    Ok(Py::new(py, PyGrumpyDataFrame { inner: sliced })?.into_py(py))
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, shuffle=None, seed=None, workers=0, world_size=1, rank=0))]
+fn stream_batches(
+    path: String,
+    batch_size: usize,
+    drop_last: bool,
+    batch_on: Option<String>,
+    shuffle: Option<String>,
+    seed: Option<u64>,
+    workers: usize,
+    world_size: usize,
+    rank: usize,
+) -> PyResult<PyStreamBatchesIter> {
+    let (handle, plan, is_dataframe, shuffle_within, seed) = prepare_stream_plan_with_shuffle_level(
+        &path,
+        batch_size,
+        drop_last,
+        batch_on.as_deref(),
+        shuffle.as_deref(),
+        seed,
+        world_size,
+        rank,
+    )?;
+    let prefetch_rx = if workers > 0 {
+        Some(spawn_prefetch_loader(handle.clone(), plan.clone(), workers))
+    } else {
+        None
+    };
+    Ok(PyStreamBatchesIter {
+        handle,
+        is_dataframe,
+        plan,
+        pos: 0,
+        shuffle_within,
+        seed,
+        prefetch_rx,
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, world_size=1, rank=0))]
+fn stream_len(
+    path: String,
+    batch_size: usize,
+    drop_last: bool,
+    batch_on: Option<String>,
+    world_size: usize,
+    rank: usize,
+) -> PyResult<usize> {
+    let handle = io_ops::DatasetHandle::open(&path)?;
+    let mut plan = stream::build_batch_plan(&handle, batch_size, drop_last, batch_on.as_deref())?;
+    if world_size > 1 || rank > 0 {
+        stream::shard_batch_plan(&mut plan, world_size.max(1), rank)?;
+    }
+    Ok(plan.batches.len())
+}
+
+#[pyfunction]
+fn io_bytes_read() -> usize {
+    io_ops::io_bytes_read()
+}
+
+#[pyfunction]
+fn reset_io_bytes_read() {
+    io_ops::reset_io_bytes_read();
 }
 
 #[pyfunction]

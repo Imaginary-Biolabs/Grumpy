@@ -6,7 +6,7 @@ mutable arrays, Zarr-backed I/O, and optional compilation of streaming transform
 Known limitations
 -----------------
 - ``UnionScalarList`` layouts are not supported for most ops (use pure list-chains).
-- Streaming is axis-0 batching only; advanced dataloader features are planned.
+- Streaming supports axis-0 and ``batch_on`` batching, shuffle, DDP, and I/O prefetch.
 - ``gr.compile`` accepts a restricted subset of Python (see :func:`compile`).
 """
 
@@ -294,8 +294,28 @@ def load(path: str):
     return _load(path)
 
 
-def stream(path: str, batch_size: int = 32, drop_last: bool = False) -> Stream:
-    return Stream(path=path, batch_size=batch_size, drop_last=drop_last)
+def stream(
+    path: str,
+    batch_size: int = 32,
+    drop_last: bool = False,
+    batch_on: Optional[str] = None,
+    shuffle: Optional[str] = None,
+    seed: Optional[int] = None,
+    workers: int = 0,
+    world_size: int = 1,
+    rank: int = 0,
+) -> Stream:
+    return Stream(
+        path=path,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        batch_on=batch_on,
+        shuffle=shuffle,
+        seed=seed,
+        workers=workers,
+        world_size=world_size,
+        rank=rank,
+    )
 
 
 def rng(seed: int = 0) -> Generator:
