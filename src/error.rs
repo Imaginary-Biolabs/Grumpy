@@ -7,7 +7,7 @@
 //! - optional `context:` key/value lines (layout, dtype, axis, …)
 //! - `fix:` with a concrete remediation when possible
 //!
-//! See `docs/errors.md` and `CONTRIBUTING.md` for the contributor checklist.
+//! See `docs/developer.md` and `CONTRIBUTING.md` for the contributor checklist.
 
 use crate::dtype::DType;
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};

@@ -41,7 +41,7 @@ grumpy.<Code>: <summary>
 
 - **Rust:** `crate::error` in `src/error.rs` — see helpers like `index_out_of_bounds`, `broadcast_failed`, `cast_not_allowed`.
 - **Python:** `python/grumpy/errors.py` — `raise_grumpy_error`, `arg_invalid`, etc.
-- **Docs:** [docs/errors.md](docs/errors.md) lists codes and the contributor checklist.
+- **Docs:** [docs/developer.md](docs/developer.md#error-handling) lists error codes and the contributor checklist.
 - **Tests:** add cases to `tests/test_errors.py` for new failure modes; assert `grumpy.<Code>`, `cause:`, and `fix:` appear.
 
 Avoid vague messages (`"Index out of bounds."`, `"Internal error: …"`) for conditions users can correct.

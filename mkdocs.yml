@@ -40,13 +40,13 @@ theme:
 
 nav:
   - Home: index.md
-  - Getting started: getting-started.md
   - Arrays: arrays.md
   - Dataframes: dataframes.md
   - Saving and loading: saving-loading.md
   - Compilation: compilation.md
-  - License FAQ: license-faq.md
   - API Reference: api.md
+  - Developer: developer.md
+  - License FAQ: license-faq.md
 
 extra_css:
   - stylesheets/imaginary.css

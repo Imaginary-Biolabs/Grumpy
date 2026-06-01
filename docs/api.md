@@ -1,6 +1,6 @@
 # API Reference
 
-Reference documentation is generated from Python docstrings in the `grumpy` package.
+Reference documentation is generated from Python docstrings in the `grumpy` package. For narrative tutorials, start at [Home](index.md) and follow the section links at the bottom of each page.
 
 ## Top-level API
 
@@ -52,3 +52,7 @@ Reference documentation is generated from Python docstrings in the `grumpy` pack
       members:
         - compile
         - CompiledTransform
+
+---
+
+**Next:** [Developer](developer.md) — repository layout, implementation notes, and error handling.

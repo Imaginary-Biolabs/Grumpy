@@ -1,94 +1,119 @@
 # Arrays
 
-Grumpy arrays represent **ragged nested lists** using a small layout tree. See [Dtypes and casting](dtypes.md) for dtype rules, promotion, and ``astype`` modes.
+Arrays are the core of Grumpy. Biomolecular and scientific workloads rarely fit a single rectangular matrix: residue counts vary per protein, atoms vary per residue, and annotation fields may be a single ID on one row and a list on the next. Grumpy represents this as **ragged nested lists** with a fixed **dtype** on every leaf, stored in a compact layout tree that Rust kernels traverse without Python per-element overhead.
 
-| Path | When it appears | Example Python input |
-|------|-----------------|----------------------|
-| **List-chain** | Every row has the same nesting depth | `[[1, 2, 3], [4, 5]]` |
-| **`UnionScalarList`** | One axis mixes scalars and lists | `[1, [2, 3], 4]` |
-
-Both are constructed with `gr.array`, saved to Zarr, streamed, and used in dataframes. Kernels implement **both paths**; choose the layout that matches your data rather than normalizing for compatibility.
+This page covers construction, elementwise math, and indexing. Dataframes (named columns with optional schema) build on the same layout machinery.
 
 ## Construction
 
-### List-chain (fixed depth per axis)
+Pass nested Python lists or tuples to `gr.array`. When you omit `dtype`, Grumpy infers it from non-null leaves (`int` → `int64`, `float` → `float64`).
+
+### List-chain (fixed nesting depth)
+
+Use a **list-chain** when every row at a given level has the same nesting depth — the usual case for coordinates, atom tables, and fixed-depth tensors:
 
 ```python
 import grumpy as gr
 
 x = gr.array([[1, 2, 3], [4, 5]], dtype=gr.int32)
-y = gr.array([[1, 2], [[None, 5], [6]]])  # dtype inferred; None → null
+print(x.to_list())        # [[1, 2, 3], [4, 5]]
+print(x.shape(dim=1))     # outer length along axis 1
 ```
 
-### Union (mixed scalar/list at one axis)
-
-Use when annotation columns or exports mix singletons and lists at the same logical level (GO terms, variant consequences, mixture SMILES, etc.):
+`None` in nested input becomes a **null** leaf; validity is tracked separately from the numeric buffer:
 
 ```python
-# One GO term vs many on the same axis
-go = gr.array(["GO:0003674", ["GO:0003674", "GO:0005524"], []], dtype=gr.string)
-
-# Numeric union: scalar row vs list row
-z = gr.array([1, [2, 3], 4], dtype=gr.int64)
-z.mean().to_list()          # 2.5
-z.min(dim=0).to_list()      # [1, 2, 4]
+y = gr.array([[1, None, 3], [4, 5]], dtype=gr.int32)
+print(y.to_list())        # [[1, None, 3], [4, 5]]
 ```
 
-Unions can also appear **inside** list-chains (e.g. a molecule column that is union-shaped while residue/atom columns remain pure list-chains).
+### Union (mixed scalar and list at one axis)
 
-## Indexing and mutation
+Use a **union** when one axis mixes scalars and lists — for example one GO term vs many on the same column:
 
-Coordinate vs array indexing matches the API examples in the project design doc. Both layout paths support axis-0 fancy selection; unions compact scalar/list pools on gather.
+```python
+go = gr.array(["GO:0003674", ["GO:0003674", "GO:0005524"], []], dtype=gr.string)
+nums = gr.array([1, [2, 3], 4], dtype=gr.int64)
+print(nums.mean().to_list())   # 2.5 — reduction over all leaves
+```
+
+Both list-chains and unions are constructed with the same `gr.array` call; Grumpy picks the layout from the Python structure.
+
+## Elementwise operations
+
+Grumpy exposes NumPy-like elementwise ops. They **broadcast** across compatible ragged shapes, including mixed list-chain ↔ union pairs when outer lengths align.
+
+Start with unary and binary ops on a list-chain:
 
 ```python
 x = gr.array([[1, 2, 3], [4, 5]], dtype=gr.int32)
-x[0]          # [1, 2, 3]
-x[[0, 1]]     # [[1, 2, 3], [4, 5]]
-x[[0, 1], 0]  # [1, 4]
-x[0] = 100
 
-u = gr.array([1, [2, 3], 4], dtype=gr.int64)
-u[[0, 2]].to_list()       # [1, 4]
-u[[1, 1], 0].to_list()    # [2, 2]  (coordinate fancy on union)
+print((x * 2).to_list())       # [[2, 4, 6], [8, 10]]
+print((x + 1).to_list())       # [[2, 3, 4], [5, 6]]
+print(x.mean(dim=1).to_list()) # [2.0, 4.5] — reduce along inner axis
 ```
 
-## Operations
-
-Elementwise ops broadcast like NumPy on compatible ragged shapes, including **union ↔ list-chain** and **union ↔ union** pairs:
+Free functions mirror methods where useful:
 
 ```python
-# List-chain
-(x * 2 + 1).to_list()
-x.mean(dim=1).to_list()
-
-# Union
-u = gr.array([1, [2, 3], 4], dtype=gr.int64)
-(u * 2).to_list()                    # [2, [4, 6], 8]
-(u + gr.array([10, [20, 30], 40])).to_list()
-
-# Broadcast union with list-chain (same outer length)
-lc = gr.array([[1], [2, 3], [4]], dtype=gr.int64)
-(u + lc).to_list()
+a = gr.array([[1, 2]], dtype=gr.int32)
+b = gr.array([[10, 20]], dtype=gr.int32)
+print(gr.add(a, b).to_list())  # [[11, 22]]
 ```
 
-### Layout support matrix
+On unions, elementwise ops preserve the scalar-vs-list structure:
 
-The table below lists current kernel coverage. Gaps apply to **both** paths where noted; neither layout is deprecated.
+```python
+u = gr.array([1, [2, 3], 4], dtype=gr.int64)
+print((u * 2).to_list())       # [2, [4, 6], 8]
+```
 
-| Category | List-chain | `UnionScalarList` |
-|----------|------------|-------------------|
-| Elementwise / unary / compare | yes | yes |
-| Broadcast (mixed layouts) | yes | yes |
-| `sum`, `mean`, `min`, `max`, `ptp` | yes | yes (`dim=0` / all-axis) |
-| `var`, `std` | yes | yes |
-| Sort / argsort / argmin / argmax (`dim=-1`) | yes | yes |
-| `searchsorted`, `unique`, shuffle | yes | yes |
-| Axis-0 concat / append / fancy index | yes | yes |
-| Streaming slice / `batch_on` | yes | yes (compact partial I/O) |
-| `einsum` / `tensordot` (1D contraction patterns) | yes | yes |
-| `neighbors` | yes (`dim=0`, `dim=1`) | yes (`dim=0`; rect2d subtrees) |
-| `histogram`, `where`, strict 1D leaf helpers | yes | not yet |
-| `partition` on flat 1D leaf | yes | not yet |
-| Fast leaf-only assignment fast paths | yes | use general mutation path |
+For dtype rules and casting, see [Developer — dtypes](developer.md#dtypes-and-casting).
 
-When adding new ops, implement list-chain **and** union traversal (or document a shared wrapper walk) so both paths stay in parity.
+## Indexing
+
+Indexing selects sub-trees without copying entire datasets. Grumpy supports **array indexing** (rows, slices, fancy indices) and **coordinate indexing** (row + column within ragged rows).
+
+### Getting values
+
+Select outer rows with integers or slices:
+
+```python
+x = gr.array([[1, 2, 3], [4, 5]], dtype=gr.int32)
+
+print(x[0].to_list())      # [1, 2, 3]
+print(x[[0, 1]].to_list()) # [[1, 2, 3], [4, 5]]
+```
+
+Coordinate indexing picks one element per row:
+
+```python
+print(x[[0, 1], 0].to_list())  # [1, 4] — first element of each row
+```
+
+Unions support the same patterns; fancy indices address union rows consistently:
+
+```python
+u = gr.array([1, [2, 3], 4], dtype=gr.int64)
+print(u[[0, 2]].to_list())     # [1, 4]
+print(u[[1, 1], 0].to_list())  # [2, 2]
+```
+
+### Setting values
+
+Assignment mutates leaves in place (Grumpy arrays are **mutable**, unlike many immutable columnar libraries):
+
+```python
+x = gr.array([[1, 2, 3], [4, 5]], dtype=gr.int32)
+x[0] = 100
+print(x.to_list())   # [[100, 2, 3], [4, 5]]
+
+x[1, 0] = 99
+print(x.to_list())   # [[100, 2, 3], [99, 5]]
+```
+
+Out-of-range indices raise actionable errors with `cause:` and `fix:` hints — see [Developer — error handling](developer.md#error-handling).
+
+---
+
+**Next:** [Dataframes](dataframes.md) — group columns, use dot notation, and enforce schema across nesting levels.
