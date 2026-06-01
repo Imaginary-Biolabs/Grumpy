@@ -1,5 +1,5 @@
 use crate::dtype::DType;
-use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
+use crate::layout::{drop_axis0_select_element, layout_ndim, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
@@ -18,11 +18,11 @@ pub enum QuantileMode {
     Percentile, // q in [0,100]
 }
 
-pub fn var(py: Python<'_>, a: &GrumpyArray, dim: isize, ddof: isize, nan: bool) -> PyResult<GrumpyArray> {
+pub fn var(py: Python<'_>, a: &GrumpyArray, dim: Option<isize>, ddof: isize, nan: bool) -> PyResult<GrumpyArray> {
     stat_reduce(py, a, dim, ddof, nan, StatOp::Var)
 }
 
-pub fn std(py: Python<'_>, a: &GrumpyArray, dim: isize, ddof: isize, nan: bool) -> PyResult<GrumpyArray> {
+pub fn std(py: Python<'_>, a: &GrumpyArray, dim: Option<isize>, ddof: isize, nan: bool) -> PyResult<GrumpyArray> {
     stat_reduce(py, a, dim, ddof, nan, StatOp::Std)
 }
 
@@ -57,13 +57,14 @@ fn out_dtype_for_var_std(in_dt: DType) -> PyResult<DType> {
     })
 }
 
-fn stat_reduce(_py: Python<'_>, a: &GrumpyArray, dim: isize, ddof: isize, nan: bool, op: StatOp) -> PyResult<GrumpyArray> {
+fn stat_reduce(_py: Python<'_>, a: &GrumpyArray, dim: Option<isize>, ddof: isize, nan: bool, op: StatOp) -> PyResult<GrumpyArray> {
     if a.layout.has_union() {
-        return Err(PyValueError::new_err("std/var on union layouts is not implemented yet."));
+        return stat_reduce_union(a, dim, ddof, nan, op);
     }
     if ddof < 0 {
         return Err(PyValueError::new_err("ddof must be >= 0."));
     }
+    let dim = dim.ok_or_else(|| PyValueError::new_err("std/var on this layout requires an explicit dim."))?;
     let out_dt = out_dtype_for_var_std(a.dtype)?;
     let depth = crate::layout::list_chain_depth(&a.layout).ok_or_else(|| PyValueError::new_err("Not a pure list chain."))?;
     if depth == 0 {
@@ -702,4 +703,279 @@ fn quantile_range(leaf: &Leaf, in_dt: DType, start: usize, end: usize, q: f64, n
     Ok((true, vals[lo] * (1.0 - w) + vals[hi] * w))
 }
 
+fn normalize_stat_dim(dim: isize, ndim: usize) -> PyResult<usize> {
+    let mut d = dim;
+    if d < 0 {
+        d += ndim as isize;
+    }
+    if d < 0 || d as usize >= ndim {
+        return Err(PyValueError::new_err("dim out of range."));
+    }
+    Ok(d as usize)
+}
 
+fn collect_layout_f64(layout: &Layout, dt: DType, nan: bool) -> PyResult<Vec<f64>> {
+    let mut out = Vec::new();
+    collect_layout_f64_rec(layout, dt, nan, &mut out)?;
+    Ok(out)
+}
+
+fn collect_layout_f64_rec(
+    layout: &Layout,
+    dt: DType,
+    nan: bool,
+    out: &mut Vec<f64>,
+) -> PyResult<()> {
+    match layout {
+        Layout::Leaf(l) => {
+            for i in 0..l.len {
+                if !l.validity[i] {
+                    continue;
+                }
+                let x = scalar_as_f64(l, dt, i)?;
+                if nan && x.is_nan() {
+                    continue;
+                }
+                out.push(x);
+            }
+        }
+        Layout::ListOffset(lo) => {
+            for i in 0..lo.len() {
+                let s = lo.offsets[i] as usize;
+                let e = lo.offsets[i + 1] as usize;
+                collect_layout_f64_rec(
+                    &crate::layout::take_range(lo.content.as_ref(), s, e)?,
+                    dt,
+                    nan,
+                    out,
+                )?;
+            }
+        }
+        Layout::OffsetView(v) => {
+            for i in 0..layout.len() {
+                collect_layout_f64_rec(&drop_axis0_select_element(layout, i)?, dt, nan, out)?;
+            }
+        }
+        Layout::Indexed(ix) => {
+            for i in 0..ix.len() {
+                collect_layout_f64_rec(&drop_axis0_select_element(layout, i)?, dt, nan, out)?;
+            }
+        }
+        Layout::UnionScalarList(u) => {
+            for i in 0..u.len() {
+                collect_layout_f64_rec(&drop_axis0_select_element(layout, i)?, dt, nan, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stat_reduce_union(a: &GrumpyArray, dim: Option<isize>, ddof: isize, nan: bool, op: StatOp) -> PyResult<GrumpyArray> {
+    if ddof < 0 {
+        return Err(PyValueError::new_err("ddof must be >= 0."));
+    }
+    let out_dt = out_dtype_for_var_std(a.dtype)?;
+    if dim.is_none() {
+        let vals = collect_layout_f64(&a.layout, a.dtype, nan)?;
+        let (ok, v) = var_std_values(&vals, ddof as usize, op)?;
+        if !ok {
+            return Err(PyValueError::new_err("std/var on empty array."));
+        }
+        return scalar_leaf(out_dt, v);
+    }
+    let dim = dim.unwrap();
+    let ndim = layout_ndim(&a.layout)?;
+    let dim_u = normalize_stat_dim(dim, ndim)?;
+    if ndim == 1 {
+        let vals = collect_layout_f64(&a.layout, a.dtype, nan)?;
+        let (ok, v) = var_std_values(&vals, ddof as usize, op)?;
+        if !ok {
+            return Err(PyValueError::new_err("std/var on empty array."));
+        }
+        return scalar_leaf(out_dt, v);
+    }
+    match dim_u {
+        0 => stat_union_axis0(a, out_dt, ddof as usize, nan, op),
+        x if x == ndim - 1 => stat_union_last_axis(a, out_dt, ddof as usize, nan, op),
+        _ => Err(PyValueError::new_err(
+            "std/var on union layouts currently supports dim=0 and innermost dim only.",
+        )),
+    }
+}
+
+fn stat_union_axis0(
+    a: &GrumpyArray,
+    out_dt: DType,
+    ddof: usize,
+    nan: bool,
+    op: StatOp,
+) -> PyResult<GrumpyArray> {
+    let n = a.len();
+    let mut scalars = Leaf::new(out_dt);
+    scalars.len = n;
+    scalars.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    scalars.has_nulls = false;
+    scalars.buffer = match out_dt {
+        DType::Float32 => LeafBuffer::F32(Arc::new(vec![0f32; n])),
+        DType::Float64 => LeafBuffer::F64(Arc::new(vec![0f64; n])),
+        _ => unreachable!(),
+    };
+    let out_valid = Arc::make_mut(&mut scalars.validity);
+    for i in 0..n {
+        let sub = drop_axis0_select_element(&a.layout, i)?;
+        let vals = collect_layout_f64(&sub, a.dtype, nan)?;
+        let (ok, v) = var_std_values(&vals, ddof, op)?;
+        if !ok {
+            out_valid.set(i, false);
+            scalars.has_nulls = true;
+            continue;
+        }
+        match &mut scalars.buffer {
+            LeafBuffer::F32(buf) => Arc::make_mut(buf)[i] = v as f32,
+            LeafBuffer::F64(buf) => Arc::make_mut(buf)[i] = v,
+            _ => unreachable!(),
+        }
+    }
+    let lists = ListOffset {
+        offsets: Arc::new(vec![0i64]),
+        content: Box::new(Layout::Leaf(Leaf::new(out_dt))),
+    };
+    Ok(GrumpyArray {
+        dtype: out_dt,
+        layout: Layout::UnionScalarList(UnionScalarList {
+            tags: (0..n).map(|_| 0u8).collect(),
+            index: (0..n as i64).collect(),
+            scalars,
+            lists,
+        }),
+    })
+}
+
+fn stat_union_last_axis(
+    a: &GrumpyArray,
+    out_dt: DType,
+    ddof: usize,
+    nan: bool,
+    op: StatOp,
+) -> PyResult<GrumpyArray> {
+    Ok(GrumpyArray {
+        dtype: out_dt,
+        layout: stat_last_layout(&a.layout, a.dtype, out_dt, ddof, nan, op)?,
+    })
+}
+
+fn stat_last_layout(
+    layout: &Layout,
+    in_dt: DType,
+    out_dt: DType,
+    ddof: usize,
+    nan: bool,
+    op: StatOp,
+) -> PyResult<Layout> {
+    match layout {
+        Layout::Leaf(l) => {
+            if l.len <= 1 {
+                return Ok(layout.clone());
+            }
+            let lo = ListOffset {
+                offsets: Arc::new(vec![0i64, l.len as i64]),
+                content: Box::new(Layout::Leaf(l.clone())),
+            };
+            Ok(Layout::ListOffset(stat_listoffset_leaf(
+                &lo,
+                l,
+                in_dt,
+                out_dt,
+                ddof,
+                nan,
+                op,
+            )?))
+        }
+        Layout::ListOffset(lo) => match lo.content.as_ref() {
+            Layout::Leaf(leaf) => Ok(Layout::ListOffset(stat_listoffset_leaf(
+                lo, leaf, in_dt, out_dt, ddof, nan, op,
+            )?)),
+            _ => Ok(Layout::ListOffset(ListOffset {
+                offsets: lo.offsets.clone(),
+                content: Box::new(stat_last_layout(
+                    lo.content.as_ref(),
+                    in_dt,
+                    out_dt,
+                    ddof,
+                    nan,
+                    op,
+                )?),
+            })),
+        },
+        Layout::UnionScalarList(u) => {
+            let list_content =
+                stat_last_layout(u.lists.content.as_ref(), in_dt, out_dt, ddof, nan, op)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars: u.scalars.clone(),
+                lists: ListOffset {
+                    offsets: u.lists.offsets.clone(),
+                    content: Box::new(list_content),
+                },
+            }))
+        }
+        Layout::OffsetView(v) => {
+            let content = stat_last_layout(v.content.as_ref(), in_dt, out_dt, ddof, nan, op)?;
+            Ok(Layout::OffsetView(crate::layout::OffsetView {
+                offsets: v.offsets.clone(),
+                start: v.start,
+                stop: v.stop,
+                content: Box::new(content),
+            }))
+        }
+        Layout::Indexed(ix) => {
+            let content = stat_last_layout(ix.content.as_ref(), in_dt, out_dt, ddof, nan, op)?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ix.index.clone(),
+                content: Box::new(content),
+            }))
+        }
+    }
+}
+
+fn stat_listoffset_leaf(
+    lo: &ListOffset,
+    leaf: &Leaf,
+    in_dt: DType,
+    out_dt: DType,
+    ddof: usize,
+    nan: bool,
+    op: StatOp,
+) -> PyResult<ListOffset> {
+    let nrows = lo.len();
+    let mut out = Leaf::new(out_dt);
+    out.len = nrows;
+    out.has_nulls = false;
+    out.validity = Arc::new(bitvec![u8, Lsb0; 1; nrows]);
+    out.buffer = match out_dt {
+        DType::Float32 => LeafBuffer::F32(Arc::new(vec![0f32; nrows])),
+        DType::Float64 => LeafBuffer::F64(Arc::new(vec![0f64; nrows])),
+        _ => unreachable!(),
+    };
+    let out_valid = Arc::make_mut(&mut out.validity);
+    for i in 0..nrows {
+        let s = lo.offsets[i] as usize;
+        let e = lo.offsets[i + 1] as usize;
+        let (ok, v) = var_std_range(leaf, in_dt, out_dt, s, e, ddof, nan, op)?;
+        if !ok {
+            out.has_nulls = true;
+            out_valid.set(i, false);
+            continue;
+        }
+        match &mut out.buffer {
+            LeafBuffer::F32(buf) => Arc::make_mut(buf)[i] = v as f32,
+            LeafBuffer::F64(buf) => Arc::make_mut(buf)[i] = v,
+            _ => unreachable!(),
+        }
+    }
+    Ok(ListOffset {
+        offsets: lo.offsets.clone(),
+        content: Box::new(Layout::Leaf(out)),
+    })
+}

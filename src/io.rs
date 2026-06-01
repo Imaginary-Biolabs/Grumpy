@@ -1,6 +1,8 @@
 use crate::dataframe::{GrumpyDataFrame, Schema};
 use crate::dtype::DType;
-use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, OffsetView, UnionScalarList};
+use crate::layout::{concat_layout_segments, remap_union_pick, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, OffsetView, UnionScalarList};
+use bitvec::bitvec;
+use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -649,6 +651,11 @@ fn read_vec_bool(store: &ReadableWritableListableStorage, path: &str) -> PyResul
     read_vec::<bool>(store, path)
 }
 
+fn array_axis0_len(store: &ReadableWritableListableStorage, tags_path: &str) -> PyResult<usize> {
+    let arr = Array::open(store.clone(), tags_path).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    Ok(arr.shape()[0] as usize)
+}
+
 fn read_vec_range<T: ElementOwned>(
     store: &ReadableWritableListableStorage,
     path: &str,
@@ -846,26 +853,158 @@ fn load_union_scalar_list_take_range(
     start: usize,
     end: usize,
 ) -> PyResult<Layout> {
-    let all_tags = read_vec::<u8>(store, tags_path)?;
-    let all_index = read_vec::<i64>(store, index_path)?;
-    if end > all_tags.len() {
+    let n = array_axis0_len(store, tags_path)?;
+    if end > n {
         return Err(PyValueError::new_err("Union slice out of bounds."));
     }
-    let full_scalars = match load_layout(store, dt, scalars_meta)? {
-        Layout::Leaf(l) => l,
-        _ => return Err(PyValueError::new_err("Invalid union scalars layout in file.")),
+    let slice_tags = read_vec_range::<u8>(store, tags_path, start, end)?;
+    let slice_index = read_vec_range::<i64>(store, index_path, start, end)?;
+    let (new_index, scalar_src, list_src) = remap_union_pick(&slice_tags, &slice_index)?;
+
+    let scalars = if scalar_src.is_empty() {
+        Leaf::new(dt)
+    } else {
+        load_leaf_indices(store, dt, scalars_meta, &scalar_src)?
     };
-    let full_lists = match load_layout(store, dt, lists_meta)? {
-        Layout::ListOffset(lo) => lo,
-        _ => return Err(PyValueError::new_err("Invalid union lists layout in file.")),
+
+    let lists = if list_src.is_empty() {
+        ListOffset {
+            offsets: Arc::new(vec![0i64]),
+            content: Box::new(Layout::Leaf(Leaf::new(dt))),
+        }
+    } else {
+        load_union_lists_pick(store, dt, lists_meta, &list_src)?
     };
-    let u = UnionScalarList {
-        tags: all_tags,
-        index: all_index,
-        scalars: full_scalars,
-        lists: full_lists,
+
+    Ok(Layout::UnionScalarList(UnionScalarList {
+        tags: slice_tags,
+        index: new_index,
+        scalars,
+        lists,
+    }))
+}
+
+fn coalesce_index_runs(sorted_unique: &[usize]) -> Vec<(usize, usize)> {
+    if sorted_unique.is_empty() {
+        return Vec::new();
+    }
+    let mut runs = Vec::new();
+    let mut run_start = sorted_unique[0];
+    let mut run_end = run_start + 1;
+    for &ix in &sorted_unique[1..] {
+        if ix == run_end {
+            run_end += 1;
+        } else {
+            runs.push((run_start, run_end));
+            run_start = ix;
+            run_end = ix + 1;
+        }
+    }
+    runs.push((run_start, run_end));
+    runs
+}
+
+fn load_leaf_indices(
+    store: &ReadableWritableListableStorage,
+    dt: DType,
+    meta: &LayoutMeta,
+    indices: &[usize],
+) -> PyResult<Leaf> {
+    if indices.is_empty() {
+        return Ok(Leaf::new(dt));
+    }
+    let len = match meta {
+        LayoutMeta::Leaf { len, .. } => *len,
+        _ => {
+            return Err(PyValueError::new_err(
+                "Internal error: expected leaf metadata for union scalars.",
+            ))
+        }
     };
-    Ok(Layout::UnionScalarList(u.take_range(start, end)?))
+    if indices.iter().any(|&i| i >= len) {
+        return Err(PyValueError::new_err("Union scalar index out of bounds."));
+    }
+
+    let mut unique: Vec<usize> = indices.iter().copied().collect();
+    unique.sort_unstable();
+    unique.dedup();
+
+    let mut gathered: Vec<(usize, Leaf)> = Vec::with_capacity(unique.len());
+    for (run_start, run_end) in coalesce_index_runs(&unique) {
+        let Layout::Leaf(chunk) = load_layout_take_range(store, dt, meta, run_start, run_end)? else {
+            return Err(PyValueError::new_err(
+                "Internal error: partial leaf read did not return a leaf.",
+            ));
+        };
+        for local in 0..(run_end - run_start) {
+            let mut one = Leaf::new(dt);
+            one.len = 1;
+            one.has_nulls = chunk.has_nulls && !chunk.validity[local];
+            one.validity = Arc::new(bitvec![u8, Lsb0; chunk.validity[local] as u8; 1]);
+            one.buffer = chunk.buffer.copy_range(local, local + 1);
+            gathered.push((run_start + local, one));
+        }
+    }
+    gathered.sort_unstable_by_key(|(src, _)| *src);
+
+    let mut out = Leaf::new(dt);
+    out.len = indices.len();
+    out.validity = Arc::new(bitvec![u8, Lsb0; 1; indices.len()]);
+    out.has_nulls = false;
+    out.buffer = LeafBuffer::new(dt);
+    let out_valid = Arc::make_mut(&mut out.validity);
+    for (out_i, &src) in indices.iter().enumerate() {
+        let pos = gathered
+            .binary_search_by_key(&src, |(ix, _)| *ix)
+            .map_err(|_| PyValueError::new_err("Internal error: missing gathered scalar."))?;
+        let elem = &gathered[pos].1;
+        if !elem.validity[0] {
+            out_valid.set(out_i, false);
+            out.has_nulls = true;
+        }
+        out.buffer.push_from_index(&elem.buffer, 0)?;
+    }
+    Ok(out)
+}
+
+fn load_union_lists_pick(
+    store: &ReadableWritableListableStorage,
+    dt: DType,
+    lists_meta: &LayoutMeta,
+    list_src: &[usize],
+) -> PyResult<ListOffset> {
+    let (offsets_path, content_meta) = match lists_meta {
+        LayoutMeta::ListOffset { offsets, content } => (offsets.as_str(), content.as_ref()),
+        _ => {
+            return Err(PyValueError::new_err(
+                "Invalid union lists metadata in file.",
+            ))
+        }
+    };
+    let offs = read_vec::<i64>(store, offsets_path)?;
+    let mut new_offs = vec![0i64];
+    let mut acc = 0i64;
+    let mut content_segs: Vec<Layout> = Vec::with_capacity(list_src.len());
+    for &li in list_src {
+        if li + 1 >= offs.len() {
+            return Err(PyValueError::new_err("Union list index out of bounds."));
+        }
+        let s = offs[li] as usize;
+        let e = offs[li + 1] as usize;
+        let seg = load_layout_take_range(store, dt, content_meta, s, e)?;
+        acc += (e - s) as i64;
+        new_offs.push(acc);
+        content_segs.push(seg);
+    }
+    let list_content = if content_segs.is_empty() {
+        Layout::Leaf(Leaf::new(dt))
+    } else {
+        concat_layout_segments(&content_segs)?
+    };
+    Ok(ListOffset {
+        offsets: Arc::new(new_offs),
+        content: Box::new(list_content),
+    })
 }
 
 /// Count entities at ``target_depth`` within each axis-0 row (reads offset buffers only).
@@ -933,9 +1072,74 @@ fn count_entities_in_axis0_row(
         } else {
             0
         }),
-        LayoutMeta::Indexed { .. } | LayoutMeta::UnionScalarList { .. } => Err(PyValueError::new_err(
-            "batch_on is not supported for Indexed/UnionScalarList layouts.",
+        LayoutMeta::UnionScalarList {
+            tags,
+            index,
+            scalars: _,
+            lists,
+        } => count_entities_in_union_axis0_row(
+            store,
+            tags,
+            index,
+            lists,
+            row,
+            target_depth,
+            current_depth,
+        ),
+        LayoutMeta::Indexed { .. } => Err(PyValueError::new_err(
+            "batch_on is not supported for Indexed layouts.",
         )),
+    }
+}
+
+fn count_entities_in_union_axis0_row(
+    store: &ReadableWritableListableStorage,
+    tags_path: &str,
+    index_path: &str,
+    lists: &LayoutMeta,
+    row: usize,
+    target_depth: usize,
+    current_depth: usize,
+) -> PyResult<usize> {
+    if target_depth == current_depth {
+        return Ok(1);
+    }
+    let all_tags = read_vec::<u8>(store, tags_path)?;
+    let all_index = read_vec::<i64>(store, index_path)?;
+    if row >= all_tags.len() {
+        return Err(PyValueError::new_err("Row index out of bounds."));
+    }
+    match all_tags[row] {
+        0 => Ok(if target_depth == current_depth + 1 {
+            1
+        } else {
+            0
+        }),
+        1 => {
+            let list_row = all_index[row] as usize;
+            match lists {
+                LayoutMeta::ListOffset { offsets, content } => {
+                    let offs = read_vec::<i64>(store, offsets)?;
+                    if list_row + 1 >= offs.len() {
+                        return Ok(0);
+                    }
+                    let leaf_lo = offs[list_row] as usize;
+                    let leaf_hi = offs[list_row + 1] as usize;
+                    entity_count_in_leaf_range(
+                        store,
+                        content,
+                        leaf_lo,
+                        leaf_hi,
+                        target_depth,
+                        current_depth + 1,
+                    )
+                }
+                _ => Err(PyValueError::new_err(
+                    "Invalid union lists metadata in file.",
+                )),
+            }
+        }
+        _ => Err(PyValueError::new_err("Invalid union tag in file.")),
     }
 }
 
@@ -976,12 +1180,60 @@ fn entity_count_in_leaf_range(
             Ok(total)
         }
         LayoutMeta::Leaf { .. } => Ok(0),
-        LayoutMeta::OffsetView { .. }
-        | LayoutMeta::Indexed { .. }
-        | LayoutMeta::UnionScalarList { .. } => Err(PyValueError::new_err(
-            "batch_on depth counting unsupported for this layout node.",
+        LayoutMeta::OffsetView { .. } => Err(PyValueError::new_err(
+            "batch_on depth counting unsupported for OffsetView layouts.",
+        )),
+        LayoutMeta::UnionScalarList {
+            tags,
+            index,
+            scalars: _,
+            lists,
+        } => count_entities_in_union_leaf_range(
+            store,
+            tags,
+            index,
+            lists,
+            leaf_lo,
+            leaf_hi,
+            target_depth,
+            current_depth,
+        ),
+        LayoutMeta::Indexed { .. } => Err(PyValueError::new_err(
+            "batch_on depth counting unsupported for Indexed layouts.",
         )),
     }
+}
+
+fn count_entities_in_union_leaf_range(
+    store: &ReadableWritableListableStorage,
+    tags_path: &str,
+    index_path: &str,
+    lists: &LayoutMeta,
+    leaf_lo: usize,
+    leaf_hi: usize,
+    target_depth: usize,
+    current_depth: usize,
+) -> PyResult<usize> {
+    if target_depth == current_depth {
+        return Ok(leaf_hi.saturating_sub(leaf_lo));
+    }
+    let all_tags = read_vec::<u8>(store, tags_path)?;
+    let mut total = 0usize;
+    for row in leaf_lo..leaf_hi {
+        if row >= all_tags.len() {
+            break;
+        }
+        total += count_entities_in_union_axis0_row(
+            store,
+            tags_path,
+            index_path,
+            lists,
+            row,
+            target_depth,
+            current_depth,
+        )?;
+    }
+    Ok(total)
 }
 
 fn entity_count_at_depth(

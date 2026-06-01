@@ -330,7 +330,7 @@ impl GrumpyDataFrame {
 
         if let Some(schema) = &self.schema {
             let lvl = schema.level_for_column(name)?;
-            let ndim = array_ndim(&arr.layout)?;
+            let ndim = crate::layout::layout_ndim(&arr.layout)?;
             if ndim < lvl + 1 {
                 return Err(PyValueError::new_err(format!(
                     "Column '{}' must have at least {} dimensions due to schema prefix, but has {}.",
@@ -395,7 +395,7 @@ impl GrumpyDataFrame {
             let mut offsets: Vec<Option<Vec<i64>>> = vec![None; nlev];
             // Scan columns: for each axis lev>=1 that exists in the column, record canonical offsets (first seen).
             for c in &self.cols {
-                let ndim = array_ndim(&c.layout)?;
+                let ndim = crate::layout::layout_ndim(&c.layout)?;
                 for lev in 1..std::cmp::min(nlev, ndim) {
                     if offsets[lev].is_none() {
                         offsets[lev] = offsets_at_level(&c.layout, lev)?;
@@ -408,13 +408,6 @@ impl GrumpyDataFrame {
         }
         Ok(())
     }
-}
-
-fn array_ndim(layout: &Layout) -> PyResult<usize> {
-    // Number of axes = list_chain_depth + 1, for pure list chains; for unions we conservatively error for now.
-    let depth = crate::layout::list_chain_depth(layout)
-        .ok_or_else(|| PyValueError::new_err("DataFrame currently requires pure list-chain arrays for schema validation."))?;
-    Ok(depth + 1)
 }
 
 fn offsets_at_level(layout: &Layout, level: usize) -> PyResult<Option<Vec<i64>>> {
@@ -482,9 +475,8 @@ fn offsets_at_level(layout: &Layout, level: usize) -> PyResult<Option<Vec<i64>>>
                 }
             }
             Layout::UnionScalarList(_) => {
-                return Err(PyValueError::new_err(
-                    "Schema validation across union layouts is not implemented yet.",
-                ))
+                // Union outer axis does not expose list offsets; skip offset checks for this column.
+                return Ok(None);
             }
         }
     }

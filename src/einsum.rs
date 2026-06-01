@@ -1,5 +1,5 @@
 use crate::dtype::DType;
-use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
+use crate::layout::{leaf_view, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
@@ -63,18 +63,15 @@ pub fn tensordot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, axes: usize) 
     if a.dtype != b.dtype {
         return Err(PyValueError::new_err("tensordot requires matching dtypes (for now)."));
     }
-    if a.layout.has_union() || b.layout.has_union() {
-        return Err(PyValueError::new_err("tensordot on union layouts not implemented."));
-    }
     match axes {
         0 => {
             // Only vector-vector -> matrix
-            let la = leaf_1d(&a.layout)?;
-            let lb = leaf_1d(&b.layout)?;
+            let la = array_as_leaf_1d(a)?;
+            let lb = array_as_leaf_1d(b)?;
             if la.has_nulls || lb.has_nulls {
                 return Err(PyValueError::new_err("tensordot: nulls not supported yet."));
             }
-            let out = outer_vec_vec(a.dtype, la, lb)?;
+            let out = outer_vec_vec(a.dtype, &la, &lb)?;
             Ok(TensorOut::Array(out))
         }
         1 => {
@@ -87,6 +84,18 @@ pub fn tensordot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, axes: usize) 
                     return Err(PyValueError::new_err("tensordot axes=1: vector lengths must match."));
                 }
                 let s = dot_vec_vec(py, a.dtype, la, lb)?;
+                return Ok(TensorOut::Scalar(s));
+            }
+            if a.layout.has_union() || b.layout.has_union() {
+                let la = array_as_leaf_1d(a)?;
+                let lb = array_as_leaf_1d(b)?;
+                if la.has_nulls || lb.has_nulls {
+                    return Err(PyValueError::new_err("tensordot: nulls not supported yet."));
+                }
+                if la.len != lb.len {
+                    return Err(PyValueError::new_err("tensordot axes=1: vector lengths must match."));
+                }
+                let s = dot_vec_vec(py, a.dtype, &la, &lb)?;
                 return Ok(TensorOut::Scalar(s));
             }
             // 2D×2D -> 2D
@@ -167,11 +176,11 @@ fn einsum1(py: Python<'_>, term: &str, rhs: &str, a: &GrumpyArray) -> PyResult<T
     if term.len() == 1 {
         // "i->" sum
         if rhs.is_empty() {
-            let leaf = leaf_1d(&a.layout)?;
+            let leaf = array_as_leaf_1d(a)?;
             if leaf.has_nulls {
                 return Err(PyValueError::new_err("einsum: nulls not supported yet."));
             }
-            return Ok(TensorOut::Scalar(sum_vec(py, a.dtype, leaf)?));
+            return Ok(TensorOut::Scalar(sum_vec(py, a.dtype, &leaf)?));
         }
         return Err(PyValueError::new_err("einsum: unsupported 1D unary pattern."));
     }
@@ -221,24 +230,24 @@ fn einsum2(py: Python<'_>, ta: &str, tb: &str, rhs: &str, a: &GrumpyArray, b: &G
     }
     if ta.len() == 1 && tb.len() == 1 && rhs.is_empty() && ta == tb {
         // dot
-        let la = leaf_1d(&a.layout)?;
-        let lb = leaf_1d(&b.layout)?;
+        let la = array_as_leaf_1d(a)?;
+        let lb = array_as_leaf_1d(b)?;
         if la.has_nulls || lb.has_nulls {
             return Err(PyValueError::new_err("einsum: nulls not supported yet."));
         }
         if la.len != lb.len {
             return Err(PyValueError::new_err("einsum: vector lengths must match."));
         }
-        return Ok(TensorOut::Scalar(dot_vec_vec(py, a.dtype, la, lb)?));
+        return Ok(TensorOut::Scalar(dot_vec_vec(py, a.dtype, &la, &lb)?));
     }
     if ta.len() == 1 && tb.len() == 1 && rhs.len() == 2 && rhs.chars().collect::<Vec<_>>() == vec![ta.chars().next().unwrap(), tb.chars().next().unwrap()] {
         // outer
-        let la = leaf_1d(&a.layout)?;
-        let lb = leaf_1d(&b.layout)?;
+        let la = array_as_leaf_1d(a)?;
+        let lb = array_as_leaf_1d(b)?;
         if la.has_nulls || lb.has_nulls {
             return Err(PyValueError::new_err("einsum: nulls not supported yet."));
         }
-        let out = outer_vec_vec(a.dtype, la, lb)?;
+        let out = outer_vec_vec(a.dtype, &la, &lb)?;
         return Ok(TensorOut::Array(out));
     }
     // "ij,ij->" sum elementwise product
@@ -670,6 +679,14 @@ fn transpose(dtype: DType, _lo: &ListOffset, a: &Leaf, nrows: usize, ncols: usiz
 }
 
 // ---------- layout helpers ----------
+
+fn array_as_leaf_1d(x: &GrumpyArray) -> PyResult<Leaf> {
+    if let Ok(l) = leaf_1d(&x.layout) {
+        Ok(l.clone())
+    } else {
+        leaf_view(&x.layout, x.dtype)
+    }
+}
 
 fn leaf_1d<'a>(layout: &'a Layout) -> PyResult<&'a Leaf> {
     match layout {

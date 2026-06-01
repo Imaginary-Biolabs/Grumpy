@@ -19,9 +19,10 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use crate::dtype::{infer_dtype, inferclass_to_dtype, DType, PyDType};
 use crate::layout::{
-    build_array, concat_to_py_list, coord_to_leaf_index, drop_axis0_select_element, fill_layout_like,
-    gather_2d_fancy_leaf, gather_2d_fancy_sum_i64, scatter_2d_fancy_i32, scatter_2d_fancy_numeric,
-    GrumpyArray, Layout, LeafBuffer, OffsetView,
+    build_array, concat_to_py_list, coord_to_leaf_index, drop_axis0_select_element, drop_layout_axes,
+    fill_layout_like, gather_2d_fancy_leaf, gather_2d_fancy_sum_i64, gather_axis0_fancy,
+    gather_coordinate_fancy_2d, index_by_coordinates, leaf_view, scatter_2d_fancy_i32,
+    scatter_2d_fancy_numeric, take_range, GrumpyArray, Layout, LeafBuffer, OffsetView,
 };
 use crate::ops::{self, BinOp};
 use crate::reduce::{self, ReduceOp, ReduceOutput};
@@ -871,23 +872,7 @@ fn df_get_level0_column(df: &df_ops::GrumpyDataFrame, level0: &str, colname: &st
         }
     }
     let col = col.ok_or_else(|| PyValueError::new_err(format!("Unknown column '{colname}'.")))?;
-    // Drop outer axes according to requested level.
-    let mut layout = col.layout.clone();
-    let mut drops = level;
-    while drops > 0 {
-        match layout {
-            Layout::ListOffset(lo) => layout = *lo.content,
-            Layout::OffsetView(v) => {
-                let start = v.offsets[v.start] as usize;
-                let end = v.offsets[v.stop] as usize;
-                layout = crate::layout::take_range(v.content.as_ref(), start, end)?;
-            }
-            Layout::Indexed(ix) => layout = *ix.content,
-            Layout::Leaf(_) => break,
-            Layout::UnionScalarList(_) => return Err(PyValueError::new_err("Dot-notation not supported for union layouts.")),
-        }
-        drops -= 1;
-    }
+    let layout = drop_layout_axes(&col.layout, level)?;
     Ok(GrumpyArray { dtype: col.dtype, layout })
 }
 
@@ -1027,29 +1012,33 @@ impl PyGrumpyArray {
         }
     }
 
-    fn mean(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
-        match reduce::reduce(py, &self.inner, Some(dim), ReduceOp::Mean)? {
+    #[pyo3(signature = (dim=None))]
+    fn mean(&self, py: Python<'_>, dim: Option<isize>) -> PyResult<PyObject> {
+        match reduce::reduce(py, &self.inner, dim, ReduceOp::Mean)? {
             ReduceOutput::Scalar(x) => Ok(x),
             ReduceOutput::Array(arr) => Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py)),
         }
     }
 
-    fn min(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
-        match reduce::reduce(py, &self.inner, Some(dim), ReduceOp::Min)? {
+    #[pyo3(signature = (dim=None))]
+    fn min(&self, py: Python<'_>, dim: Option<isize>) -> PyResult<PyObject> {
+        match reduce::reduce(py, &self.inner, dim, ReduceOp::Min)? {
             ReduceOutput::Scalar(x) => Ok(x),
             ReduceOutput::Array(arr) => Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py)),
         }
     }
 
-    fn max(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
-        match reduce::reduce(py, &self.inner, Some(dim), ReduceOp::Max)? {
+    #[pyo3(signature = (dim=None))]
+    fn max(&self, py: Python<'_>, dim: Option<isize>) -> PyResult<PyObject> {
+        match reduce::reduce(py, &self.inner, dim, ReduceOp::Max)? {
             ReduceOutput::Scalar(x) => Ok(x),
             ReduceOutput::Array(arr) => Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py)),
         }
     }
 
-    fn ptp(&self, py: Python<'_>, dim: isize) -> PyResult<PyObject> {
-        match reduce::reduce(py, &self.inner, Some(dim), ReduceOp::Ptp)? {
+    #[pyo3(signature = (dim=None))]
+    fn ptp(&self, py: Python<'_>, dim: Option<isize>) -> PyResult<PyObject> {
+        match reduce::reduce(py, &self.inner, dim, ReduceOp::Ptp)? {
             ReduceOutput::Scalar(x) => Ok(x),
             ReduceOutput::Array(arr) => Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py)),
         }
@@ -1167,20 +1156,48 @@ impl PyGrumpyArray {
         Ok(Self { inner: cmp_ops::logical_not(py, &self.inner)? })
     }
 
-    fn var(&self, py: Python<'_>, dim: isize, ddof: isize) -> PyResult<Self> {
-        Ok(Self { inner: stats_ops::var(py, &self.inner, dim, ddof, false)? })
+    #[pyo3(signature = (dim=None, ddof=0))]
+    fn var(&self, py: Python<'_>, dim: Option<isize>, ddof: isize) -> PyResult<PyObject> {
+        let arr = stats_ops::var(py, &self.inner, dim, ddof, false)?;
+        if arr.len() == 1 {
+            if let Layout::Leaf(l) = &arr.layout {
+                return l.scalar_to_py(py, 0);
+            }
+        }
+        Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py))
     }
 
-    fn std(&self, py: Python<'_>, dim: isize, ddof: isize) -> PyResult<Self> {
-        Ok(Self { inner: stats_ops::std(py, &self.inner, dim, ddof, false)? })
+    #[pyo3(signature = (dim=None, ddof=0))]
+    fn std(&self, py: Python<'_>, dim: Option<isize>, ddof: isize) -> PyResult<PyObject> {
+        let arr = stats_ops::std(py, &self.inner, dim, ddof, false)?;
+        if arr.len() == 1 {
+            if let Layout::Leaf(l) = &arr.layout {
+                return l.scalar_to_py(py, 0);
+            }
+        }
+        Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py))
     }
 
-    fn nanvar(&self, py: Python<'_>, dim: isize, ddof: isize) -> PyResult<Self> {
-        Ok(Self { inner: stats_ops::var(py, &self.inner, dim, ddof, true)? })
+    #[pyo3(signature = (dim=None, ddof=0))]
+    fn nanvar(&self, py: Python<'_>, dim: Option<isize>, ddof: isize) -> PyResult<PyObject> {
+        let arr = stats_ops::var(py, &self.inner, dim, ddof, true)?;
+        if arr.len() == 1 {
+            if let Layout::Leaf(l) = &arr.layout {
+                return l.scalar_to_py(py, 0);
+            }
+        }
+        Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py))
     }
 
-    fn nanstd(&self, py: Python<'_>, dim: isize, ddof: isize) -> PyResult<Self> {
-        Ok(Self { inner: stats_ops::std(py, &self.inner, dim, ddof, true)? })
+    #[pyo3(signature = (dim=None, ddof=0))]
+    fn nanstd(&self, py: Python<'_>, dim: Option<isize>, ddof: isize) -> PyResult<PyObject> {
+        let arr = stats_ops::std(py, &self.inner, dim, ddof, true)?;
+        if arr.len() == 1 {
+            if let Layout::Leaf(l) = &arr.layout {
+                return l.scalar_to_py(py, 0);
+            }
+        }
+        Ok(Py::new(py, PyGrumpyArray { inner: arr })?.into_py(py))
     }
 
     fn quantile(&self, py: Python<'_>, q: f64, dim: isize) -> PyResult<Self> {
@@ -1824,9 +1841,13 @@ impl PyGrumpyDataFrame {
         // Otherwise, treat as column name and return fully flattened array (default dot-notation behavior).
         for (n, c) in slf.inner.names.iter().zip(slf.inner.cols.iter()) {
             if n == &name {
-                // default df.col: fully flatten all axes
-                let leaf = crate::py_api::find_leaf_fast(&c.layout)?;
-                let out = PyGrumpyArray { inner: GrumpyArray { dtype: c.dtype, layout: Layout::Leaf(leaf.clone()) } };
+                let leaf = leaf_view(&c.layout, c.dtype)?;
+                let out = PyGrumpyArray {
+                    inner: GrumpyArray {
+                        dtype: c.dtype,
+                        layout: Layout::Leaf(leaf),
+                    },
+                };
                 return Ok(Py::new(py, out)?.into_py(py));
             }
         }
@@ -1866,24 +1887,13 @@ impl PyDataFrameAccessor {
         }
         let col = col.ok_or_else(|| PyValueError::new_err(format!("Unknown column '{}'.", name)))?;
 
-        // Drop outer axes according to requested level0: molecule->drop0, residue->drop1, atom->drop2, ...
-        let mut layout = col.layout.clone();
-        let mut drops = level0;
-        while drops > 0 {
-            match layout {
-                Layout::ListOffset(lo) => layout = *lo.content,
-                Layout::OffsetView(v) => {
-                    let start = v.offsets[v.start] as usize;
-                    let end = v.offsets[v.stop] as usize;
-                    layout = crate::layout::take_range(v.content.as_ref(), start, end)?;
-                }
-                Layout::Indexed(ix) => layout = *ix.content,
-                Layout::Leaf(_) => break,
-                Layout::UnionScalarList(_) => return Err(PyValueError::new_err("Dot-notation not supported for union layouts.")),
-            }
-            drops -= 1;
-        }
-        let out = PyGrumpyArray { inner: GrumpyArray { dtype: col.dtype, layout } };
+        let layout = drop_layout_axes(&col.layout, level0)?;
+        let out = PyGrumpyArray {
+            inner: GrumpyArray {
+                dtype: col.dtype,
+                layout,
+            },
+        };
         Ok(Py::new(py, out)?.into_py(py))
     }
 
@@ -2481,11 +2491,20 @@ fn wrap_result(py: Python<'_>, out: PyObject, dtype: DType) -> PyResult<PyObject
     }
 }
 
-fn fast_getitem(py: Python<'_>, arr: &GrumpyArray, index: &Bound<'_, PyAny>) -> PyResult<Option<PyObject>> {
-    // Only optimize pure list chains (no unions); unions fall back.
-    if !arr.is_pure_list_chain() {
-        return Ok(None);
+fn wrap_index_layout_result(py: Python<'_>, dtype: DType, layout: Layout) -> PyResult<PyObject> {
+    if let Layout::Leaf(l) = &layout {
+        if l.len == 1 {
+            return l.scalar_to_py(py, 0);
+        }
     }
+    Ok(PyGrumpyArray {
+        inner: GrumpyArray { dtype, layout },
+    }
+    .into_py(py))
+}
+
+fn fast_getitem(py: Python<'_>, arr: &GrumpyArray, index: &Bound<'_, PyAny>) -> PyResult<Option<PyObject>> {
+    let is_list_chain = arr.is_pure_list_chain();
 
     // Coordinate tuple indexing
     if let Ok(tup) = index.downcast::<PyTuple>() {
@@ -2495,6 +2514,10 @@ fn fast_getitem(py: Python<'_>, arr: &GrumpyArray, index: &Bound<'_, PyAny>) -> 
             let a1 = tup.get_item(1)?;
             if a0.is_instance_of::<PyInt>() && a1.is_instance_of::<PyInt>() {
                 if let (Ok(r), Ok(c)) = (a0.extract::<i64>(), a1.extract::<i64>()) {
+                    if !is_list_chain {
+                        let result = index_by_coordinates(&arr.layout, &[r, c])?;
+                        return Ok(Some(wrap_index_layout_result(py, arr.dtype, result)?));
+                    }
                     if arr.dtype == DType::Int32 {
                         if let Layout::ListOffset(lo) = &arr.layout {
                             if let Layout::Leaf(leaf) = lo.content.as_ref() {
@@ -2534,6 +2557,10 @@ fn fast_getitem(py: Python<'_>, arr: &GrumpyArray, index: &Bound<'_, PyAny>) -> 
             let a1 = tup.get_item(1)?;
             if a0.downcast::<PySlice>().is_err() && a1.downcast::<PySlice>().is_err() {
                 if let (Ok(r), Ok(c)) = (a0.extract::<i64>(), a1.extract::<i64>()) {
+                    if !is_list_chain {
+                        let result = index_by_coordinates(&arr.layout, &[r, c])?;
+                        return Ok(Some(wrap_index_layout_result(py, arr.dtype, result)?));
+                    }
                     if arr.dtype == DType::Int32 {
                         if let Layout::ListOffset(lo) = &arr.layout {
                             if let Layout::Leaf(leaf) = lo.content.as_ref() {
@@ -2572,6 +2599,26 @@ fn fast_getitem(py: Python<'_>, arr: &GrumpyArray, index: &Bound<'_, PyAny>) -> 
                 IndexData::Owned(v) => v.as_slice(),
                 IndexData::Empty => &[],
             };
+
+            if !is_list_chain {
+                if !rows.is_empty() && !cols.is_empty() {
+                    let layout = gather_coordinate_fancy_2d(&arr.layout, rows, cols)?;
+                    return Ok(Some(wrap_index_layout_result(py, arr.dtype, layout)?));
+                }
+                if !rows.is_empty() && cols.is_empty() {
+                    let col = a1.extract::<i64>()?;
+                    let cols2: Vec<i64> = vec![col; rows.len()];
+                    let layout = gather_coordinate_fancy_2d(&arr.layout, rows, &cols2)?;
+                    return Ok(Some(wrap_index_layout_result(py, arr.dtype, layout)?));
+                }
+                if rows.is_empty() && !cols.is_empty() {
+                    let row = a0.extract::<i64>()?;
+                    let rows2: Vec<i64> = vec![row; cols.len()];
+                    let layout = gather_coordinate_fancy_2d(&arr.layout, &rows2, cols)?;
+                    return Ok(Some(wrap_index_layout_result(py, arr.dtype, layout)?));
+                }
+                return Ok(None);
+            }
 
             if !rows.is_empty() && !cols.is_empty() {
                 let leaf = gather_2d_fancy_leaf(&arr.layout, &rows, &cols)?;
@@ -2620,6 +2667,10 @@ fn fast_getitem(py: Python<'_>, arr: &GrumpyArray, index: &Bound<'_, PyAny>) -> 
         for i in 0..tup.len() {
             coords.push(tup.get_item(i)?.extract::<i64>()?);
         }
+        if !is_list_chain {
+            let result = index_by_coordinates(&arr.layout, &coords)?;
+            return Ok(Some(wrap_index_layout_result(py, arr.dtype, result)?));
+        }
         // Only support scalar selection ending in leaf scalar.
         let leaf_ix = coord_to_leaf_index(&arr.layout, &coords)?;
         let leaf = find_leaf_fast(&arr.layout)?;
@@ -2647,41 +2698,123 @@ fn fast_getitem(py: Python<'_>, arr: &GrumpyArray, index: &Bound<'_, PyAny>) -> 
         return Ok(Some(out.into_py(py)));
     }
 
-    // Axis-0 slice view (no copy) for list-chains: return a new ListOffset with trimmed offsets,
-    // sharing underlying leaf buffers via Arc/COW.
+    // Axis-0 slice: zero-copy view for list-chains; compact take for unions.
     if let Ok(slc) = index.downcast::<PySlice>() {
-        let root_lo = match &arr.layout {
-            Layout::ListOffset(lo) => lo,
+        match &arr.layout {
+            Layout::UnionScalarList(u) => {
+                let n: isize = u
+                    .len()
+                    .try_into()
+                    .map_err(|_| PyValueError::new_err("Slice length too large."))?;
+                let indices = slc.indices(n)?;
+                let (start, stop, step) = (indices.start, indices.stop, indices.step);
+                let layout = if step == 1 {
+                    let start_u = start as usize;
+                    let stop_u = stop as usize;
+                    if start_u > stop_u || stop_u > u.len() {
+                        return Err(PyValueError::new_err("Slice out of bounds."));
+                    }
+                    take_range(&arr.layout, start_u, stop_u)?
+                } else {
+                    let mut idxs: Vec<i64> = Vec::new();
+                    let mut i = start;
+                    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                        idxs.push(i as i64);
+                        i += step;
+                    }
+                    gather_axis0_fancy(&arr.layout, &idxs)?
+                };
+                let out = PyGrumpyArray {
+                    inner: GrumpyArray {
+                        dtype: arr.dtype,
+                        layout,
+                    },
+                };
+                return Ok(Some(out.into_py(py)));
+            }
+            Layout::ListOffset(root_lo) if is_list_chain => {
+                // Only step=1 for now (fast and common). Other steps fall back.
+                let n: isize = root_lo
+                    .len()
+                    .try_into()
+                    .map_err(|_| PyValueError::new_err("Slice length too large."))?;
+                let indices = slc.indices(n)?;
+                let (start, stop, step) = (indices.start, indices.stop, indices.step);
+                if step != 1 {
+                    return Ok(None);
+                }
+                let start_u = start as usize;
+                let stop_u = stop as usize;
+                if start_u > stop_u || stop_u > root_lo.len() {
+                    return Err(PyValueError::new_err("Slice out of bounds."));
+                }
+                let layout = Layout::OffsetView(crate::layout::OffsetView {
+                    offsets: root_lo.offsets.clone(),
+                    start: start_u,
+                    stop: stop_u,
+                    content: root_lo.content.clone(),
+                });
+                let out = PyGrumpyArray {
+                    inner: GrumpyArray {
+                        dtype: arr.dtype,
+                        layout,
+                    },
+                };
+                return Ok(Some(out.into_py(py)));
+            }
             _ => return Ok(None),
-        };
-        // Only step=1 for now (fast and common). Other steps fall back.
-        let n: isize = root_lo
-            .len()
-            .try_into()
-            .map_err(|_| PyValueError::new_err("Slice length too large."))?;
-        let indices = slc.indices(n)?;
-        let (start, stop, step) = (indices.start, indices.stop, indices.step);
-        if step != 1 {
-            return Ok(None);
         }
-        let start_u = start as usize;
-        let stop_u = stop as usize;
-        if start_u > stop_u || stop_u > root_lo.len() {
-            return Err(PyValueError::new_err("Slice out of bounds."));
+    }
+
+    // Axis-0 fancy / boolean selection (union arrays; list-chains use per-row rules via fallback).
+    if !is_list_chain && is_index_vec_like(py, index)? {
+        if let Ok(seq) = index.downcast::<pyo3::types::PySequence>() {
+            let m = seq.len()? as usize;
+            let n = arr.len();
+            let mut bools: Vec<bool> = Vec::new();
+            let mut all_bool = m > 0;
+            for i in 0..m {
+                let it = seq.get_item(i)?;
+                if it.is_instance_of::<pyo3::types::PyBool>() {
+                    bools.push(it.extract::<bool>()?);
+                } else {
+                    all_bool = false;
+                    break;
+                }
+            }
+            if all_bool && m == n {
+                let picked: Vec<i64> = bools
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| **b)
+                    .map(|(i, _)| i as i64)
+                    .collect();
+                let layout = gather_axis0_fancy(&arr.layout, &picked)?;
+                let out = PyGrumpyArray {
+                    inner: GrumpyArray {
+                        dtype: arr.dtype,
+                        layout,
+                    },
+                };
+                return Ok(Some(out.into_py(py)));
+            }
         }
-        let layout = Layout::OffsetView(crate::layout::OffsetView {
-            offsets: root_lo.offsets.clone(),
-            start: start_u,
-            stop: stop_u,
-            content: root_lo.content.clone(),
-        });
-        let out = PyGrumpyArray {
-            inner: GrumpyArray {
-                dtype: arr.dtype,
-                layout,
-            },
+        let rows_d = extract_index_data(py, index)?;
+        let rows: Vec<i64> = match rows_d {
+            IndexData::NpI64(ro) => ro.as_slice()?.to_vec(),
+            IndexData::Owned(v) => v,
+            IndexData::Empty => return Ok(None),
         };
-        return Ok(Some(out.into_py(py)));
+        if !rows.is_empty() {
+            let layout = gather_axis0_fancy(&arr.layout, &rows)?;
+            let out = PyGrumpyArray {
+                inner: GrumpyArray {
+                    dtype: arr.dtype,
+                    layout,
+                },
+            };
+            return Ok(Some(out.into_py(py)));
+        }
     }
 
     Ok(None)

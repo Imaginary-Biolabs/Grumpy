@@ -1797,43 +1797,35 @@ fn reduce_2d_dim0_to_leaf(layout: &Layout, dt: DType, op: ReduceOp) -> PyResult<
 fn reduce_union(py: Python<'_>, arr: &GrumpyArray, dim: Option<isize>, op: ReduceOp) -> PyResult<ReduceOutput> {
     match dim {
         None => match op {
-            ReduceOp::Sum => {
-                let total = sum_layout_values(&arr.layout, arr.dtype)?;
-                Ok(ReduceOutput::Scalar(wrap_reduce_scalar(py, arr.dtype, total)?))
+            ReduceOp::Sum | ReduceOp::Mean | ReduceOp::Min | ReduceOp::Max | ReduceOp::Ptp => {
+                let val = fold_layout_values(&arr.layout, arr.dtype, op)?;
+                Ok(ReduceOutput::Scalar(wrap_reduce_scalar(py, arr.dtype, val)?))
             }
-            ReduceOp::Mean => {
-                let (total, count) = sum_layout_values_with_count(&arr.layout, arr.dtype)?;
-                if count == 0 {
-                    return Err(PyValueError::new_err("mean of empty array."));
-                }
-                Ok(ReduceOutput::Scalar(wrap_reduce_scalar(
-                    py,
-                    arr.dtype,
-                    total / count as f64,
-                )?))
-            }
-            _ => Err(PyValueError::new_err(
-                "Union arrays currently support sum/mean without dim only.",
-            )),
         },
         Some(d) => {
-            let axis = if d < 0 { 0isize + d + 1 } else { d } as usize;
+            let ndim = crate::layout::layout_ndim(&arr.layout)?;
+            let mut axis = d;
+            if axis < 0 {
+                axis += ndim as isize;
+            }
+            if axis < 0 || axis as usize >= ndim {
+                return Err(PyValueError::new_err("dim out of range."));
+            }
             if axis != 0 {
                 return Err(PyValueError::new_err(
                     "Union reduce currently supports dim=0 only.",
                 ));
             }
             match op {
-                ReduceOp::Sum => reduce_union_axis0(py, arr),
-                _ => Err(PyValueError::new_err(
-                    "Union reduce dim=0 currently supports sum only.",
-                )),
+                ReduceOp::Sum | ReduceOp::Mean | ReduceOp::Min | ReduceOp::Max | ReduceOp::Ptp => {
+                    reduce_union_axis0(py, arr, op)
+                }
             }
         }
     }
 }
 
-fn reduce_union_axis0(_py: Python<'_>, arr: &GrumpyArray) -> PyResult<ReduceOutput> {
+fn reduce_union_axis0(_py: Python<'_>, arr: &GrumpyArray, op: ReduceOp) -> PyResult<ReduceOutput> {
     let n = arr.len();
     let mut tags = Vec::with_capacity(n);
     let mut index = Vec::with_capacity(n);
@@ -1845,7 +1837,7 @@ fn reduce_union_axis0(_py: Python<'_>, arr: &GrumpyArray) -> PyResult<ReduceOutp
 
     for i in 0..n {
         let sub = drop_axis0_select_element(&arr.layout, i)?;
-        let val = sum_layout_values(&sub, arr.dtype)?;
+        let val = fold_layout_values(&sub, arr.dtype, op)?;
         push_scalar_to_leaf(&mut scalars, arr.dtype, val)?;
         tags.push(0);
         index.push(i as i64);
@@ -1864,6 +1856,77 @@ fn reduce_union_axis0(_py: Python<'_>, arr: &GrumpyArray) -> PyResult<ReduceOutp
             lists,
         }),
     }))
+}
+
+fn fold_layout_values(layout: &Layout, dt: DType, op: ReduceOp) -> PyResult<f64> {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    let mut minv = f64::INFINITY;
+    let mut maxv = f64::NEG_INFINITY;
+    walk_layout_fold(layout, dt, &mut |v| {
+        sum += v;
+        count += 1;
+        if v < minv {
+            minv = v;
+        }
+        if v > maxv {
+            maxv = v;
+        }
+        Ok(())
+    })?;
+    if count == 0 {
+        return Err(PyValueError::new_err(" reduction of empty array."));
+    }
+    Ok(match op {
+        ReduceOp::Sum => sum,
+        ReduceOp::Mean => sum / count as f64,
+        ReduceOp::Min => minv,
+        ReduceOp::Max => maxv,
+        ReduceOp::Ptp => maxv - minv,
+    })
+}
+
+fn walk_layout_fold(
+    layout: &Layout,
+    dt: DType,
+    f: &mut dyn FnMut(f64) -> PyResult<()>,
+) -> PyResult<()> {
+    match layout {
+        Layout::Leaf(l) => {
+            for i in 0..l.len {
+                if l.validity[i] {
+                    f(read_leaf_as_f64(dt, &l.buffer, i)?)?;
+                }
+            }
+        }
+        Layout::ListOffset(lo) => {
+            for i in 0..lo.len() {
+                let s = lo.offsets[i] as usize;
+                let e = lo.offsets[i + 1] as usize;
+                walk_layout_fold(
+                    &crate::layout::take_range(lo.content.as_ref(), s, e)?,
+                    dt,
+                    f,
+                )?;
+            }
+        }
+        Layout::OffsetView(v) => {
+            for i in 0..v.len() {
+                walk_layout_fold(&drop_axis0_select_element(layout, i)?, dt, f)?;
+            }
+        }
+        Layout::Indexed(ix) => {
+            for i in 0..ix.len() {
+                walk_layout_fold(&drop_axis0_select_element(layout, i)?, dt, f)?;
+            }
+        }
+        Layout::UnionScalarList(u) => {
+            for i in 0..u.len() {
+                walk_layout_fold(&drop_axis0_select_element(layout, i)?, dt, f)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sum_layout_values(layout: &Layout, dt: DType) -> PyResult<f64> {

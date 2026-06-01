@@ -14,7 +14,7 @@
 //! - Supports `OffsetView` batches produced by streaming
 
 use crate::dtype::DType;
-use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
+use crate::layout::{drop_axis0_select_element, stack_axis0_broadcast, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use kdtree::distance::squared_euclidean;
@@ -57,13 +57,92 @@ pub fn neighbors_edge_index_and_distances(
         return Err(PyValueError::new_err("neighbors requires matching dtypes for query and data (for now)."));
     }
     if query.layout.has_union() || data.layout.has_union() {
-        return Err(PyValueError::new_err("neighbors on union layouts not implemented."));
+        return neighbors_union(query, data, k, radius, dim, loop_, return_distances);
     }
     match dim {
         0 | -2 => neighbors_dim0_edges(query, data, k, radius, loop_, return_distances),
         1 | -3 => neighbors_dim1_edges(query, data, k, radius, loop_, return_distances),
         _ => Err(PyValueError::new_err("neighbors: only dim=0 or dim=1 supported for now.")),
     }
+}
+
+fn neighbors_union(
+    query: &GrumpyArray,
+    data: &GrumpyArray,
+    k: Option<usize>,
+    radius: Option<f64>,
+    dim: isize,
+    loop_: bool,
+    return_distances: bool,
+) -> PyResult<(GrumpyArray, Option<GrumpyArray>)> {
+    match dim {
+        0 | -2 => {}
+        _ => {
+            return Err(PyValueError::new_err(
+                "neighbors on union layouts currently supports dim=0 only.",
+            ));
+        }
+    }
+    let q_union = query.layout.has_union();
+    let d_union = data.layout.has_union();
+    let n = if q_union {
+        query.len()
+    } else if d_union {
+        data.len()
+    } else {
+        unreachable!()
+    };
+    if q_union && d_union && query.len() != data.len() {
+        return Err(PyValueError::new_err(
+            "neighbors: union query and data must have the same outer length.",
+        ));
+    }
+    let mut edge_layouts: Vec<Layout> = Vec::with_capacity(n);
+    let mut dist_layouts: Vec<Layout> = Vec::with_capacity(n);
+    for i in 0..n {
+        let q_arr = if q_union {
+            GrumpyArray {
+                dtype: query.dtype,
+                layout: drop_axis0_select_element(&query.layout, i)?,
+            }
+        } else {
+            query.clone()
+        };
+        let d_arr = if d_union {
+            GrumpyArray {
+                dtype: data.dtype,
+                layout: drop_axis0_select_element(&data.layout, i)?,
+            }
+        } else {
+            data.clone()
+        };
+        if rect2d(&q_arr.layout).is_err() || rect2d(&d_arr.layout).is_err() {
+            return Err(PyValueError::new_err(
+                "neighbors on union layouts requires each outer element to be a rectangular 2D point cloud.",
+            ));
+        }
+        let (edge, dist) =
+            neighbors_dim0_edges(&q_arr, &d_arr, k, radius, loop_, return_distances)?;
+        edge_layouts.push(edge.layout);
+        if return_distances {
+            dist_layouts.push(dist.ok_or_else(|| {
+                PyValueError::new_err("Internal error: missing distance output.")
+            })?.layout);
+        }
+    }
+    let edge = GrumpyArray {
+        dtype: DType::Int64,
+        layout: stack_axis0_broadcast(&edge_layouts, DType::Int64)?,
+    };
+    let dist = if return_distances {
+        Some(GrumpyArray {
+            dtype: DType::Float64,
+            layout: stack_axis0_broadcast(&dist_layouts, DType::Float64)?,
+        })
+    } else {
+        None
+    };
+    Ok((edge, dist))
 }
 
 fn neighbors_dim0_edges(

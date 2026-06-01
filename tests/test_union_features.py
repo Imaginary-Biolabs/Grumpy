@@ -74,3 +74,20 @@ def test_union_shuffle_reproducible():
     b.shuffle(dim=0, seed=7)
     assert a.to_list() == b.to_list()
     assert len(a.to_list()) == len(_union_array().to_list())
+
+
+def test_union_fancy_axis0():
+    x = _union_array()
+    assert x[[0, 2]].to_list() == [1, 4]
+    assert x[[1, 3]].to_list() == [[2, 3], [5]]
+    assert x[[0, 1]].to_list() == [1, [2, 3]]
+    assert x[[True, False, True, False]].to_list() == [1, 4]
+    assert x[1:3].to_list() == [[2, 3], 4]
+
+
+def test_union_fancy_coordinates():
+    x = _union_array()
+    assert x[0, 0] == 1
+    assert x[1, 0] == 2
+    assert x[[0, 1], [0, 0]].to_list() == [1, 2]
+    assert x[[0, 1], 0].to_list() == [1, 2]

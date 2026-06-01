@@ -893,22 +893,15 @@ fn take_union_scalar_list_range(u: &UnionScalarList, start: usize, end: usize) -
     if end > u.len() {
         return Err(PyValueError::new_err("Index out of bounds."));
     }
-    if start == end {
-        let scalars = Leaf::new(u.scalars.dtype);
-        let lists = ListOffset {
-            offsets: Arc::new(vec![0i64]),
-            content: Box::new(Layout::Leaf(Leaf::new(u.scalars.dtype))),
-        };
-        return Ok(UnionScalarList {
-            tags: Vec::new(),
-            index: Vec::new(),
-            scalars,
-            lists,
-        });
-    }
-    let sub_tags = u.tags[start..end].to_vec();
-    let sub_old_index = &u.index[start..end];
+    let positions: Vec<usize> = (start..end).collect();
+    pick_union_scalar_list_indices(u, &positions)
+}
 
+/// Remap union outer-axis tags/index for a pick/slice into compact scalar/list pool indices.
+pub fn remap_union_pick(
+    sub_tags: &[u8],
+    sub_old_index: &[i64],
+) -> PyResult<(Vec<i64>, Vec<usize>, Vec<usize>)> {
     use std::collections::HashMap;
     let mut scalar_remap: HashMap<usize, i64> = HashMap::new();
     let mut list_remap: HashMap<usize, i64> = HashMap::new();
@@ -935,6 +928,41 @@ fn take_union_scalar_list_range(u: &UnionScalarList, start: usize, end: usize) -
         }
     }
 
+    let mut new_index = Vec::with_capacity(sub_tags.len());
+    for i in 0..sub_tags.len() {
+        let tag = sub_tags[i];
+        let ix = sub_old_index[i] as usize;
+        new_index.push(if tag == 0 {
+            scalar_remap[&ix]
+        } else {
+            list_remap[&ix]
+        });
+    }
+    Ok((new_index, scalar_old, list_old))
+}
+
+fn pick_union_scalar_list_indices(
+    u: &UnionScalarList,
+    outer_positions: &[usize],
+) -> PyResult<UnionScalarList> {
+    if outer_positions.is_empty() {
+        let scalars = Leaf::new(u.scalars.dtype);
+        let lists = ListOffset {
+            offsets: Arc::new(vec![0i64]),
+            content: Box::new(Layout::Leaf(Leaf::new(u.scalars.dtype))),
+        };
+        return Ok(UnionScalarList {
+            tags: Vec::new(),
+            index: Vec::new(),
+            scalars,
+            lists,
+        });
+    }
+    let sub_tags: Vec<u8> = outer_positions.iter().map(|&i| u.tags[i]).collect();
+    let sub_old_index: Vec<i64> = outer_positions.iter().map(|&i| u.index[i]).collect();
+
+    let (new_index, scalar_old, list_old) = remap_union_pick(&sub_tags, &sub_old_index)?;
+
     let scalars = take_leaf_indices(&u.scalars, &scalar_old)?;
 
     let mut new_list_offsets = vec![0i64];
@@ -958,23 +986,396 @@ fn take_union_scalar_list_range(u: &UnionScalarList, start: usize, end: usize) -
         content: Box::new(list_content),
     };
 
-    let mut new_index = Vec::with_capacity(sub_tags.len());
-    for i in 0..sub_tags.len() {
-        let tag = sub_tags[i];
-        let ix = sub_old_index[i] as usize;
-        new_index.push(if tag == 0 {
-            scalar_remap[&ix]
-        } else {
-            list_remap[&ix]
-        });
-    }
-
     Ok(UnionScalarList {
         tags: sub_tags,
         index: new_index,
         scalars,
         lists,
     })
+}
+
+fn finalize_gathered_union(u: UnionScalarList) -> Layout {
+    if u.tags.is_empty() {
+        return Layout::Leaf(Leaf::new(u.scalars.dtype));
+    }
+    if u.tags.iter().all(|&t| t == 0) {
+        return Layout::Leaf(u.scalars);
+    }
+    if u.tags.iter().all(|&t| t == 1) {
+        return Layout::ListOffset(u.lists);
+    }
+    Layout::UnionScalarList(u)
+}
+
+/// Fancy axis-0 selection on a union array, compacting scalar/list pools.
+pub fn gather_union_axis0_fancy(u: &UnionScalarList, indices: &[i64]) -> PyResult<Layout> {
+    let root_len = u.len() as i64;
+    let mut positions = Vec::with_capacity(indices.len());
+    for &raw in indices {
+        positions.push(normalize_index(raw, root_len)?);
+    }
+    let picked = pick_union_scalar_list_indices(u, &positions)?;
+    Ok(finalize_gathered_union(picked))
+}
+
+fn concat_len1_leaves(elems: &[Layout]) -> PyResult<Layout> {
+    let dt = match &elems[0] {
+        Layout::Leaf(l) => l.dtype,
+        _ => return Err(PyValueError::new_err("Internal error: expected leaves.")),
+    };
+    let mut out = Leaf::new(dt);
+    out.len = elems.len();
+    out.validity = Arc::new(bitvec![u8, Lsb0; 1; elems.len()]);
+    out.has_nulls = false;
+    out.buffer = LeafBuffer::new(dt);
+    let out_valid = Arc::make_mut(&mut out.validity);
+    for (i, e) in elems.iter().enumerate() {
+        let l = match e {
+            Layout::Leaf(l) => l,
+            _ => return Err(PyValueError::new_err("Internal error: expected leaves.")),
+        };
+        if l.len != 1 {
+            return Err(PyValueError::new_err("Internal error: expected length-1 leaves."));
+        }
+        if !l.validity[0] {
+            out_valid.set(i, false);
+            out.has_nulls = true;
+        }
+        out.buffer.push_from_index(&l.buffer, 0)?;
+    }
+    Ok(Layout::Leaf(out))
+}
+
+/// Stack axis-0 element selections into a single layout (list-chain path).
+pub fn stack_axis0_selects(elems: &[Layout]) -> PyResult<Layout> {
+    if elems.is_empty() {
+        return Err(PyValueError::new_err("Cannot stack empty selection."));
+    }
+    let all_scalar1 = elems
+        .iter()
+        .all(|e| matches!(e, Layout::Leaf(l) if l.len == 1));
+    if all_scalar1 {
+        return concat_len1_leaves(elems);
+    }
+    let all_leaves = elems.iter().all(|e| matches!(e, Layout::Leaf(_)));
+    if all_leaves {
+        let mut offsets = vec![0i64];
+        let mut acc = 0i64;
+        let mut segs = Vec::with_capacity(elems.len());
+        for e in elems {
+            let l = match e {
+                Layout::Leaf(l) => l,
+                _ => unreachable!(),
+            };
+            acc += l.len as i64;
+            offsets.push(acc);
+            segs.push(e.clone());
+        }
+        let content = concat_layout_segments(&segs)?;
+        return Ok(Layout::ListOffset(ListOffset {
+            offsets: Arc::new(offsets),
+            content: Box::new(content),
+        }));
+    }
+    Err(PyValueError::new_err(
+        "Unsupported stacked layout kinds for axis-0 gather.",
+    ))
+}
+
+fn is_scalar_segment(seg: &Layout) -> bool {
+    matches!(seg, Layout::Leaf(l) if l.len == 1)
+}
+
+fn segment_flat_len(seg: &Layout) -> PyResult<usize> {
+    match seg {
+        Layout::Leaf(l) => Ok(l.len),
+        Layout::ListOffset(lo) => Ok(lo.offsets[lo.len()] as usize),
+        Layout::UnionScalarList(u) => {
+            let mut n = 0usize;
+            for i in 0..u.len() {
+                n += segment_flat_len(&drop_axis0_select_element(
+                    &Layout::UnionScalarList(u.clone()),
+                    i,
+                )?)?;
+            }
+            Ok(n)
+        }
+        Layout::OffsetView(v) => {
+            let start = v.offsets[v.start] as usize;
+            let end = v.offsets[v.stop] as usize;
+            segment_flat_len(&take_range(v.content.as_ref(), start, end)?)
+        }
+        Layout::Indexed(ix) => {
+            let mut n = 0usize;
+            for i in 0..ix.len() {
+                n += segment_flat_len(&drop_axis0_select_element(
+                    &Layout::Indexed(crate::layout::Indexed {
+                        index: ix.index.clone(),
+                        content: ix.content.clone(),
+                    }),
+                    i,
+                )?)?;
+            }
+            Ok(n)
+        }
+    }
+}
+
+fn build_union_from_broadcast_segments(segs: &[Layout], dtype: DType) -> PyResult<Layout> {
+    let mut tags = Vec::with_capacity(segs.len());
+    let mut index = Vec::with_capacity(segs.len());
+    let mut scalars = Leaf::new(dtype);
+    let mut list_row_segs: Vec<Layout> = Vec::new();
+
+    for seg in segs {
+        if is_scalar_segment(seg) {
+            tags.push(0);
+            index.push(scalars.len as i64);
+            let l = match seg {
+                Layout::Leaf(l) => l,
+                _ => unreachable!(),
+            };
+            append_leaf_into(&mut scalars, l)?;
+        } else {
+            tags.push(1);
+            index.push(list_row_segs.len() as i64);
+            list_row_segs.push(seg.clone());
+        }
+    }
+
+    let mut list_offsets = vec![0i64];
+    let mut acc = 0i64;
+    let mut content_segs: Vec<Layout> = Vec::with_capacity(list_row_segs.len());
+    for seg in &list_row_segs {
+        content_segs.push(seg.clone());
+        acc += segment_flat_len(seg)? as i64;
+        list_offsets.push(acc);
+    }
+    let list_content = if content_segs.is_empty() {
+        Layout::Leaf(Leaf::new(dtype))
+    } else {
+        concat_layout_segments(&content_segs)?
+    };
+    let lists = ListOffset {
+        offsets: Arc::new(list_offsets),
+        content: Box::new(list_content),
+    };
+
+    Ok(Layout::UnionScalarList(UnionScalarList {
+        tags,
+        index,
+        scalars,
+        lists,
+    }))
+}
+
+/// Stack per-row broadcast segments; builds a union when rows mix scalars and lists.
+pub fn stack_axis0_broadcast(segs: &[Layout], dtype: DType) -> PyResult<Layout> {
+    if segs.is_empty() {
+        return Err(PyValueError::new_err("Cannot stack empty broadcast segments."));
+    }
+    let all_scalar1 = segs.iter().all(is_scalar_segment);
+    if all_scalar1 {
+        return concat_len1_leaves(segs);
+    }
+    let has_scalar = segs.iter().any(is_scalar_segment);
+    let has_listlike = segs.iter().any(|s| !is_scalar_segment(s));
+    if has_scalar && has_listlike {
+        return build_union_from_broadcast_segments(segs, dtype);
+    }
+    if has_listlike && !has_scalar {
+        return build_union_from_broadcast_segments(segs, dtype);
+    }
+    stack_axis0_selects(segs)
+}
+
+/// Fancy axis-0 selection for any layout (union or list-chain).
+pub fn gather_axis0_fancy(layout: &Layout, indices: &[i64]) -> PyResult<Layout> {
+    match layout {
+        Layout::UnionScalarList(u) => gather_union_axis0_fancy(u, indices),
+        _ => {
+            let root_len = layout.len() as i64;
+            let elems: Vec<Layout> = indices
+                .iter()
+                .map(|&raw| {
+                    let i = normalize_index(raw, root_len)?;
+                    drop_axis0_select_element(layout, i)
+                })
+                .collect::<PyResult<_>>()?;
+            stack_axis0_selects(&elems)
+        }
+    }
+}
+
+/// Coordinate indexing: apply ``coords`` axis-by-axis, returning the selected sub-layout.
+pub fn index_by_coordinates(layout: &Layout, coords: &[i64]) -> PyResult<Layout> {
+    if coords.is_empty() {
+        return Err(PyValueError::new_err("Empty coordinate index."));
+    }
+    let ix = normalize_index(coords[0], layout.len() as i64)?;
+    let elem = drop_axis0_select_element(layout, ix)?;
+    if coords.len() == 1 {
+        return Ok(elem);
+    }
+    if let Layout::Leaf(l) = &elem {
+        if l.len == 1 {
+            for &c in &coords[1..] {
+                normalize_index(c, 1)?;
+            }
+            return Ok(elem);
+        }
+    }
+    index_by_coordinates(&elem, &coords[1..])
+}
+
+/// 2D fancy coordinate gather; result is a flat leaf when every selection is a scalar.
+pub fn gather_coordinate_fancy_2d(layout: &Layout, rows: &[i64], cols: &[i64]) -> PyResult<Layout> {
+    if rows.len() != cols.len() {
+        return Err(PyValueError::new_err(
+            "Fancy coordinate arrays must have same length.",
+        ));
+    }
+    let mut elems = Vec::with_capacity(rows.len());
+    for k in 0..rows.len() {
+        elems.push(index_by_coordinates(layout, &[rows[k], cols[k]])?);
+    }
+    let all_scalar1 = elems
+        .iter()
+        .all(|e| matches!(e, Layout::Leaf(l) if l.len == 1));
+    if all_scalar1 {
+        return concat_len1_leaves(&elems);
+    }
+    Err(PyValueError::new_err(
+        "Fancy coordinate gather produced non-scalar elements.",
+    ))
+}
+
+/// Peel one outer nesting axis (ListOffset content or union element concat).
+pub fn peel_layout_axis(layout: &Layout) -> PyResult<Layout> {
+    match layout {
+        Layout::ListOffset(lo) => Ok((*lo.content).clone()),
+        Layout::UnionScalarList(u) => {
+            let mut elems = Vec::with_capacity(u.len());
+            for i in 0..u.len() {
+                elems.push(drop_axis0_select_element(layout, i)?);
+            }
+            stack_axis0_selects(&elems)
+        }
+        Layout::OffsetView(v) => {
+            let start = v.offsets[v.start] as usize;
+            let end = v.offsets[v.stop] as usize;
+            take_range(v.content.as_ref(), start, end)
+        }
+        Layout::Indexed(ix) => Ok((*ix.content).clone()),
+        Layout::Leaf(_) => Ok(layout.clone()),
+    }
+}
+
+/// Drop the first ``drops`` schema nesting axes for dot-notation column views.
+pub fn drop_layout_axes(layout: &Layout, drops: usize) -> PyResult<Layout> {
+    let mut cur = layout.clone();
+    for _ in 0..drops {
+        cur = peel_layout_axis(&cur)?;
+    }
+    Ok(cur)
+}
+
+fn append_leaf_into(out: &mut Leaf, src: &Leaf) -> PyResult<()> {
+    if out.dtype != src.dtype {
+        return Err(PyValueError::new_err("Internal error: dtype mismatch while flattening."));
+    }
+    if src.has_nulls {
+        out.has_nulls = true;
+    }
+    let out_valid = Arc::make_mut(&mut out.validity);
+    for i in 0..src.len {
+        out_valid.push(src.validity[i]);
+        out.buffer.push_from_index(&src.buffer, i)?;
+    }
+    out.len += src.len;
+    Ok(())
+}
+
+fn flatten_layout_to_leaf(layout: &Layout, dtype: DType) -> PyResult<Leaf> {
+    match layout {
+        Layout::Leaf(l) => Ok(l.clone()),
+        Layout::ListOffset(lo) => {
+            let mut out = Leaf::new(dtype);
+            for i in 0..lo.len() {
+                let sub = drop_axis0_select_element(layout, i)?;
+                let leaf = flatten_layout_to_leaf(&sub, dtype)?;
+                append_leaf_into(&mut out, &leaf)?;
+            }
+            Ok(out)
+        }
+        Layout::UnionScalarList(u) => {
+            let mut out = Leaf::new(dtype);
+            for i in 0..u.len() {
+                let sub = drop_axis0_select_element(layout, i)?;
+                let leaf = flatten_layout_to_leaf(&sub, dtype)?;
+                append_leaf_into(&mut out, &leaf)?;
+            }
+            Ok(out)
+        }
+        Layout::OffsetView(v) => {
+            let start = v.offsets[v.start] as usize;
+            let end = v.offsets[v.stop] as usize;
+            flatten_layout_to_leaf(&take_range(v.content.as_ref(), start, end)?, dtype)
+        }
+        Layout::Indexed(ix) => {
+            let mut out = Leaf::new(dtype);
+            for i in 0..ix.len() {
+                let sub = drop_axis0_select_element(layout, i)?;
+                let leaf = flatten_layout_to_leaf(&sub, dtype)?;
+                append_leaf_into(&mut out, &leaf)?;
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Return a fully flattened leaf view (zero-copy for pure list-chains when possible).
+pub fn leaf_view(layout: &Layout, dtype: DType) -> PyResult<Leaf> {
+    if let Some(_) = list_chain_depth(layout) {
+        let mut cur = layout;
+        loop {
+            match cur {
+                Layout::Leaf(l) => return Ok(l.clone()),
+                Layout::ListOffset(lo) => cur = lo.content.as_ref(),
+                Layout::OffsetView(v) => cur = v.content.as_ref(),
+                Layout::Indexed(ix) => cur = ix.content.as_ref(),
+                Layout::UnionScalarList(_) => break,
+            }
+        }
+    }
+    flatten_layout_to_leaf(layout, dtype)
+}
+
+/// Number of nesting axes in a layout (union outer axis counts as one).
+pub fn layout_ndim(layout: &Layout) -> PyResult<usize> {
+    match layout {
+        Layout::Indexed(ix) => layout_ndim(ix.content.as_ref()),
+        Layout::OffsetView(v) => layout_ndim(v.content.as_ref()),
+        Layout::UnionScalarList(u) => {
+            let mut inner = 0usize;
+            for i in 0..u.len() {
+                if u.tags[i] == 1 {
+                    let li = u.index[i] as usize;
+                    let start = u.lists.offsets[li] as usize;
+                    let end = u.lists.offsets[li + 1] as usize;
+                    let seg = take_range(u.lists.content.as_ref(), start, end)?;
+                    inner = inner.max(layout_ndim(&seg)?);
+                }
+            }
+            Ok(1 + inner)
+        }
+        _ => {
+            let depth = list_chain_depth(layout).ok_or_else(|| {
+                PyValueError::new_err("Internal error: could not determine layout depth.")
+            })?;
+            Ok(depth + 1)
+        }
+    }
 }
 
 pub fn drop_axis0_select_element(layout: &Layout, idx: usize) -> PyResult<Layout> {
@@ -1055,6 +1456,9 @@ fn take_leaf_indices(l: &Leaf, indices: &[usize]) -> PyResult<Leaf> {
 }
 
 pub fn coord_to_leaf_index(layout: &Layout, coords: &[i64]) -> PyResult<usize> {
+    if let Layout::UnionScalarList(u) = layout {
+        return coord_to_leaf_index_union(u, coords);
+    }
     // Fast path: 2D list-chain (ListOffset -> Leaf), coords [row, col].
     if coords.len() == 2 {
         if let Layout::ListOffset(lo) = layout {
@@ -1091,7 +1495,7 @@ pub fn coord_to_leaf_index(layout: &Layout, coords: &[i64]) -> PyResult<usize> {
             Layout::Leaf(_) => break,
             Layout::UnionScalarList(_) => {
                 return Err(PyValueError::new_err(
-                    "Fast coordinate indexing not supported for union layouts.",
+                    "Internal error: union should be handled above.",
                 ))
             }
         }
@@ -1132,6 +1536,44 @@ pub fn coord_to_leaf_index(layout: &Layout, coords: &[i64]) -> PyResult<usize> {
     let len = end - start;
     let local = normalize_index(*coords.last().unwrap(), len)?;
     Ok((start as usize) + local)
+}
+
+fn coord_to_leaf_index_union(u: &UnionScalarList, coords: &[i64]) -> PyResult<usize> {
+    if coords.is_empty() {
+        return Err(PyValueError::new_err("Coordinate length does not match array depth."));
+    }
+    let outer = normalize_index(coords[0], u.len() as i64)?;
+    match u.tags[outer] {
+        0 => {
+            if coords.len() == 1 {
+                return Ok(u.index[outer] as usize);
+            }
+            normalize_index(coords[1], 1)?;
+            if coords.len() > 2 {
+                for c in &coords[2..] {
+                    normalize_index(*c, 1)?;
+                }
+            }
+            Ok(u.index[outer] as usize)
+        }
+        1 => {
+            let li = u.index[outer] as usize;
+            let start = u.lists.offsets[li] as usize;
+            let end = u.lists.offsets[li + 1] as usize;
+            if coords.len() == 1 {
+                return Err(PyValueError::new_err(
+                    "Coordinate length does not match array depth.",
+                ));
+            }
+            if coords.len() == 2 {
+                let local = normalize_index(coords[1], (end - start) as i64)?;
+                return Ok(start + local);
+            }
+            let sub = take_range(u.lists.content.as_ref(), start, end)?;
+            coord_to_leaf_index(&sub, &coords[1..])
+        }
+        _ => Err(PyValueError::new_err("Invalid union tag.")),
+    }
 }
 
 fn normalize_index(i: i64, len: i64) -> PyResult<usize> {

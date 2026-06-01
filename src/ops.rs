@@ -12,7 +12,7 @@
 //!   - `elementwise_ragged2d_fast` (ragged 2D list->leaf) with per-row broadcast handling.
 //! - **3) Generic engine**:
 //!   - `elementwise_layout` for same-structure (including unions).
-//!   - `elementwise_layout_broadcast` for broadcasting on pure list-chains.
+//!   - `elementwise_layout_broadcast` for broadcasting on list-chains and unions.
 //! - **4) Compiled pipeline support**:
 //!   - If scalar form is common (e.g. `x + 1`), extend `elementwise_scalar_inplace`.
 //! - **5) Bench + test**:
@@ -20,7 +20,7 @@
 //!   - Add parity tests including `OffsetView` batches and null propagation.
 
 use crate::dtype::DType;
-use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
+use crate::layout::{drop_axis0_select_element, stack_axis0_broadcast, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
@@ -338,13 +338,6 @@ pub fn elementwise(a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyResult<Grum
     if layouts_compatible(&a2.layout, &b2.layout) {
         let layout = elementwise_layout(&a2.layout, &b2.layout, a2.dtype, b2.dtype, out_dtype, op)?;
         return Ok(GrumpyArray { dtype: out_dtype, layout });
-    }
-
-    // Broadcasting path: currently only supported for pure list-chains (no unions).
-    if a2.layout.has_union() || b2.layout.has_union() {
-        return Err(PyValueError::new_err(
-            "Broadcasting on union layouts is not supported. If both operands have the same union structure, it is supported.",
-        ));
     }
 
     let layout = elementwise_layout_broadcast(&a2.layout, &b2.layout, a2.dtype, b2.dtype, out_dtype, op)?;
@@ -1387,7 +1380,180 @@ fn elementwise_layout_broadcast(
             elementwise_layout_broadcast(other, &as_lo, a_dt, b_dt, out_dt, op)
         }
 
+        (Layout::UnionScalarList(ua), Layout::UnionScalarList(ub)) => {
+            broadcast_union_pair(ua, ub, a_dt, b_dt, out_dt, op)
+        }
+        (Layout::UnionScalarList(u), other) => {
+            broadcast_union_with_other(u, other, true, a_dt, b_dt, out_dt, op)
+        }
+        (other, Layout::UnionScalarList(u)) => {
+            broadcast_union_with_other(u, other, false, a_dt, b_dt, out_dt, op)
+        }
+
         _ => Err(PyValueError::new_err("Broadcasting failed: incompatible layouts.")),
+    }
+}
+
+fn broadcast_axis0_segments(
+    segs: &[Layout],
+    out_dt: DType,
+) -> PyResult<Layout> {
+    stack_axis0_broadcast(segs, out_dt)
+}
+
+fn broadcast_one_to_many_axis0(
+    small: &Layout,
+    big: &Layout,
+    small_dt: DType,
+    big_dt: DType,
+    out_dt: DType,
+    op: BinOp,
+    small_is_a: bool,
+) -> PyResult<Layout> {
+    let big_n = big.len();
+    let small_el = drop_axis0_select_element(small, 0)?;
+    let mut segs: Vec<Layout> = Vec::with_capacity(big_n);
+    for i in 0..big_n {
+        let big_el = drop_axis0_select_element(big, i)?;
+        let seg = if small_is_a {
+            elementwise_layout_broadcast(&small_el, &big_el, small_dt, big_dt, out_dt, op)?
+        } else {
+            elementwise_layout_broadcast(&big_el, &small_el, big_dt, small_dt, out_dt, op)?
+        };
+        segs.push(seg);
+    }
+    broadcast_axis0_segments(&segs, out_dt)
+}
+
+fn broadcast_same_outer_axis0(
+    a: &Layout,
+    b: &Layout,
+    a_dt: DType,
+    b_dt: DType,
+    out_dt: DType,
+    op: BinOp,
+) -> PyResult<Layout> {
+    let n = a.len();
+    let mut segs: Vec<Layout> = Vec::with_capacity(n);
+    for i in 0..n {
+        let a_el = drop_axis0_select_element(a, i)?;
+        let b_el = drop_axis0_select_element(b, i)?;
+        segs.push(elementwise_layout_broadcast(&a_el, &b_el, a_dt, b_dt, out_dt, op)?);
+    }
+    broadcast_axis0_segments(&segs, out_dt)
+}
+
+fn broadcast_union_pair(
+    ua: &UnionScalarList,
+    ub: &UnionScalarList,
+    a_dt: DType,
+    b_dt: DType,
+    out_dt: DType,
+    op: BinOp,
+) -> PyResult<Layout> {
+    let na = ua.len();
+    let nb = ub.len();
+    let a_layout = Layout::UnionScalarList(ua.clone());
+    let b_layout = Layout::UnionScalarList(ub.clone());
+    if na == 1 && nb > 1 {
+        return broadcast_one_to_many_axis0(&a_layout, &b_layout, a_dt, b_dt, out_dt, op, true);
+    }
+    if nb == 1 && na > 1 {
+        return broadcast_one_to_many_axis0(&b_layout, &a_layout, b_dt, a_dt, out_dt, op, false);
+    }
+    if na != nb {
+        return Err(PyValueError::new_err(
+            "Broadcasting failed: incompatible union outer lengths.",
+        ));
+    }
+    broadcast_same_outer_axis0(&a_layout, &b_layout, a_dt, b_dt, out_dt, op)
+}
+
+fn broadcast_union_with_other(
+    u: &UnionScalarList,
+    other: &Layout,
+    union_is_a: bool,
+    a_dt: DType,
+    b_dt: DType,
+    out_dt: DType,
+    op: BinOp,
+) -> PyResult<Layout> {
+    let union_layout = Layout::UnionScalarList(u.clone());
+    let nu = u.len();
+    match other {
+        Layout::Leaf(l) if l.len == 1 => broadcast_one_to_many_axis0(
+            other,
+            &union_layout,
+            if union_is_a { b_dt } else { a_dt },
+            if union_is_a { a_dt } else { b_dt },
+            out_dt,
+            op,
+            !union_is_a,
+        ),
+        Layout::Leaf(l) if l.len == nu => broadcast_same_outer_axis0(
+            if union_is_a {
+                &union_layout
+            } else {
+                other
+            },
+            if union_is_a { other } else { &union_layout },
+            if union_is_a { a_dt } else { b_dt },
+            if union_is_a { b_dt } else { a_dt },
+            out_dt,
+            op,
+        ),
+        Layout::ListOffset(lo) => {
+            let nb = lo.len();
+            let lo_layout = Layout::ListOffset(lo.clone());
+            if nu == 1 && nb > 1 {
+                if union_is_a {
+                    broadcast_one_to_many_axis0(&union_layout, &lo_layout, a_dt, b_dt, out_dt, op, true)
+                } else {
+                    broadcast_one_to_many_axis0(&union_layout, &lo_layout, b_dt, a_dt, out_dt, op, false)
+                }
+            } else if nb == 1 && nu > 1 {
+                if union_is_a {
+                    broadcast_one_to_many_axis0(&lo_layout, &union_layout, b_dt, a_dt, out_dt, op, false)
+                } else {
+                    broadcast_one_to_many_axis0(&lo_layout, &union_layout, a_dt, b_dt, out_dt, op, true)
+                }
+            } else if nu == nb {
+                broadcast_same_outer_axis0(
+                    if union_is_a {
+                        &union_layout
+                    } else {
+                        &lo_layout
+                    },
+                    if union_is_a { &lo_layout } else { &union_layout },
+                    if union_is_a { a_dt } else { b_dt },
+                    if union_is_a { b_dt } else { a_dt },
+                    out_dt,
+                    op,
+                )
+            } else {
+                Err(PyValueError::new_err(
+                    "Broadcasting failed: incompatible outer lengths between union and list.",
+                ))
+            }
+        }
+        Layout::OffsetView(v) => {
+            let mut offs: Vec<i64> = Vec::with_capacity(v.len() + 1);
+            let base = v.offsets[v.start];
+            for i in v.start..=v.stop {
+                offs.push(v.offsets[i] - base);
+            }
+            let child_start = v.offsets[v.start] as usize;
+            let child_end = v.offsets[v.stop] as usize;
+            let content = crate::layout::take_range(v.content.as_ref(), child_start, child_end)?;
+            let as_lo = Layout::ListOffset(ListOffset {
+                offsets: Arc::new(offs),
+                content: Box::new(content),
+            });
+            broadcast_union_with_other(u, &as_lo, union_is_a, a_dt, b_dt, out_dt, op)
+        }
+        _ => Err(PyValueError::new_err(
+            "Broadcasting failed: incompatible union and layout kind.",
+        )),
     }
 }
 

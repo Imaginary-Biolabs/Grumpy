@@ -1,5 +1,5 @@
 use crate::dtype::DType;
-use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
+use crate::layout::{drop_axis0_select_element, layout_ndim, leaf_view, stack_axis0_broadcast, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
@@ -8,80 +8,77 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 pub fn sort(_py: Python<'_>, x: &GrumpyArray) -> PyResult<GrumpyArray> {
-    let leaf = leaf_1d(&x.layout)?;
+    let leaf = array_as_leaf_1d(x)?;
     if leaf.has_nulls {
         return Err(PyValueError::new_err("sort does not support nulls yet."));
     }
     match x.dtype {
-        DType::Int32 => sort_i32(leaf),
-        DType::Int64 => sort_i64(leaf),
-        DType::UInt32 => sort_u32(leaf),
-        DType::UInt64 => sort_u64(leaf),
-        DType::Float32 => sort_f32(leaf),
-        DType::Float64 => sort_f64(leaf),
-        DType::Bool => sort_bool(leaf),
-        DType::Char => sort_char(leaf),
+        DType::Int32 => sort_i32(&leaf),
+        DType::Int64 => sort_i64(&leaf),
+        DType::UInt32 => sort_u32(&leaf),
+        DType::UInt64 => sort_u64(&leaf),
+        DType::Float32 => sort_f32(&leaf),
+        DType::Float64 => sort_f64(&leaf),
+        DType::Bool => sort_bool(&leaf),
+        DType::Char => sort_char(&leaf),
         _ => Err(PyValueError::new_err("sort not implemented for this dtype.")),
     }
 }
 
 pub fn sort_axis(py: Python<'_>, x: &GrumpyArray, dim: isize) -> PyResult<GrumpyArray> {
-    if x.layout.has_union() {
-        return Err(PyValueError::new_err("sort on union layouts not implemented."));
-    }
-    let depth = crate::layout::list_chain_depth(&x.layout)
-        .ok_or_else(|| PyValueError::new_err("sort requires a pure list-chain array."))?;
-    let axis = normalize_axis(dim, depth)?;
-    if depth == 0 {
+    let ndim = layout_ndim_for_sort(&x.layout)?;
+    let axis = normalize_axis(dim, ndim)?;
+    if ndim == 1 {
         if axis != 0 {
             return Err(PyValueError::new_err("sort: dim out of range."));
         }
         return sort(py, x);
     }
-    if axis != depth {
-        // Only support sorting of scalar values within lists (last axis). Sorting lists-of-lists is undefined here.
+    if axis != ndim - 1 {
         return Err(PyValueError::new_err(
             "sort is only supported on the innermost axis for nested ragged arrays (dim=-1).",
         ));
+    }
+    if x.layout.has_union() {
+        return map_union_last_axis(py, x, |sub| sort(py, sub));
     }
     Ok(GrumpyArray { dtype: x.dtype, layout: sort_last_layout(&x.layout, x.dtype)? })
 }
 
 pub fn argsort(_py: Python<'_>, x: &GrumpyArray) -> PyResult<GrumpyArray> {
-    let leaf = leaf_1d(&x.layout)?;
+    let leaf = array_as_leaf_1d(x)?;
     if leaf.has_nulls {
         return Err(PyValueError::new_err("argsort does not support nulls yet."));
     }
     match x.dtype {
-        DType::Int32 => argsort_i32(leaf),
-        DType::Int64 => argsort_i64(leaf),
-        DType::UInt32 => argsort_u32(leaf),
-        DType::UInt64 => argsort_u64(leaf),
-        DType::Float32 => argsort_f32(leaf),
-        DType::Float64 => argsort_f64(leaf),
-        DType::Bool => argsort_bool(leaf),
-        DType::Char => argsort_char(leaf),
+        DType::Int32 => argsort_i32(&leaf),
+        DType::Int64 => argsort_i64(&leaf),
+        DType::UInt32 => argsort_u32(&leaf),
+        DType::UInt64 => argsort_u64(&leaf),
+        DType::Float32 => argsort_f32(&leaf),
+        DType::Float64 => argsort_f64(&leaf),
+        DType::Bool => argsort_bool(&leaf),
+        DType::Char => argsort_char(&leaf),
         _ => Err(PyValueError::new_err("argsort not implemented for this dtype.")),
     }
 }
 
 pub fn argsort_axis(py: Python<'_>, x: &GrumpyArray, dim: isize) -> PyResult<GrumpyArray> {
-    if x.layout.has_union() {
-        return Err(PyValueError::new_err("argsort on union layouts not implemented."));
-    }
-    let depth = crate::layout::list_chain_depth(&x.layout)
-        .ok_or_else(|| PyValueError::new_err("argsort requires a pure list-chain array."))?;
-    let axis = normalize_axis(dim, depth)?;
-    if depth == 0 {
+    let ndim = layout_ndim_for_sort(&x.layout)?;
+    let axis = normalize_axis(dim, ndim)?;
+    if ndim == 1 {
         if axis != 0 {
             return Err(PyValueError::new_err("argsort: dim out of range."));
         }
         return argsort(py, x);
     }
-    if axis != depth {
+    if axis != ndim - 1 {
         return Err(PyValueError::new_err(
             "argsort is only supported on the innermost axis for nested ragged arrays (dim=-1).",
         ));
+    }
+    if x.layout.has_union() {
+        return map_union_last_axis(py, x, |sub| argsort(py, sub));
     }
     Ok(GrumpyArray { dtype: DType::Int64, layout: argsort_last_layout(&x.layout, x.dtype)? })
 }
@@ -99,15 +96,15 @@ pub enum ArgOut {
 }
 
 pub fn argreduce(py: Python<'_>, x: &GrumpyArray, op: ArgOp) -> PyResult<ArgOut> {
-    let leaf = leaf_1d(&x.layout)?;
+    let leaf = array_as_leaf_1d(x)?;
     // Skip nulls always. For nan* also skip NaNs.
     match x.dtype {
-        DType::Float64 => argreduce_f64(py, leaf, op),
-        DType::Float32 => argreduce_f32(py, leaf, op),
-        DType::Int32 => argreduce_i32(py, leaf, op),
-        DType::Int64 => argreduce_i64(py, leaf, op),
-        DType::UInt32 => argreduce_u32(py, leaf, op),
-        DType::UInt64 => argreduce_u64(py, leaf, op),
+        DType::Float64 => argreduce_f64(py, &leaf, op),
+        DType::Float32 => argreduce_f32(py, &leaf, op),
+        DType::Int32 => argreduce_i32(py, &leaf, op),
+        DType::Int64 => argreduce_i64(py, &leaf, op),
+        DType::UInt32 => argreduce_u32(py, &leaf, op),
+        DType::UInt64 => argreduce_u64(py, &leaf, op),
         _ => Err(PyValueError::new_err("argmin/argmax not implemented for this dtype.")),
     }
 }
@@ -115,7 +112,7 @@ pub fn argreduce(py: Python<'_>, x: &GrumpyArray, op: ArgOp) -> PyResult<ArgOut>
 #[allow(dead_code)]
 pub fn argreduce_dim1(_py: Python<'_>, x: &GrumpyArray, op: ArgOp) -> PyResult<GrumpyArray> {
     if x.layout.has_union() {
-        return Err(PyValueError::new_err("argmax/argmin(dim=1) on union layouts not implemented."));
+        return argreduce_union_last_axis(x, op);
     }
     let (lo, leaf) = listoffset_leaf2d(&x.layout)?;
     let nrows = lo.len();
@@ -324,38 +321,142 @@ pub fn argreduce_dim1(_py: Python<'_>, x: &GrumpyArray, op: ArgOp) -> PyResult<G
 }
 
 pub fn argreduce_axis_array(_py: Python<'_>, x: &GrumpyArray, dim: isize, op: ArgOp) -> PyResult<GrumpyArray> {
-    if x.layout.has_union() {
-        return Err(PyValueError::new_err("argmax/argmin on union layouts not implemented."));
-    }
-    let depth = crate::layout::list_chain_depth(&x.layout)
-        .ok_or_else(|| PyValueError::new_err("argmax/argmin requires a pure list-chain array."))?;
-    let axis = normalize_axis(dim, depth)?;
-    if depth == 0 {
+    let ndim = layout_ndim_for_sort(&x.layout)?;
+    let axis = normalize_axis(dim, ndim)?;
+    if ndim == 1 {
         return Err(PyValueError::new_err("argmax/argmin(dim=...) on 1D arrays returns a scalar; call without dim."));
     }
-    if axis != depth {
+    if axis != ndim - 1 {
         return Err(PyValueError::new_err(
             "argmax/argmin are only supported on the innermost axis for nested ragged arrays (dim=-1).",
         ));
     }
+    if x.layout.has_union() {
+        return argreduce_union_last_axis(x, op);
+    }
     Ok(GrumpyArray { dtype: DType::Int64, layout: argreduce_last_layout(&x.layout, x.dtype, op)? })
 }
 
-fn normalize_axis(dim: isize, depth: usize) -> PyResult<usize> {
-    let nd = depth as isize + 1;
+fn normalize_axis(dim: isize, ndim: usize) -> PyResult<usize> {
     let mut d = dim;
     if d < 0 {
-        d += nd;
+        d += ndim as isize;
     }
-    if d < 0 || d >= nd {
+    if d < 0 || d as usize >= ndim {
         return Err(PyValueError::new_err("dim out of range."));
     }
     Ok(d as usize)
 }
 
+fn layout_ndim_for_sort(layout: &Layout) -> PyResult<usize> {
+    if layout.has_union() {
+        layout_ndim(layout)
+    } else {
+        let depth = crate::layout::list_chain_depth(layout).ok_or_else(|| {
+            PyValueError::new_err("sort/search requires a list-chain or union array.")
+        })?;
+        Ok(depth + 1)
+    }
+}
+
+fn array_as_leaf_1d(x: &GrumpyArray) -> PyResult<Leaf> {
+    if let Ok(l) = leaf_1d(&x.layout) {
+        Ok(l.clone())
+    } else {
+        leaf_view(&x.layout, x.dtype)
+    }
+}
+
+fn map_union_last_axis(
+    py: Python<'_>,
+    x: &GrumpyArray,
+    mut f: impl FnMut(&GrumpyArray) -> PyResult<GrumpyArray>,
+) -> PyResult<GrumpyArray> {
+    let n = x.len();
+    let mut segs: Vec<Layout> = Vec::with_capacity(n);
+    for i in 0..n {
+        let sub = drop_axis0_select_element(&x.layout, i)?;
+        let sub_arr = GrumpyArray {
+            dtype: x.dtype,
+            layout: sub,
+        };
+        segs.push(f(&sub_arr)?.layout);
+    }
+    Ok(GrumpyArray {
+        dtype: x.dtype,
+        layout: stack_axis0_broadcast(&segs, x.dtype)?,
+    })
+}
+
+fn argreduce_union_last_axis(x: &GrumpyArray, op: ArgOp) -> PyResult<GrumpyArray> {
+    Python::with_gil(|py| {
+        let n = x.len();
+        let mut scalars = Leaf::new(DType::Int64);
+        scalars.len = n;
+        scalars.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+        scalars.has_nulls = false;
+        scalars.buffer = LeafBuffer::I64(Arc::new(vec![0i64; n]));
+        for i in 0..n {
+            let sub = drop_axis0_select_element(&x.layout, i)?;
+            let sub_arr = GrumpyArray {
+                dtype: x.dtype,
+                layout: sub,
+            };
+            let ix = argreduce_subtree_last(py, &sub_arr, op)?;
+            match &mut scalars.buffer {
+                LeafBuffer::I64(v) => Arc::make_mut(v)[i] = ix,
+                _ => unreachable!(),
+            }
+        }
+        let lists = ListOffset {
+            offsets: Arc::new(vec![0i64]),
+            content: Box::new(Layout::Leaf(Leaf::new(DType::Int64))),
+        };
+        Ok(GrumpyArray {
+            dtype: DType::Int64,
+            layout: Layout::UnionScalarList(UnionScalarList {
+                tags: (0..n).map(|_| 0u8).collect(),
+                index: (0..n as i64).collect(),
+                scalars,
+                lists,
+            }),
+        })
+    })
+}
+
+fn argreduce_subtree_last(py: Python<'_>, x: &GrumpyArray, op: ArgOp) -> PyResult<i64> {
+    if layout_ndim(&x.layout)? <= 1 {
+        return match argreduce(py, x, op)? {
+            ArgOut::Scalar(o) => o.extract(py),
+        };
+    }
+    let out = argreduce_last_layout(&x.layout, x.dtype, op)?;
+    read_first_i64_layout(&out)
+}
+
+fn read_first_i64_layout(layout: &Layout) -> PyResult<i64> {
+    match layout {
+        Layout::Leaf(l) => match &l.buffer {
+            LeafBuffer::I64(v) => Ok(v[0]),
+            _ => Err(PyValueError::new_err("Internal error: expected int64 leaf.")),
+        },
+        Layout::ListOffset(lo) => read_first_i64_layout(lo.content.as_ref()),
+        _ => Err(PyValueError::new_err("Internal error: expected int64 layout.")),
+    }
+}
+
 fn sort_last_layout(layout: &Layout, dt: DType) -> PyResult<Layout> {
     match layout {
-        Layout::Leaf(_) => Err(PyValueError::new_err("Internal error: sort_last_layout expected list.")),
+        Layout::Leaf(l) => {
+            if l.len <= 1 {
+                return Ok(layout.clone());
+            }
+            let lo = ListOffset {
+                offsets: Arc::new(vec![0i64, l.len as i64]),
+                content: Box::new(Layout::Leaf(l.clone())),
+            };
+            Ok(sort_listoffset_leaf(&lo, l, dt)?.layout)
+        }
         Layout::ListOffset(lo) => match lo.content.as_ref() {
             Layout::Leaf(leaf) => Ok(sort_listoffset_leaf(lo, leaf, dt)?.layout),
             _ => Ok(Layout::ListOffset(ListOffset {
@@ -363,13 +464,49 @@ fn sort_last_layout(layout: &Layout, dt: DType) -> PyResult<Layout> {
                 content: Box::new(sort_last_layout(lo.content.as_ref(), dt)?),
             })),
         },
-        _ => Err(PyValueError::new_err("sort_last_layout requires list-chains only.")),
+        Layout::UnionScalarList(u) => {
+            let list_content = sort_last_layout(u.lists.content.as_ref(), dt)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars: u.scalars.clone(),
+                lists: ListOffset {
+                    offsets: u.lists.offsets.clone(),
+                    content: Box::new(list_content),
+                },
+            }))
+        }
+        Layout::OffsetView(v) => {
+            let content = sort_last_layout(v.content.as_ref(), dt)?;
+            Ok(Layout::OffsetView(crate::layout::OffsetView {
+                offsets: v.offsets.clone(),
+                start: v.start,
+                stop: v.stop,
+                content: Box::new(content),
+            }))
+        }
+        Layout::Indexed(ix) => {
+            let content = sort_last_layout(ix.content.as_ref(), dt)?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ix.index.clone(),
+                content: Box::new(content),
+            }))
+        }
     }
 }
 
 fn argsort_last_layout(layout: &Layout, dt: DType) -> PyResult<Layout> {
     match layout {
-        Layout::Leaf(_) => Err(PyValueError::new_err("Internal error: argsort_last_layout expected list.")),
+        Layout::Leaf(l) => {
+            if l.len <= 1 {
+                return Ok(layout.clone());
+            }
+            let lo = ListOffset {
+                offsets: Arc::new(vec![0i64, l.len as i64]),
+                content: Box::new(Layout::Leaf(l.clone())),
+            };
+            Ok(argsort_listoffset_leaf(&lo, l, dt)?.layout)
+        }
         Layout::ListOffset(lo) => match lo.content.as_ref() {
             Layout::Leaf(leaf) => Ok(argsort_listoffset_leaf(lo, leaf, dt)?.layout),
             _ => Ok(Layout::ListOffset(ListOffset {
@@ -377,13 +514,49 @@ fn argsort_last_layout(layout: &Layout, dt: DType) -> PyResult<Layout> {
                 content: Box::new(argsort_last_layout(lo.content.as_ref(), dt)?),
             })),
         },
-        _ => Err(PyValueError::new_err("argsort_last_layout requires list-chains only.")),
+        Layout::UnionScalarList(u) => {
+            let list_content = argsort_last_layout(u.lists.content.as_ref(), dt)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars: u.scalars.clone(),
+                lists: ListOffset {
+                    offsets: u.lists.offsets.clone(),
+                    content: Box::new(list_content),
+                },
+            }))
+        }
+        Layout::OffsetView(v) => {
+            let content = argsort_last_layout(v.content.as_ref(), dt)?;
+            Ok(Layout::OffsetView(crate::layout::OffsetView {
+                offsets: v.offsets.clone(),
+                start: v.start,
+                stop: v.stop,
+                content: Box::new(content),
+            }))
+        }
+        Layout::Indexed(ix) => {
+            let content = argsort_last_layout(ix.content.as_ref(), dt)?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ix.index.clone(),
+                content: Box::new(content),
+            }))
+        }
     }
 }
 
 fn argreduce_last_layout(layout: &Layout, dt: DType, op: ArgOp) -> PyResult<Layout> {
     match layout {
-        Layout::Leaf(_) => Err(PyValueError::new_err("Internal error: argreduce_last_layout expected list.")),
+        Layout::Leaf(l) => {
+            if l.len <= 1 {
+                return Ok(layout.clone());
+            }
+            let lo = ListOffset {
+                offsets: Arc::new(vec![0i64, l.len as i64]),
+                content: Box::new(Layout::Leaf(l.clone())),
+            };
+            Ok(argreduce_listoffset_leaf(&lo, l, dt, op)?.layout)
+        }
         Layout::ListOffset(lo) => match lo.content.as_ref() {
             Layout::Leaf(leaf) => Ok(argreduce_listoffset_leaf(lo, leaf, dt, op)?.layout),
             _ => Ok(Layout::ListOffset(ListOffset {
@@ -391,7 +564,34 @@ fn argreduce_last_layout(layout: &Layout, dt: DType, op: ArgOp) -> PyResult<Layo
                 content: Box::new(argreduce_last_layout(lo.content.as_ref(), dt, op)?),
             })),
         },
-        _ => Err(PyValueError::new_err("argreduce_last_layout requires list-chains only.")),
+        Layout::UnionScalarList(u) => {
+            let list_content = argreduce_last_layout(u.lists.content.as_ref(), dt, op)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars: u.scalars.clone(),
+                lists: ListOffset {
+                    offsets: u.lists.offsets.clone(),
+                    content: Box::new(list_content),
+                },
+            }))
+        }
+        Layout::OffsetView(v) => {
+            let content = argreduce_last_layout(v.content.as_ref(), dt, op)?;
+            Ok(Layout::OffsetView(crate::layout::OffsetView {
+                offsets: v.offsets.clone(),
+                start: v.start,
+                stop: v.stop,
+                content: Box::new(content),
+            }))
+        }
+        Layout::Indexed(ix) => {
+            let content = argreduce_last_layout(ix.content.as_ref(), dt, op)?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ix.index.clone(),
+                content: Box::new(content),
+            }))
+        }
     }
 }
 
@@ -704,8 +904,8 @@ pub fn nonzero(_py: Python<'_>, x: &GrumpyArray) -> PyResult<GrumpyArray> {
 }
 
 pub fn search_sorted(_py: Python<'_>, x: &GrumpyArray, v: &GrumpyArray, right: bool) -> PyResult<GrumpyArray> {
-    let xl = leaf_1d(&x.layout)?;
-    let vl = leaf_1d(&v.layout)?;
+    let xl = array_as_leaf_1d(x)?;
+    let vl = array_as_leaf_1d(v)?;
     if xl.has_nulls || vl.has_nulls {
         return Err(PyValueError::new_err("search_sorted does not support nulls yet."));
     }
@@ -773,7 +973,7 @@ pub fn search_sorted(_py: Python<'_>, x: &GrumpyArray, v: &GrumpyArray, right: b
 }
 
 pub fn partition(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<GrumpyArray> {
-    let leaf = leaf_1d(&x.layout)?;
+    let leaf = array_as_leaf_1d(x)?;
     if leaf.has_nulls {
         return Err(PyValueError::new_err("partition does not support nulls yet."));
     }
@@ -835,7 +1035,10 @@ pub fn partition(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<Grump
 
 pub fn partition_dim1(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<GrumpyArray> {
     if x.layout.has_union() {
-        return Err(PyValueError::new_err("partition(dim=1) on union layouts not implemented."));
+        return Ok(GrumpyArray {
+            dtype: x.dtype,
+            layout: partition_last_layout(&x.layout, x.dtype, kth)?,
+        });
     }
     let (lo, leaf) = listoffset_leaf2d(&x.layout)?;
     if leaf.has_nulls {
@@ -912,7 +1115,7 @@ pub fn partition_dim1(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<
 }
 
 pub fn argpartition(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<GrumpyArray> {
-    let leaf = leaf_1d(&x.layout)?;
+    let leaf = array_as_leaf_1d(x)?;
     if leaf.has_nulls {
         return Err(PyValueError::new_err("argpartition does not support nulls yet."));
     }
@@ -960,7 +1163,10 @@ pub fn argpartition(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<Gr
 
 pub fn argpartition_dim1(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<GrumpyArray> {
     if x.layout.has_union() {
-        return Err(PyValueError::new_err("argpartition(dim=1) on union layouts not implemented."));
+        return Ok(GrumpyArray {
+            dtype: DType::Int64,
+            layout: argpartition_last_layout(&x.layout, x.dtype, kth)?,
+        });
     }
     let (lo, leaf) = listoffset_leaf2d(&x.layout)?;
     if leaf.has_nulls {
@@ -1012,6 +1218,100 @@ pub fn argpartition_dim1(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResu
         dtype: DType::Int64,
         layout: Layout::ListOffset(ListOffset { offsets: lo.offsets.clone(), content: Box::new(Layout::Leaf(new_leaf_i64_from(outv))) }),
     })
+}
+
+fn partition_last_layout(layout: &Layout, dt: DType, kth: usize) -> PyResult<Layout> {
+    match layout {
+        Layout::Leaf(_) => Err(PyValueError::new_err("Internal error: partition_last_layout expected list.")),
+        Layout::ListOffset(lo) => match lo.content.as_ref() {
+            Layout::Leaf(_) => {
+                let tmp = GrumpyArray {
+                    dtype: dt,
+                    layout: layout.clone(),
+                };
+                Ok(Python::with_gil(|py| partition_dim1(py, &tmp, kth))?.layout)
+            }
+            _ => Ok(Layout::ListOffset(ListOffset {
+                offsets: lo.offsets.clone(),
+                content: Box::new(partition_last_layout(lo.content.as_ref(), dt, kth)?),
+            })),
+        },
+        Layout::UnionScalarList(u) => {
+            let list_content = partition_last_layout(u.lists.content.as_ref(), dt, kth)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars: u.scalars.clone(),
+                lists: ListOffset {
+                    offsets: u.lists.offsets.clone(),
+                    content: Box::new(list_content),
+                },
+            }))
+        }
+        Layout::OffsetView(v) => {
+            let content = partition_last_layout(v.content.as_ref(), dt, kth)?;
+            Ok(Layout::OffsetView(crate::layout::OffsetView {
+                offsets: v.offsets.clone(),
+                start: v.start,
+                stop: v.stop,
+                content: Box::new(content),
+            }))
+        }
+        Layout::Indexed(ix) => {
+            let content = partition_last_layout(ix.content.as_ref(), dt, kth)?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ix.index.clone(),
+                content: Box::new(content),
+            }))
+        }
+    }
+}
+
+fn argpartition_last_layout(layout: &Layout, dt: DType, kth: usize) -> PyResult<Layout> {
+    match layout {
+        Layout::Leaf(_) => Err(PyValueError::new_err("Internal error: argpartition_last_layout expected list.")),
+        Layout::ListOffset(lo) => match lo.content.as_ref() {
+            Layout::Leaf(_) => {
+                let tmp = GrumpyArray {
+                    dtype: dt,
+                    layout: layout.clone(),
+                };
+                Ok(Python::with_gil(|py| argpartition_dim1(py, &tmp, kth))?.layout)
+            }
+            _ => Ok(Layout::ListOffset(ListOffset {
+                offsets: lo.offsets.clone(),
+                content: Box::new(argpartition_last_layout(lo.content.as_ref(), dt, kth)?),
+            })),
+        },
+        Layout::UnionScalarList(u) => {
+            let list_content = argpartition_last_layout(u.lists.content.as_ref(), dt, kth)?;
+            Ok(Layout::UnionScalarList(UnionScalarList {
+                tags: u.tags.clone(),
+                index: u.index.clone(),
+                scalars: u.scalars.clone(),
+                lists: ListOffset {
+                    offsets: u.lists.offsets.clone(),
+                    content: Box::new(list_content),
+                },
+            }))
+        }
+        Layout::OffsetView(v) => {
+            let content = argpartition_last_layout(v.content.as_ref(), dt, kth)?;
+            Ok(Layout::OffsetView(crate::layout::OffsetView {
+                offsets: v.offsets.clone(),
+                start: v.start,
+                stop: v.stop,
+                content: Box::new(content),
+            }))
+        }
+        Layout::Indexed(ix) => {
+            let content = argpartition_last_layout(ix.content.as_ref(), dt, kth)?;
+            Ok(Layout::Indexed(crate::layout::Indexed {
+                index: ix.index.clone(),
+                content: Box::new(content),
+            }))
+        }
+    }
 }
 
 // -------- leaf helpers --------
