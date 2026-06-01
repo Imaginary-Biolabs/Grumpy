@@ -1,0 +1,22 @@
+# Codecov configuration for Grumpy (Rust core + thin Python bindings).
+# pytest --cov=grumpy only measures python/grumpy/; patch checks must not
+# penalize Rust changes that are absent from coverage.xml.
+
+coverage:
+  status:
+    project:
+      default:
+        target: 95%
+        threshold: 2%
+    patch:
+      default:
+        target: 95%
+        threshold: 5%
+        paths:
+          - "python/"
+          - "tests/"
+
+ignore:
+  - "src/**"
+  - "benchmarks/**"
+  - "**/*.rs"
