@@ -22,6 +22,8 @@ htmlcov/
 # Compiled extension (built by maturin in CI / local dev)
 python/grumpy/_core*.so
 python/grumpy/_core*.pyd
+python/grumpy/*.dylib
+*.dSYM/
 
 # Local benchmark / test dataset artifacts
 *.gr
