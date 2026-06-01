@@ -89,6 +89,7 @@ def test_partial_io_reads_leaf_data(tmp_path):
     assert partial_bytes > 0
 
     gr._core.reset_io_bytes_read()
+    gr._core.clear_path_caches()
     gr._core.load_slice(path, 0, 500)
     full_slice_bytes = gr._core.io_bytes_read()
     assert partial_bytes <= full_slice_bytes * 2
@@ -180,6 +181,36 @@ def test_ddp_len_per_rank(tmp_path):
     gr.save(x, path)
     lens = [len(gr.stream(path, batch_size=4, world_size=3, rank=r)) for r in range(3)]
     assert sum(lens) == len(gr.stream(path, batch_size=4))
+
+
+def test_stream_in_memory_parity(tmp_path):
+    df = _make_protein_like_df(n_scenes=5, mols_per_scene=2)
+    path = str(tmp_path / "df.gr")
+    gr.save(df, path, chunk_size=4)
+    full = gr.load(path)
+    sync = [b.to_dict() for b in gr.stream(path, batch_size=2, in_memory=True)]
+    manual = [full[i : i + 2].to_dict() for i in range(0, len(full), 2)]
+    assert sync == manual
+
+
+def test_shared_offsets_on_save(tmp_path):
+    df = _make_protein_like_df(n_scenes=3, mols_per_scene=2)
+    path = str(tmp_path / "df.gr")
+    gr.save(df, path, chunk_size=8)
+    import json
+    from pathlib import Path
+
+    meta = json.loads((Path(path) / "grumpy.json").read_text())
+    columns = meta["root"]["columns"]
+    offset_paths = set()
+    for col in columns:
+        layout = col["layout"]
+        while "content" in layout:
+            if layout.get("type") == "listoffset":
+                offset_paths.add(layout["offsets"])
+            layout = layout.get("content", {})
+    # molecule and residue level offsets should be shared across columns
+    assert len(offset_paths) <= 4
 
 
 def test_workers_prefetch_yields_same_batches(tmp_path):
@@ -305,6 +336,7 @@ def test_compiled_stream_apply_partial_io(tmp_path):
     assert out[0].to_list()[0] == 0.0
 
     gr._core.reset_io_bytes_read()
+    gr._core.clear_path_caches()
     gr._core.load_slice(path, 0, 100)
     full_bytes = gr._core.io_bytes_read()
     assert partial_bytes > 0

@@ -34,7 +34,7 @@ pub fn build_batch_plan(
         Some(level) => {
             let depth = resolve_batch_on_depth(handle, level)?;
             let layout = layout_meta_for_batch_on(handle, level)?;
-            let counts = io::row_entity_counts_at_depth(&handle.store, layout, depth)?;
+            let counts = io::row_entity_counts_at_depth(&handle.reader(), layout, depth)?;
             build_entity_batches(&counts, batch_size, drop_last)
         }
     };

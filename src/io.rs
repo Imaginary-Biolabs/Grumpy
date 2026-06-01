@@ -1,16 +1,18 @@
 use crate::dataframe::{GrumpyDataFrame, Schema};
 use crate::dtype::DType;
 use crate::error::{arg_invalid, index_out_of_bounds, internal, internal_dtype_buffer_mismatch, invalid_slice_range, io_failed, io_wrong_type, schema_violation, unsupported};
-use crate::layout::{concat_layout_segments, remap_union_pick, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, OffsetView, UnionScalarList};
+use crate::io_cache::{IoCache, IoReader};
+use crate::layout::{concat_layout_segments, remap_union_pick, take_range, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, OffsetView, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use zarrs::array_subset::ArraySubset;
+use std::sync::{LazyLock, Mutex};
 use zarrs::array::{Array, ArrayBuilder, DataType, ElementOwned, FillValue};
 use zarrs::array::chunk_grid::ChunkGrid;
 use zarrs::storage::ReadableWritableListableStorage;
@@ -27,41 +29,106 @@ pub fn reset_io_bytes_read() {
     IO_BYTES_READ.store(0, Ordering::Relaxed);
 }
 
-fn record_io_bytes(n: usize) {
+pub(crate) fn record_io_bytes(n: usize) {
     IO_BYTES_READ.fetch_add(n, Ordering::Relaxed);
 }
 
 const META_FILE: &str = "grumpy.json";
 const FORMAT_VERSION: u32 = 1;
 
+static PATH_IO_CACHES: LazyLock<Mutex<HashMap<String, Arc<IoCache>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static PATH_RESIDENT: LazyLock<Mutex<HashMap<String, Arc<ResidentDataset>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn path_io_cache(path: &str) -> Arc<IoCache> {
+    let mut caches = PATH_IO_CACHES.lock().unwrap();
+    if let Some(c) = caches.get(path) {
+        return Arc::clone(c);
+    }
+    let c = Arc::new(IoCache::default());
+    caches.insert(path.to_string(), Arc::clone(&c));
+    c
+}
+
+fn path_resident(
+    path: &str,
+    store: &ReadableWritableListableStorage,
+    cache: &IoCache,
+    meta: &FileMeta,
+) -> PyResult<Arc<ResidentDataset>> {
+    let mut residents = PATH_RESIDENT.lock().unwrap();
+    if let Some(r) = residents.get(path) {
+        return Ok(Arc::clone(r));
+    }
+    let r = Arc::new(load_resident(store, cache, meta)?);
+    residents.insert(path.to_string(), Arc::clone(&r));
+    Ok(r)
+}
+
+/// Clear path-persistent I/O and resident caches (for tests).
+pub fn clear_path_caches() {
+    PATH_IO_CACHES.lock().unwrap().clear();
+    PATH_RESIDENT.lock().unwrap().clear();
+}
+
+#[derive(Clone)]
+pub enum ResidentDataset {
+    Array(GrumpyArray),
+    DataFrame(GrumpyDataFrame),
+}
+
 #[derive(Clone)]
 pub struct DatasetHandle {
     pub path: String,
     pub store: ReadableWritableListableStorage,
     pub meta: FileMeta,
+    pub cache: Arc<IoCache>,
+    pub resident: Option<Arc<ResidentDataset>>,
 }
 
 impl DatasetHandle {
     pub fn open(path: &str) -> PyResult<Self> {
+        Self::open_with_mode(path, false)
+    }
+
+    pub fn open_with_mode(path: &str, in_memory: bool) -> PyResult<Self> {
         let meta = read_meta(path)?;
         let store = store_fs(path)?;
+        let cache = path_io_cache(path);
+        let resident = if in_memory {
+            Some(path_resident(path, &store, cache.as_ref(), &meta)?)
+        } else {
+            None
+        };
         Ok(Self {
             path: path.to_string(),
             store,
             meta,
+            cache,
+            resident,
         })
     }
 
+    pub fn reader(&self) -> IoReader<'_> {
+        IoReader {
+            store: &self.store,
+            cache: &self.cache,
+        }
+    }
+
     pub fn axis0_len(&self) -> PyResult<usize> {
+        let io = self.reader();
         match &self.meta.root {
-            RootMeta::Array { layout, .. } => axis0_len_from_layout_meta(&self.store, layout),
+            RootMeta::Array { layout, .. } => axis0_len_from_layout_meta(&io, layout),
             RootMeta::DataFrame { columns, .. } => {
                 if columns.is_empty() {
                     return Ok(0);
                 }
                 let mut n = 0usize;
                 for c in columns {
-                    n = n.max(axis0_len_from_layout_meta(&self.store, &c.layout)?);
+                    n = n.max(axis0_len_from_layout_meta(&io, &c.layout)?);
                 }
                 Ok(n)
             }
@@ -196,6 +263,8 @@ struct SaveCtx {
     chunk_size: usize,
     /// When set, only leaf/offset buffers at this list depth use ``chunk_size``; others use one chunk.
     chunk_dim_depth: Option<usize>,
+    /// Dedup identical offset buffers (shared canonical offsets for dataframes).
+    offset_dedup: std::collections::HashMap<Vec<i64>, String>,
 }
 
 impl SaveCtx {
@@ -225,6 +294,7 @@ pub fn save_array(
         next: 0,
         chunk_size: chunk_size.max(1),
         chunk_dim_depth: chunk_dim,
+        offset_dedup: std::collections::HashMap::new(),
     };
     let layout = save_layout(&store, &mut ctx, arr.dtype, &arr.layout, 0)?;
     let meta = FileMeta {
@@ -244,8 +314,13 @@ pub fn load_array(py: Python<'_>, path: &str) -> PyResult<GrumpyArray> {
     match meta.root {
         RootMeta::Array { dtype, layout } => {
             let store = store_fs(path)?;
+            let cache = IoCache::default();
+            let io = IoReader {
+                store: &store,
+                cache: &cache,
+            };
             let dt: DType = dtype.into();
-            let layout = load_layout(&store, dt, &layout)?;
+            let layout = load_layout(&io, dt, &layout)?;
             Ok(GrumpyArray { dtype: dt, layout })
         }
         _ => Err(io_wrong_type("array", path)),
@@ -268,6 +343,7 @@ pub fn save_dataframe(
         next: 0,
         chunk_size: chunk_size.max(1),
         chunk_dim_depth: chunk_dim,
+        offset_dedup: std::collections::HashMap::new(),
     };
     let mut columns: Vec<ColumnMeta> = Vec::new();
     for (name, col) in df.names.iter().zip(df.cols.iter()) {
@@ -296,11 +372,16 @@ pub fn load_dataframe(py: Python<'_>, path: &str) -> PyResult<GrumpyDataFrame> {
     match meta.root {
         RootMeta::DataFrame { schema, columns } => {
             let store = store_fs(path)?;
+            let cache = IoCache::default();
+            let io = IoReader {
+                store: &store,
+                cache: &cache,
+            };
             let mut names: Vec<String> = Vec::new();
             let mut cols: Vec<GrumpyArray> = Vec::new();
             for c in columns {
                 let dt: DType = c.dtype.into();
-                let layout = load_layout(&store, dt, &c.layout)?;
+                let layout = load_layout(&io, dt, &c.layout)?;
                 names.push(c.name);
                 cols.push(GrumpyArray { dtype: dt, layout });
             }
@@ -323,42 +404,89 @@ pub fn load_dataframe(py: Python<'_>, path: &str) -> PyResult<GrumpyDataFrame> {
     }
 }
 
+fn load_resident(
+    store: &ReadableWritableListableStorage,
+    cache: &IoCache,
+    meta: &FileMeta,
+) -> PyResult<ResidentDataset> {
+    let io = IoReader { store, cache };
+    match &meta.root {
+        RootMeta::Array { dtype, layout } => {
+            let dt: DType = dtype.clone().into();
+            Ok(ResidentDataset::Array(GrumpyArray {
+                dtype: dt,
+                layout: load_layout(&io, dt, layout)?,
+            }))
+        }
+        RootMeta::DataFrame { schema, columns } => {
+            let mut names: Vec<String> = Vec::new();
+            let mut cols: Vec<GrumpyArray> = Vec::new();
+            for c in columns {
+                let dt: DType = c.dtype.clone().into();
+                let layout = load_layout(&io, dt, &c.layout)?;
+                names.push(c.name.clone());
+                cols.push(GrumpyArray { dtype: dt, layout });
+            }
+            let schema = match schema {
+                None => None,
+                Some(levels) => {
+                    let mut name_to_level = std::collections::HashMap::new();
+                    for (lvl, names) in levels.iter().enumerate() {
+                        for n in names {
+                            name_to_level.insert(n.clone(), lvl);
+                        }
+                    }
+                    Some(Schema {
+                        levels: levels.clone(),
+                        name_to_level,
+                    })
+                }
+            };
+            Ok(ResidentDataset::DataFrame(GrumpyDataFrame::new(
+                names, cols, schema,
+            )?))
+        }
+    }
+}
+
 /// Return axis-0 length from on-disk metadata and offset buffers without loading leaf data.
 pub fn stored_axis0_len(path: &str) -> PyResult<usize> {
     let meta = read_meta(path)?;
     let store = store_fs(path)?;
+    let cache = IoCache::default();
+    let io = IoReader {
+        store: &store,
+        cache: &cache,
+    };
     match meta.root {
-        RootMeta::Array { layout, .. } => axis0_len_from_layout_meta(&store, &layout),
+        RootMeta::Array { layout, .. } => axis0_len_from_layout_meta(&io, &layout),
         RootMeta::DataFrame { columns, .. } => {
             if columns.is_empty() {
                 return Ok(0);
             }
             let mut n = 0usize;
             for c in &columns {
-                n = n.max(axis0_len_from_layout_meta(&store, &c.layout)?);
+                n = n.max(axis0_len_from_layout_meta(&io, &c.layout)?);
             }
             Ok(n)
         }
     }
 }
 
-fn axis0_len_from_layout_meta(
-    store: &ReadableWritableListableStorage,
-    meta: &LayoutMeta,
-) -> PyResult<usize> {
+fn axis0_len_from_layout_meta(io: &IoReader<'_>, meta: &LayoutMeta) -> PyResult<usize> {
     match meta {
         LayoutMeta::ListOffset { offsets, .. } => {
-            let offs = read_vec::<i64>(store, offsets)?;
+            let offs = io.cache.read_i64(io.store, offsets)?;
             Ok(offs.len().saturating_sub(1))
         }
         LayoutMeta::OffsetView { start, stop, .. } => Ok(stop.saturating_sub(*start)),
         LayoutMeta::Indexed { index, .. } => {
-            let idx = read_vec::<i64>(store, index)?;
+            let idx = io.cache.read_i64(io.store, index)?;
             Ok(idx.len())
         }
         LayoutMeta::Leaf { len, .. } => Ok(*len),
         LayoutMeta::UnionScalarList { tags, .. } => {
-            let tags = read_vec::<u8>(store, tags)?;
+            let tags = io.cache.read_u8(io.store, tags)?;
             Ok(tags.len())
         }
     }
@@ -374,7 +502,7 @@ fn save_layout(
     match layout {
         Layout::Leaf(leaf) => save_leaf(store, ctx, dt, leaf, depth),
         Layout::ListOffset(lo) => {
-            let offsets = write_vec_i64(store, ctx, "offsets", lo.offsets.as_slice(), depth)?;
+            let offsets = write_offsets_dedup(store, ctx, lo.offsets.as_slice(), depth)?;
             let content = save_layout(store, ctx, dt, lo.content.as_ref(), depth + 1)?;
             Ok(LayoutMeta::ListOffset {
                 offsets,
@@ -382,7 +510,7 @@ fn save_layout(
             })
         }
         Layout::OffsetView(v) => {
-            let offsets = write_vec_i64(store, ctx, "offsets", v.offsets.as_slice(), depth)?;
+            let offsets = write_offsets_dedup(store, ctx, v.offsets.as_slice(), depth)?;
             let content = save_layout(store, ctx, dt, v.content.as_ref(), depth)?;
             Ok(LayoutMeta::OffsetView {
                 offsets,
@@ -453,10 +581,25 @@ fn save_leaf(
     Ok(LayoutMeta::Leaf { len, values, validity })
 }
 
-fn load_layout(store: &ReadableWritableListableStorage, dt: DType, meta: &LayoutMeta) -> PyResult<Layout> {
+fn write_offsets_dedup(
+    store: &ReadableWritableListableStorage,
+    ctx: &mut SaveCtx,
+    data: &[i64],
+    depth: usize,
+) -> PyResult<String> {
+    let key = data.to_vec();
+    if let Some(path) = ctx.offset_dedup.get(&key) {
+        return Ok(path.clone());
+    }
+    let path = write_vec_i64(store, ctx, "offsets", data, depth)?;
+    ctx.offset_dedup.insert(key, path.clone());
+    Ok(path)
+}
+
+fn load_layout(io: &IoReader<'_>, dt: DType, meta: &LayoutMeta) -> PyResult<Layout> {
     match meta {
         LayoutMeta::Leaf { len, values, validity } => {
-            let valid = read_vec_bool(store, validity)?;
+            let valid = io.cache.read_bool(io.store, validity)?;
             if valid.len() != *len {
                 return Err(internal("load_layout_take_range", "validity length mismatch in file"));
             }
@@ -465,49 +608,49 @@ fn load_layout(store: &ReadableWritableListableStorage, dt: DType, meta: &Layout
             leaf.has_nulls = valid.iter().any(|b| !*b);
             leaf.validity = Arc::new(bitvec::vec::BitVec::<u8, bitvec::order::Lsb0>::from_iter(valid.iter().copied()));
             leaf.buffer = match dt {
-                DType::Int8 => LeafBuffer::I8(Arc::new(read_vec::<i8>(store, values)?)),
-                DType::Int16 => LeafBuffer::I16(Arc::new(read_vec::<i16>(store, values)?)),
-                DType::Int32 => LeafBuffer::I32(Arc::new(read_vec::<i32>(store, values)?)),
-                DType::Int64 => LeafBuffer::I64(Arc::new(read_vec::<i64>(store, values)?)),
-                DType::UInt8 => LeafBuffer::U8(Arc::new(read_vec::<u8>(store, values)?)),
-                DType::UInt16 => LeafBuffer::U16(Arc::new(read_vec::<u16>(store, values)?)),
-                DType::UInt32 => LeafBuffer::U32(Arc::new(read_vec::<u32>(store, values)?)),
-                DType::UInt64 => LeafBuffer::U64(Arc::new(read_vec::<u64>(store, values)?)),
-                DType::Float16 => LeafBuffer::F16(Arc::new(read_vec::<u16>(store, values)?)),
-                DType::Float32 => LeafBuffer::F32(Arc::new(read_vec::<f32>(store, values)?)),
-                DType::Float64 => LeafBuffer::F64(Arc::new(read_vec::<f64>(store, values)?)),
+                DType::Int8 => LeafBuffer::I8(io.cache.read_i8_arc(io.store, values)?),
+                DType::Int16 => LeafBuffer::I16(io.cache.read_i16_arc(io.store, values)?),
+                DType::Int32 => LeafBuffer::I32(io.cache.read_i32_arc(io.store, values)?),
+                DType::Int64 => LeafBuffer::I64(io.cache.read_i64_arc(io.store, values)?),
+                DType::UInt8 => LeafBuffer::U8(io.cache.read_u8_arc(io.store, values)?),
+                DType::UInt16 => LeafBuffer::U16(io.cache.read_u16_arc(io.store, values)?),
+                DType::UInt32 => LeafBuffer::U32(io.cache.read_u32_arc(io.store, values)?),
+                DType::UInt64 => LeafBuffer::U64(io.cache.read_u64_arc(io.store, values)?),
+                DType::Float16 => LeafBuffer::F16(io.cache.read_u16_arc(io.store, values)?),
+                DType::Float32 => LeafBuffer::F32(io.cache.read_f32_arc(io.store, values)?),
+                DType::Float64 => LeafBuffer::F64(io.cache.read_f64_arc(io.store, values)?),
                 DType::Bool => {
-                    let b = read_vec::<bool>(store, values)?;
+                    let b = io.cache.read_bool(io.store, values)?;
                     LeafBuffer::Bool(Arc::new(b.into_iter().map(|x| if x { 1 } else { 0 }).collect()))
                 }
-                DType::Char => LeafBuffer::Char(Arc::new(read_vec::<u32>(store, values)?)),
-                DType::String => LeafBuffer::String(Arc::new(read_vec::<String>(store, values)?)),
+                DType::Char => LeafBuffer::Char(io.cache.read_u32_arc(io.store, values)?),
+                DType::String => LeafBuffer::String(io.cache.read_string_arc(io.store, values)?),
             };
             Ok(Layout::Leaf(leaf))
         }
         LayoutMeta::ListOffset { offsets, content } => {
-            let offs = read_vec::<i64>(store, offsets)?;
-            let content = load_layout(store, dt, content)?;
-            Ok(Layout::ListOffset(ListOffset { offsets: Arc::new(offs), content: Box::new(content) }))
+            let offs = io.cache.read_i64_arc(io.store, offsets)?;
+            let content = load_layout(io, dt, content)?;
+            Ok(Layout::ListOffset(ListOffset { offsets: offs, content: Box::new(content) }))
         }
         LayoutMeta::OffsetView { offsets, start, stop, content } => {
-            let offs = read_vec::<i64>(store, offsets)?;
-            let content = load_layout(store, dt, content)?;
-            Ok(Layout::OffsetView(OffsetView { offsets: Arc::new(offs), start: *start, stop: *stop, content: Box::new(content) }))
+            let offs = io.cache.read_i64_arc(io.store, offsets)?;
+            let content = load_layout(io, dt, content)?;
+            Ok(Layout::OffsetView(OffsetView { offsets: offs, start: *start, stop: *stop, content: Box::new(content) }))
         }
         LayoutMeta::Indexed { index, content } => {
-            let idx = read_vec::<i64>(store, index)?;
-            let content = load_layout(store, dt, content)?;
+            let idx = io.cache.read_i64(io.store, index)?;
+            let content = load_layout(io, dt, content)?;
             Ok(Layout::Indexed(crate::layout::Indexed { index: Arc::new(idx), content: Box::new(content) }))
         }
         LayoutMeta::UnionScalarList { tags, index, scalars, lists } => {
-            let tags = read_vec::<u8>(store, tags)?;
-            let index = read_vec::<i64>(store, index)?;
-            let scal = match load_layout(store, dt, scalars)? {
+            let tags = io.cache.read_u8(io.store, tags)?;
+            let index = io.cache.read_i64(io.store, index)?;
+            let scal = match load_layout(io, dt, scalars)? {
                 Layout::Leaf(l) => l,
                 _ => return Err(internal("load_layout", "invalid union scalars layout in file")),
             };
-            let lists_layout = load_layout(store, dt, lists)?;
+            let lists_layout = load_layout(io, dt, lists)?;
             let lists = match lists_layout {
                 Layout::ListOffset(lo) => lo,
                 _ => return Err(internal("load_layout", "invalid union lists layout in file")),
@@ -632,36 +775,9 @@ fn write_vec_string(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, 
     write_1d(store, ctx, prefix, DataType::String, FillValue::from(""), data, depth)
 }
 
-fn read_vec<T: ElementOwned>(store: &ReadableWritableListableStorage, path: &str) -> PyResult<Vec<T>> {
-    let arr = Array::open(store.clone(), path).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
-    let subset = arr.subset_all();
-    arr.retrieve_array_subset_elements::<T>(&subset)
-        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))
-}
-
-fn read_vec_bool(store: &ReadableWritableListableStorage, path: &str) -> PyResult<Vec<bool>> {
-    read_vec::<bool>(store, path)
-}
-
 fn array_axis0_len(store: &ReadableWritableListableStorage, tags_path: &str) -> PyResult<usize> {
     let arr = Array::open(store.clone(), tags_path).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     Ok(arr.shape()[0] as usize)
-}
-
-fn read_vec_range<T: ElementOwned>(
-    store: &ReadableWritableListableStorage,
-    path: &str,
-    start: usize,
-    stop: usize,
-) -> PyResult<Vec<T>> {
-    if start >= stop {
-        return Ok(Vec::new());
-    }
-    let arr = Array::open(store.clone(), path).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
-    let subset = ArraySubset::new_with_ranges(&[start as u64..stop as u64]);
-    record_io_bytes((stop - start) * std::mem::size_of::<T>());
-    arr.retrieve_array_subset_elements::<T>(&subset)
-        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))
 }
 
 /// Load an array batch covering axis-0 ``[start, stop)`` without reading unrelated leaf data.
@@ -670,10 +786,17 @@ pub fn load_array_axis0_slice(
     start: usize,
     stop: usize,
 ) -> PyResult<GrumpyArray> {
+    if let Some(ResidentDataset::Array(arr)) = handle.resident.as_deref() {
+        let dt = arr.dtype;
+        return Ok(GrumpyArray {
+            dtype: dt,
+            layout: take_range(&arr.layout, start, stop)?,
+        });
+    }
     match &handle.meta.root {
         RootMeta::Array { dtype, layout } => {
             let dt: DType = dtype.clone().into();
-            let layout = load_layout_axis0_slice(&handle.store, dt, layout, start, stop)?;
+            let layout = load_layout_axis0_slice(handle, dt, layout, start, stop)?;
             Ok(GrumpyArray { dtype: dt, layout })
         }
         _ => Err(io_wrong_type("array", &handle.path)),
@@ -686,13 +809,23 @@ pub fn load_dataframe_axis0_slice(
     start: usize,
     stop: usize,
 ) -> PyResult<GrumpyDataFrame> {
+    if let Some(ResidentDataset::DataFrame(df)) = handle.resident.as_deref() {
+        let mut cols: Vec<GrumpyArray> = Vec::with_capacity(df.cols.len());
+        for c in &df.cols {
+            cols.push(GrumpyArray {
+                dtype: c.dtype,
+                layout: take_range(&c.layout, start, stop)?,
+            });
+        }
+        return GrumpyDataFrame::new(df.names.clone(), cols, df.schema.clone());
+    }
     match &handle.meta.root {
         RootMeta::DataFrame { schema, columns } => {
             let mut names: Vec<String> = Vec::new();
             let mut cols: Vec<GrumpyArray> = Vec::new();
             for c in columns {
                 let dt: DType = c.dtype.clone().into();
-                let layout = load_layout_axis0_slice(&handle.store, dt, &c.layout, start, stop)?;
+                let layout = load_layout_axis0_slice(handle, dt, &c.layout, start, stop)?;
                 names.push(c.name.clone());
                 cols.push(GrumpyArray { dtype: dt, layout });
             }
@@ -715,18 +848,18 @@ pub fn load_dataframe_axis0_slice(
 }
 
 fn load_layout_axis0_slice(
-    store: &ReadableWritableListableStorage,
+    handle: &DatasetHandle,
     dt: DType,
     meta: &LayoutMeta,
     start: usize,
     stop: usize,
 ) -> PyResult<Layout> {
-    load_layout_take_range(store, dt, meta, start, stop)
+    load_layout_take_range(&handle.reader(), dt, meta, start, stop)
 }
 
 /// Disk-backed analogue of in-memory ``take_range`` (partial leaf reads only).
 fn load_layout_take_range(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     dt: DType,
     meta: &LayoutMeta,
     start: usize,
@@ -740,7 +873,7 @@ fn load_layout_take_range(
             if end > *len {
                 return Err(index_out_of_bounds(end, *len, "on leaf slice in file"));
             }
-            let valid = read_vec_range::<bool>(store, validity, start, end)?;
+            let valid = io.cache.read_bool_range(io.store, validity, start, end)?;
             let new_len = end - start;
             if valid.len() != new_len {
                 return Err(internal("load_layout_take_range", "validity length mismatch in file"));
@@ -752,28 +885,28 @@ fn load_layout_take_range(
                 valid.iter().copied(),
             ));
             leaf.buffer = match dt {
-                DType::Int8 => LeafBuffer::I8(Arc::new(read_vec_range::<i8>(store, values, start, end)?)),
-                DType::Int16 => LeafBuffer::I16(Arc::new(read_vec_range::<i16>(store, values, start, end)?)),
-                DType::Int32 => LeafBuffer::I32(Arc::new(read_vec_range::<i32>(store, values, start, end)?)),
-                DType::Int64 => LeafBuffer::I64(Arc::new(read_vec_range::<i64>(store, values, start, end)?)),
-                DType::UInt8 => LeafBuffer::U8(Arc::new(read_vec_range::<u8>(store, values, start, end)?)),
-                DType::UInt16 => LeafBuffer::U16(Arc::new(read_vec_range::<u16>(store, values, start, end)?)),
-                DType::UInt32 => LeafBuffer::U32(Arc::new(read_vec_range::<u32>(store, values, start, end)?)),
-                DType::UInt64 => LeafBuffer::U64(Arc::new(read_vec_range::<u64>(store, values, start, end)?)),
-                DType::Float16 => LeafBuffer::F16(Arc::new(read_vec_range::<u16>(store, values, start, end)?)),
-                DType::Float32 => LeafBuffer::F32(Arc::new(read_vec_range::<f32>(store, values, start, end)?)),
-                DType::Float64 => LeafBuffer::F64(Arc::new(read_vec_range::<f64>(store, values, start, end)?)),
+                DType::Int8 => LeafBuffer::I8(Arc::new(io.cache.read_i8_range(io.store, values, start, end)?)),
+                DType::Int16 => LeafBuffer::I16(Arc::new(io.cache.read_i16_range(io.store, values, start, end)?)),
+                DType::Int32 => LeafBuffer::I32(Arc::new(io.cache.read_i32_range(io.store, values, start, end)?)),
+                DType::Int64 => LeafBuffer::I64(Arc::new(io.cache.read_i64_range(io.store, values, start, end)?)),
+                DType::UInt8 => LeafBuffer::U8(Arc::new(io.cache.read_u8_range(io.store, values, start, end)?)),
+                DType::UInt16 => LeafBuffer::U16(Arc::new(io.cache.read_u16_range(io.store, values, start, end)?)),
+                DType::UInt32 => LeafBuffer::U32(Arc::new(io.cache.read_u32_range(io.store, values, start, end)?)),
+                DType::UInt64 => LeafBuffer::U64(Arc::new(io.cache.read_u64_range(io.store, values, start, end)?)),
+                DType::Float16 => LeafBuffer::F16(Arc::new(io.cache.read_u16_range(io.store, values, start, end)?)),
+                DType::Float32 => LeafBuffer::F32(Arc::new(io.cache.read_f32_range(io.store, values, start, end)?)),
+                DType::Float64 => LeafBuffer::F64(Arc::new(io.cache.read_f64_range(io.store, values, start, end)?)),
                 DType::Bool => {
-                    let b = read_vec_range::<bool>(store, values, start, end)?;
+                    let b = io.cache.read_bool_range(io.store, values, start, end)?;
                     LeafBuffer::Bool(Arc::new(b.into_iter().map(|x| if x { 1 } else { 0 }).collect()))
                 }
-                DType::Char => LeafBuffer::Char(Arc::new(read_vec_range::<u32>(store, values, start, end)?)),
-                DType::String => LeafBuffer::String(Arc::new(read_vec_range::<String>(store, values, start, end)?)),
+                DType::Char => LeafBuffer::Char(Arc::new(io.cache.read_u32_range(io.store, values, start, end)?)),
+                DType::String => LeafBuffer::String(Arc::new(io.cache.read_string_range(io.store, values, start, end)?)),
             };
             Ok(Layout::Leaf(leaf))
         }
         LayoutMeta::ListOffset { offsets, content } => {
-            let offs = read_vec::<i64>(store, offsets)?;
+            let offs = io.cache.read_i64_arc(io.store, offsets)?;
             if end > offs.len().saturating_sub(1) {
                 return Err(index_out_of_bounds(end, offs.len().saturating_sub(1), "on list slice in file"));
             }
@@ -786,7 +919,7 @@ fn load_layout_take_range(
                 acc += offs[i + 1] - offs[i];
                 new_offs.push(acc);
             }
-            let inner = load_layout_take_range(store, dt, content, child_start, child_end)?;
+            let inner = load_layout_take_range(io, dt, content, child_start, child_end)?;
             Ok(Layout::ListOffset(ListOffset {
                 offsets: Arc::new(new_offs),
                 content: Box::new(inner),
@@ -803,12 +936,12 @@ fn load_layout_take_range(
             if abs_end > *base_stop {
                 return Err(index_out_of_bounds(end, *base_stop - base, "on list slice in file"));
             }
-            let offs = read_vec::<i64>(store, offsets)?;
+            let offs = io.cache.read_i64_arc(io.store, offsets)?;
             let child_start = offs[abs_start] as usize;
             let child_end = offs[abs_end] as usize;
-            let inner = load_layout_take_range(store, dt, content, child_start, child_end)?;
+            let inner = load_layout_take_range(io, dt, content, child_start, child_end)?;
             Ok(Layout::OffsetView(OffsetView {
-                offsets: Arc::new(offs),
+                offsets: offs,
                 start: abs_start,
                 stop: abs_end,
                 content: Box::new(inner),
@@ -825,7 +958,7 @@ fn load_layout_take_range(
             scalars,
             lists,
         } => load_union_scalar_list_take_range(
-            store,
+            io,
             dt,
             tags,
             index,
@@ -838,7 +971,7 @@ fn load_layout_take_range(
 }
 
 fn load_union_scalar_list_take_range(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     dt: DType,
     tags_path: &str,
     index_path: &str,
@@ -847,18 +980,18 @@ fn load_union_scalar_list_take_range(
     start: usize,
     end: usize,
 ) -> PyResult<Layout> {
-    let n = array_axis0_len(store, tags_path)?;
+    let n = array_axis0_len(io.store, tags_path)?;
     if end > n {
         return Err(index_out_of_bounds(end, n, "on union slice in file"));
     }
-    let slice_tags = read_vec_range::<u8>(store, tags_path, start, end)?;
-    let slice_index = read_vec_range::<i64>(store, index_path, start, end)?;
+    let slice_tags = io.cache.read_u8_range(io.store, tags_path, start, end)?;
+    let slice_index = io.cache.read_i64_range(io.store, index_path, start, end)?;
     let (new_index, scalar_src, list_src) = remap_union_pick(&slice_tags, &slice_index)?;
 
     let scalars = if scalar_src.is_empty() {
         Leaf::new(dt)
     } else {
-        load_leaf_indices(store, dt, scalars_meta, &scalar_src)?
+        load_leaf_indices(io, dt, scalars_meta, &scalar_src)?
     };
 
     let lists = if list_src.is_empty() {
@@ -867,7 +1000,7 @@ fn load_union_scalar_list_take_range(
             content: Box::new(Layout::Leaf(Leaf::new(dt))),
         }
     } else {
-        load_union_lists_pick(store, dt, lists_meta, &list_src)?
+        load_union_lists_pick(io, dt, lists_meta, &list_src)?
     };
 
     Ok(Layout::UnionScalarList(UnionScalarList {
@@ -899,7 +1032,7 @@ fn coalesce_index_runs(sorted_unique: &[usize]) -> Vec<(usize, usize)> {
 }
 
 fn load_leaf_indices(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     dt: DType,
     meta: &LayoutMeta,
     indices: &[usize],
@@ -928,7 +1061,7 @@ fn load_leaf_indices(
 
     let mut gathered: Vec<(usize, Leaf)> = Vec::with_capacity(unique.len());
     for (run_start, run_end) in coalesce_index_runs(&unique) {
-        let Layout::Leaf(chunk) = load_layout_take_range(store, dt, meta, run_start, run_end)? else {
+        let Layout::Leaf(chunk) = load_layout_take_range(io, dt, meta, run_start, run_end)? else {
             return Err(internal(
                 "load_union_scalar_list_take_range",
                 "partial leaf read did not return a leaf",
@@ -966,7 +1099,7 @@ fn load_leaf_indices(
 }
 
 fn load_union_lists_pick(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     dt: DType,
     lists_meta: &LayoutMeta,
     list_src: &[usize],
@@ -980,7 +1113,7 @@ fn load_union_lists_pick(
             ))
         }
     };
-    let offs = read_vec::<i64>(store, offsets_path)?;
+    let offs = io.cache.read_i64_arc(io.store, offsets_path)?;
     let mut new_offs = vec![0i64];
     let mut acc = 0i64;
     let mut content_segs: Vec<Layout> = Vec::with_capacity(list_src.len());
@@ -990,7 +1123,7 @@ fn load_union_lists_pick(
         }
         let s = offs[li] as usize;
         let e = offs[li + 1] as usize;
-        let seg = load_layout_take_range(store, dt, content_meta, s, e)?;
+        let seg = load_layout_take_range(io, dt, content_meta, s, e)?;
         acc += (e - s) as i64;
         new_offs.push(acc);
         content_segs.push(seg);
@@ -1008,20 +1141,20 @@ fn load_union_lists_pick(
 
 /// Count entities at ``target_depth`` within each axis-0 row (reads offset buffers only).
 pub fn row_entity_counts_at_depth(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     meta: &LayoutMeta,
     target_depth: usize,
 ) -> PyResult<Vec<usize>> {
-    let n = axis0_len_from_layout_meta(store, meta)?;
+    let n = axis0_len_from_layout_meta(io, meta)?;
     let mut out = Vec::with_capacity(n);
     for row in 0..n {
-        out.push(count_entities_in_axis0_row(store, meta, row, target_depth, 0)?);
+        out.push(count_entities_in_axis0_row(io, meta, row, target_depth, 0)?);
     }
     Ok(out)
 }
 
 fn count_entities_in_axis0_row(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     meta: &LayoutMeta,
     row: usize,
     target_depth: usize,
@@ -1029,14 +1162,14 @@ fn count_entities_in_axis0_row(
 ) -> PyResult<usize> {
     match meta {
         LayoutMeta::ListOffset { offsets, content } => {
-            let offs = read_vec::<i64>(store, offsets)?;
+            let offs = io.cache.read_i64_arc(io.store, offsets)?;
             if row + 1 >= offs.len() {
                 return Err(index_out_of_bounds(row, offs.len().saturating_sub(1), "on dataframe row in file"));
             }
             let leaf_lo = offs[row] as usize;
             let leaf_hi = offs[row + 1] as usize;
             entity_count_in_leaf_range(
-                store,
+                io,
                 content,
                 leaf_lo,
                 leaf_hi,
@@ -1050,7 +1183,7 @@ fn count_entities_in_axis0_row(
             stop: _,
             content,
         } => {
-            let offs = read_vec::<i64>(store, offsets)?;
+            let offs = io.cache.read_i64_arc(io.store, offsets)?;
             let abs_row = start + row;
             if abs_row + 1 >= offs.len() {
                 return Err(index_out_of_bounds(row, offs.len().saturating_sub(1), "on dataframe row in file"));
@@ -1058,7 +1191,7 @@ fn count_entities_in_axis0_row(
             let leaf_lo = offs[abs_row] as usize;
             let leaf_hi = offs[abs_row + 1] as usize;
             entity_count_in_leaf_range(
-                store,
+                io,
                 content,
                 leaf_lo,
                 leaf_hi,
@@ -1077,7 +1210,7 @@ fn count_entities_in_axis0_row(
             scalars: _,
             lists,
         } => count_entities_in_union_axis0_row(
-            store,
+            io,
             tags,
             index,
             lists,
@@ -1094,7 +1227,7 @@ fn count_entities_in_axis0_row(
 }
 
 fn count_entities_in_union_axis0_row(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     tags_path: &str,
     index_path: &str,
     lists: &LayoutMeta,
@@ -1105,8 +1238,8 @@ fn count_entities_in_union_axis0_row(
     if target_depth == current_depth {
         return Ok(1);
     }
-    let all_tags = read_vec::<u8>(store, tags_path)?;
-    let all_index = read_vec::<i64>(store, index_path)?;
+    let all_tags = io.cache.read_u8_arc(io.store, tags_path)?;
+    let all_index = io.cache.read_i64_arc(io.store, index_path)?;
     if row >= all_tags.len() {
         return Err(index_out_of_bounds(row, all_tags.len(), "on dataframe row in file"));
     }
@@ -1120,14 +1253,14 @@ fn count_entities_in_union_axis0_row(
             let list_row = all_index[row] as usize;
             match lists {
                 LayoutMeta::ListOffset { offsets, content } => {
-                    let offs = read_vec::<i64>(store, offsets)?;
+                    let offs = io.cache.read_i64_arc(io.store, offsets)?;
                     if list_row + 1 >= offs.len() {
                         return Ok(0);
                     }
                     let leaf_lo = offs[list_row] as usize;
                     let leaf_hi = offs[list_row + 1] as usize;
                     entity_count_in_leaf_range(
-                        store,
+                        io,
                         content,
                         leaf_lo,
                         leaf_hi,
@@ -1146,7 +1279,7 @@ fn count_entities_in_union_axis0_row(
 }
 
 fn entity_count_in_leaf_range(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     meta: &LayoutMeta,
     leaf_lo: usize,
     leaf_hi: usize,
@@ -1154,11 +1287,11 @@ fn entity_count_in_leaf_range(
     current_depth: usize,
 ) -> PyResult<usize> {
     if current_depth == target_depth {
-        return Ok(entity_count_at_depth(store, meta, leaf_lo, leaf_hi));
+        return Ok(entity_count_at_depth(io, meta, leaf_lo, leaf_hi));
     }
     match meta {
         LayoutMeta::ListOffset { offsets, content } => {
-            let offs = read_vec::<i64>(store, offsets)?;
+            let offs = io.cache.read_i64_arc(io.store, offsets)?;
             let n = offs.len().saturating_sub(1);
             let mut total = 0usize;
             for k in 0..n {
@@ -1171,7 +1304,7 @@ fn entity_count_in_leaf_range(
                 let sub_lo = std::cmp::max(offs[k] as usize, leaf_lo);
                 let sub_hi = std::cmp::min(offs[k + 1] as usize, leaf_hi);
                 total += entity_count_in_leaf_range(
-                    store,
+                    io,
                     content,
                     sub_lo,
                     sub_hi,
@@ -1193,7 +1326,7 @@ fn entity_count_in_leaf_range(
             scalars: _,
             lists,
         } => count_entities_in_union_leaf_range(
-            store,
+            io,
             tags,
             index,
             lists,
@@ -1211,7 +1344,7 @@ fn entity_count_in_leaf_range(
 }
 
 fn count_entities_in_union_leaf_range(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     tags_path: &str,
     index_path: &str,
     lists: &LayoutMeta,
@@ -1223,14 +1356,14 @@ fn count_entities_in_union_leaf_range(
     if target_depth == current_depth {
         return Ok(leaf_hi.saturating_sub(leaf_lo));
     }
-    let all_tags = read_vec::<u8>(store, tags_path)?;
+    let all_tags = io.cache.read_u8_arc(io.store, tags_path)?;
     let mut total = 0usize;
     for row in leaf_lo..leaf_hi {
         if row >= all_tags.len() {
             break;
         }
         total += count_entities_in_union_axis0_row(
-            store,
+            io,
             tags_path,
             index_path,
             lists,
@@ -1243,14 +1376,14 @@ fn count_entities_in_union_leaf_range(
 }
 
 fn entity_count_at_depth(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     meta: &LayoutMeta,
     leaf_lo: usize,
     leaf_hi: usize,
 ) -> usize {
     match meta {
-        LayoutMeta::ListOffset { offsets, .. } => {
-            count_list_elements_in_leaf_range(store, meta, leaf_lo, leaf_hi)
+        LayoutMeta::ListOffset { .. } => {
+            count_list_elements_in_leaf_range(io, meta, leaf_lo, leaf_hi)
         }
         LayoutMeta::Leaf { .. } => leaf_hi.saturating_sub(leaf_lo),
         _ => 0,
@@ -1258,14 +1391,14 @@ fn entity_count_at_depth(
 }
 
 fn count_list_elements_in_leaf_range(
-    store: &ReadableWritableListableStorage,
+    io: &IoReader<'_>,
     meta: &LayoutMeta,
     leaf_lo: usize,
     leaf_hi: usize,
 ) -> usize {
     match meta {
         LayoutMeta::ListOffset { offsets, .. } => {
-            let offs = read_vec::<i64>(store, offsets).unwrap_or_default();
+            let offs = io.cache.read_i64_arc(io.store, offsets).unwrap_or_default();
             let n = offs.len().saturating_sub(1);
             let mut count = 0usize;
             for k in 0..n {

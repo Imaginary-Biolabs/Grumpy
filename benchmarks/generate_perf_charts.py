@@ -19,12 +19,22 @@ OUT_DIR = ROOT / "docs" / "generated" / "performance"
 COLORS = {
     "numpy": "#777067",  # ink-400
     "grumpy": "#4a6b52",  # green-light
+    "grumpy_compiled": "#2d4434",
+    "grumpy_ragged": "#6b8f71",
+    "grumpy_ragged_compiled": "#1a3328",
     "awkward": "#484240",  # ink-600
     "paper": "#faf9f7",
     "plot": "#f5f3ef",
     "grid": "#ddd8ce",
     "text": "#1e1b19",
 }
+
+COMPILE_SERIES = (
+    ("Python stream (cpu=1)", "stream_py_cpu1_ms", "numpy"),
+    ("Compiled (cpu=1)", "stream_compiled_cpu1_ms", "grumpy"),
+    ("Compiled + parallel (cpu=4)", "stream_compiled_cpu4_pysched_ms", "grumpy_compiled"),
+    ("Compiled + Rust sched (cpu=4)", "stream_compiled_cpu4_rust_ms", "grumpy_ragged_compiled"),
+)
 
 REPRESENTATIVE_OPS = [
     "(a * b).sum()",
@@ -89,6 +99,48 @@ def _run_ragged_api_benchmark(*, nrows: int, ncols: int, nfancy: int, warmup: in
     return json_path
 
 
+def _run_compile_benchmark(*, seed: int) -> Path:
+    sys.path.insert(0, str(BENCH_DIR))
+    from benchmark_compile_suite import main as run_compile  # noqa: WPS433
+
+    json_path = OUT_DIR / "compile_suite.json"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    argv = [
+        "--warmup",
+        "0",
+        "--repeats",
+        "1",
+        "--seed",
+        str(seed),
+        "--max-seconds",
+        os.environ.get("GRUMPY_COMPILE_MAX_SECONDS", "55"),
+        "--mode-timeout",
+        os.environ.get("GRUMPY_COMPILE_MODE_TIMEOUT", "8"),
+        "--json",
+        str(json_path),
+    ]
+    n_mol = os.environ.get("GRUMPY_COMPILE_NMOLECULES")
+    n_res = os.environ.get("GRUMPY_COMPILE_NRESIDUES")
+    batch = os.environ.get("GRUMPY_COMPILE_BATCH_SIZE")
+    cpu = os.environ.get("GRUMPY_COMPILE_CPU")
+    if n_mol:
+        argv.extend(["--n-molecules", n_mol])
+    if n_res:
+        argv.extend(["--n-residues", n_res])
+    if batch:
+        argv.extend(["--batch-size", batch])
+    if cpu:
+        argv.extend(["--cpu", cpu])
+    import io
+    from contextlib import redirect_stdout
+
+    with redirect_stdout(io.StringIO()):
+        code = run_compile(argv)
+    if code != 0:
+        raise SystemExit(f"benchmark_compile_suite.py failed with exit code {code}")
+    return json_path
+
+
 def _load_report(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as f:
         return json.load(f)
@@ -133,6 +185,24 @@ def _summary_chart(cases: list[dict[str, Any]]):
     return _bar_chart_ms(selected, "Representative ops — public API (ms)", height=440)
 
 
+def _compile_chart(cases: list[dict[str, Any]]):
+    import plotly.graph_objects as go
+
+    names = [c["name"] for c in cases]
+    fig = go.Figure()
+    for lib, key, color_key in COMPILE_SERIES:
+        ys = []
+        for c in cases:
+            val = c.get(key)
+            ys.append(val if val is not None else None)
+        fig.add_bar(name=lib, x=names, y=ys, marker_color=COLORS[color_key])
+    fig.update_layout(
+        **_fig_layout("Streaming compile — mini-epoch (ms)", height=480)
+    )
+    fig.update_xaxes(tickangle=-20)
+    return fig
+
+
 def _write_html(fig, path: Path, *, include_plotlyjs: bool | str = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -142,7 +212,13 @@ def _write_html(fig, path: Path, *, include_plotlyjs: bool | str = False) -> Non
 
 
 def _cleanup_stale_artifacts() -> None:
-    keep = {"summary.html", "ragged_api.json", "manifest.json"}
+    keep = {
+        "summary.html",
+        "compile_summary.html",
+        "ragged_api.json",
+        "compile_suite.json",
+        "manifest.json",
+    }
     if not OUT_DIR.is_dir():
         return
     for path in OUT_DIR.iterdir():
@@ -150,10 +226,17 @@ def _cleanup_stale_artifacts() -> None:
             path.unlink()
 
 
-def generate_charts(report: dict[str, Any]) -> None:
+def generate_charts(report: dict[str, Any], compile_report: dict[str, Any] | None = None) -> None:
     cases = report["cases"]
     _cleanup_stale_artifacts()
     _write_html(_summary_chart(cases), OUT_DIR / "summary.html", include_plotlyjs="cdn")
+
+    if compile_report is not None:
+        _write_html(
+            _compile_chart(compile_report["cases"]),
+            OUT_DIR / "compile_summary.html",
+            include_plotlyjs=False,
+        )
 
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -165,6 +248,8 @@ def generate_charts(report: dict[str, Any]) -> None:
         "numpy": report.get("numpy"),
         "awkward": report.get("awkward"),
         "case_count": len(cases),
+        "compile_suite": compile_report.get("suite") if compile_report else None,
+        "compile_case_count": len(compile_report["cases"]) if compile_report else 0,
     }
     (OUT_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
@@ -177,6 +262,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--warmup", type=int, default=int(os.environ.get("GRUMPY_BENCH_WARMUP", "3")))
     ap.add_argument("--repeats", type=int, default=int(os.environ.get("GRUMPY_BENCH_REPEATS", "7")))
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--skip-compile",
+        action="store_true",
+        help="Skip compile benchmark (reuse existing compile_suite.json if present).",
+    )
     ap.add_argument(
         "--skip-run",
         action="store_true",
@@ -199,8 +289,15 @@ def main(argv: list[str] | None = None) -> int:
     elif not json_path.is_file():
         raise SystemExit(f"--skip-run requested but {json_path} is missing")
 
-    generate_charts(_load_report(json_path))
-    print(f"Wrote homepage chart to {OUT_DIR / 'summary.html'}")
+    compile_json = OUT_DIR / "compile_suite.json"
+    compile_report: dict[str, Any] | None = None
+    if not args.skip_compile:
+        compile_json = _run_compile_benchmark(seed=args.seed)
+    if compile_json.is_file():
+        compile_report = _load_report(compile_json)
+
+    generate_charts(_load_report(json_path), compile_report)
+    print(f"Wrote homepage charts to {OUT_DIR / 'summary.html'} and {OUT_DIR / 'compile_summary.html'}")
     return 0
 
 

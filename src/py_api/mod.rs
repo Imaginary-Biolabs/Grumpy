@@ -44,7 +44,8 @@ use fns::setops::{isin, setdiff, setunion, setxor, unique};
 use fns::sortsearch::{nonzero, search_sorted};
 use fns::whereops::{argwhere, where_};
 use py_io::{
-    append_batch, io_bytes_read, load, load_slice, reset_io_bytes_read, save, stored_len,
+    append_batch, clear_path_caches, io_bytes_read, load, load_slice, reset_io_bytes_read, save,
+    stored_len,
 };
 use py_stream::{stream_batches, stream_len};
 use pyo3::prelude::*;
@@ -103,6 +104,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stream_len, m)?)?;
     m.add_function(wrap_pyfunction!(io_bytes_read, m)?)?;
     m.add_function(wrap_pyfunction!(reset_io_bytes_read, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_path_caches, m)?)?;
     m.add_function(wrap_pyfunction!(compiled_stream_apply, m)?)?;
     Ok(())
 }

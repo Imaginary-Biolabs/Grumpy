@@ -18,6 +18,7 @@ mod einsum;
 mod neighbors;
 mod dataframe;
 mod io;
+mod io_cache;
 mod random;
 mod stream;
 mod py_api;

@@ -34,6 +34,11 @@ pub fn reset_io_bytes_read() {
 }
 
 #[pyfunction]
+pub fn clear_path_caches() {
+    io_ops::clear_path_caches();
+}
+
+#[pyfunction]
 #[pyo3(signature = (obj, path, chunk_size=1024usize, chunk_dim=None))]
 pub fn save(py: Python<'_>, obj: Bound<'_, PyAny>, path: String, chunk_size: usize, chunk_dim: Option<String>) -> PyResult<()> {
     let depth = chunk_dim

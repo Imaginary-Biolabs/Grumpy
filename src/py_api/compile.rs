@@ -461,6 +461,7 @@ pub fn compiled_stream_apply(
         world_size,
         rank,
         batch_indices.as_deref(),
+        false,
     )?;
     let pool = ThreadPoolBuilder::new()
         .num_threads(cpu)

@@ -59,7 +59,9 @@ class Stream:
     seed:
         Random seed for ``shuffle`` (required for reproducible training).
     workers:
-        Number of background I/O prefetch slots (``0`` = synchronous loads).
+        Number of background I/O prefetch slots and parallel loader threads (``0`` = synchronous loads).
+    in_memory:
+        If ``True``, load the entire dataset into RAM once at stream open; batches are zero-copy slices.
     world_size:
         DDP world size; batches are partitioned as ``index % world_size == rank``.
     rank:
@@ -81,6 +83,7 @@ class Stream:
     shuffle: Optional[Union[str, bool]] = None
     seed: Optional[int] = None
     workers: int = 0
+    in_memory: bool = False
     world_size: int = 1
     rank: int = 0
     batch_indices: Optional[tuple[int, ...]] = None
@@ -139,6 +142,7 @@ class Stream:
             self.world_size,
             self.rank,
             self._batch_indices_arg(),
+            self.in_memory,
         )
 
     def __iter__(self) -> Iterator:
@@ -164,6 +168,7 @@ class Stream:
             self.world_size,
             self.rank,
             self._batch_indices_arg(),
+            self.in_memory,
         )
 
     def apply(
@@ -320,6 +325,7 @@ class StreamApply(Iterable[T]):
                 yield run_all(b)
             return
 
+        # Parallel transform: prefetch from base stream when workers > 0.
         max_in_flight = self.prefetch if self.prefetch is not None else (2 * self.cpu)
         if max_in_flight < 1:
             max_in_flight = 1

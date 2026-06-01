@@ -3,6 +3,8 @@ use crate::stream::{self, BatchPayload, BatchPlan};
 use crate::py_api::types::{PyGrumpyArray, PyGrumpyDataFrame, PyStreamBatchesIter};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
@@ -30,8 +32,9 @@ pub(crate) fn prepare_stream_plan_with_shuffle_level(
     world_size: usize,
     rank: usize,
     batch_indices: Option<&[usize]>,
+    in_memory: bool,
 ) -> PyResult<(io_ops::DatasetHandle, BatchPlan, bool, Option<String>, Option<u64>)> {
-    let handle = io_ops::DatasetHandle::open(path)?;
+    let handle = io_ops::DatasetHandle::open_with_mode(path, in_memory)?;
     let is_df = matches!(handle.meta.root, io_ops::RootMeta::DataFrame { .. });
     let mut plan = stream::build_batch_plan(&handle, batch_size, drop_last, batch_on)?;
     let shuffle_within = shuffle.and_then(|s| {
@@ -59,15 +62,62 @@ pub(crate) fn spawn_prefetch_loader(
     handle: io_ops::DatasetHandle,
     plan: BatchPlan,
     queue_depth: usize,
+    loader_threads: usize,
 ) -> Receiver<PyResult<BatchPayload>> {
     let (tx, rx): (SyncSender<PyResult<BatchPayload>>, Receiver<PyResult<BatchPayload>>) =
         mpsc::sync_channel(queue_depth.max(1));
     thread::spawn(move || {
-        for batch in plan.batches {
-            let result = stream::load_batch(&handle, &batch);
-            if tx.send(result).is_err() {
-                break;
+        let batches = plan.batches;
+        if loader_threads <= 1 {
+            for batch in batches {
+                let result = stream::load_batch(&handle, &batch);
+                if tx.send(result).is_err() {
+                    break;
+                }
             }
+            return;
+        }
+        // Serial-first: warm path-persistent I/O cache before parallel prefetch.
+        if !batches.is_empty() {
+            let result = stream::load_batch(&handle, &batches[0]);
+            if tx.send(result).is_err() {
+                return;
+            }
+        }
+        if batches.len() <= 1 {
+            return;
+        }
+        let pool = match ThreadPoolBuilder::new()
+            .num_threads(loader_threads)
+            .build()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = tx.send(Err(PyValueError::new_err(format!(
+                    "Prefetch loader failed to build thread pool: {e}"
+                ))));
+                return;
+            }
+        };
+        let mut i = 1usize;
+        while i < batches.len() {
+            let window = loader_threads.min(batches.len() - i).max(1);
+            let chunk: Vec<_> = (i..i + window)
+                .map(|j| (j, batches[j].clone()))
+                .collect();
+            let mut loaded: Vec<(usize, PyResult<BatchPayload>)> = pool.install(|| {
+                chunk
+                    .par_iter()
+                    .map(|(j, batch)| (*j, stream::load_batch(&handle, batch)))
+                    .collect()
+            });
+            loaded.sort_by_key(|(j, _)| *j);
+            for (_, result) in loaded {
+                if tx.send(result).is_err() {
+                    return;
+                }
+            }
+            i += window;
         }
     });
     rx
@@ -109,7 +159,7 @@ impl PyStreamBatchesIter {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, shuffle=None, seed=None, workers=0, world_size=1, rank=0, batch_indices=None))]
+#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, shuffle=None, seed=None, workers=0, world_size=1, rank=0, batch_indices=None, in_memory=false))]
 pub fn stream_batches(
     path: String,
     batch_size: usize,
@@ -121,6 +171,7 @@ pub fn stream_batches(
     world_size: usize,
     rank: usize,
     batch_indices: Option<Vec<usize>>,
+    in_memory: bool,
 ) -> PyResult<PyStreamBatchesIter> {
     let (handle, plan, is_dataframe, shuffle_within, seed) = prepare_stream_plan_with_shuffle_level(
         &path,
@@ -132,9 +183,16 @@ pub fn stream_batches(
         world_size,
         rank,
         batch_indices.as_deref(),
+        in_memory,
     )?;
+    let loader_threads = if workers > 0 { workers } else { 1 };
     let prefetch_rx = if workers > 0 {
-        Some(spawn_prefetch_loader(handle.clone(), plan.clone(), workers))
+        Some(spawn_prefetch_loader(
+            handle.clone(),
+            plan.clone(),
+            workers,
+            loader_threads,
+        ))
     } else {
         None
     };
@@ -150,7 +208,7 @@ pub fn stream_batches(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, world_size=1, rank=0, batch_indices=None))]
+#[pyo3(signature = (path, batch_size, drop_last=false, batch_on=None, world_size=1, rank=0, batch_indices=None, in_memory=false))]
 pub fn stream_len(
     path: String,
     batch_size: usize,
@@ -159,8 +217,9 @@ pub fn stream_len(
     world_size: usize,
     rank: usize,
     batch_indices: Option<Vec<usize>>,
+    in_memory: bool,
 ) -> PyResult<usize> {
-    let handle = io_ops::DatasetHandle::open(&path)?;
+    let handle = io_ops::DatasetHandle::open_with_mode(&path, in_memory)?;
     let mut plan = stream::build_batch_plan(&handle, batch_size, drop_last, batch_on.as_deref())?;
     if world_size > 1 || rank > 0 {
         stream::shard_batch_plan(&mut plan, world_size.max(1), rank)?;

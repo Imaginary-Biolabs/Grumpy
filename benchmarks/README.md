@@ -99,3 +99,31 @@ Or regenerate the chart only:
 ```bash
 python benchmarks/generate_perf_charts.py
 ```
+
+## Compiler benchmark (docs / charts)
+
+Compares **streaming** pipelines where ``gr.compile`` is meant to be used — full mini-epoch over a Zarr-backed protein dataset (**< 60 s** wall budget):
+
+```bash
+python benchmarks/benchmark_compile_suite.py
+python benchmarks/benchmark_compile_suite.py --json docs/generated/performance/compile_suite.json
+```
+
+Default dataset: **256 proteins × 96 residues × 3 coords** (CA trace), plus a molecule>residue>atom dataframe (4 atoms/residue). Streaming with `batch_size=32`, `cpu=4`. Per-mode timeouts and a 55 s suite budget keep docs builds under one minute.
+
+Pipelines: coordinate normalize + pool, dataframe residue center, fused normalize + kNN (`k=8`).
+
+Each case times four modes: Python stream (cpu=1), compiled (cpu=1), compiled + ThreadPool (cpu=4), compiled + Rust scheduler (cpu=4).
+
+## In-memory vs streaming
+
+Compares batched transforms over **in-memory** data vs **Zarr streaming** (plus load-only baselines):
+
+```bash
+python benchmarks/benchmark_memory_vs_stream.py
+python benchmarks/benchmark_memory_vs_stream.py --json docs/generated/performance/memory_vs_stream.json
+```
+
+Default: 256 proteins × 96 residues, `batch_size=32`, **< 60 s** wall budget. Shows how much of a stream epoch is Zarr I/O vs compute.
+
+The compile chart on the [docs landing page](https://imaginary-biolabs.github.io/Grumpy/) is rebuilt together with the API chart by `generate_perf_charts.py`.
