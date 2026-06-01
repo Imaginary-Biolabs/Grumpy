@@ -1,7 +1,7 @@
 ## Highlights
 
-- Layout-first kernels for elementwise ops, reductions, neighbors, and more
-- `GrumpyDataFrame` with optional schema and dot-notation column access
+- Layout-first kernels for elementwise ops, reductions, neighbors, and more — **list-chains** and **`UnionScalarList`** are both first-class
+- `GrumpyDataFrame` with optional schema and dot-notation column access (list-chain and union columns)
 - Zarr save/load and axis-0 streaming with optional `gr.compile` fusion
 - BSL 1.1 license (Imaginary Biolabs GmbH) — [License FAQ](license-faq.md)
 

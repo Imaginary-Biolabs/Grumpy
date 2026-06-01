@@ -3,11 +3,18 @@
 Grumpy provides Awkward-like layout semantics with strong typing, explicit nullability,
 mutable arrays, Zarr-backed I/O, and optional compilation of streaming transforms.
 
-Known limitations
------------------
-- ``UnionScalarList`` layouts support streaming, scalar ops, sum/mean, unique, shuffle, and append save; many other kernels still require pure list-chains.
-- Streaming supports axis-0 and ``batch_on`` batching, shuffle, DDP, and I/O prefetch.
-- ``gr.compile`` accepts a restricted subset of Python (see :func:`compile`).
+Layouts
+-------
+Arrays use either **list-chains** (``ListOffset -> … -> Leaf``) or **`UnionScalarList``**
+(mixed scalar/list rows at one axis). Both are constructed with :func:`array`, persisted to
+Zarr, streamed, and used in dataframes.
+
+Notes
+-----
+- Streaming supports axis-0 and ``batch_on`` batching, shuffle, DDP, and I/O prefetch on
+  both layout paths.
+- ``gr.compile`` accepts a restricted subset of Python (see :func:`compile`); scalar
+  elementwise opcodes fuse on union batches as well as list-chains.
 """
 
 from __future__ import annotations

@@ -4,10 +4,15 @@ The compiler analyzes straight-line Python functions (typically ``def f(batch): 
 and builds :class:`~grumpy._core.CompiledPlan` opcode lists for use with
 :meth:`~grumpy.stream.Stream.apply` or the :func:`compile` decorator.
 
+Supported inputs
+----------------
+- List-chain and ``UnionScalarList`` batches for scalar elementwise opcodes
+  (``batch * 2``, ``batch + 1``, …).
+- Reduction and neighbor opcodes when the underlying Rust kernel supports the layout.
+
 Known limitations
 -----------------
 - No control flow (``if``/``for``/``try``), no imports, single ``batch`` parameter.
-- ``UnionScalarList`` layouts are not compilable.
 - Rust scheduling supports only a fixed opcode set (see ``stream.py``).
 """
 

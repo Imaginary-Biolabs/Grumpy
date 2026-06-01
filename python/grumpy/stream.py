@@ -5,17 +5,19 @@ over Zarr-backed stores written by :func:`grumpy.save`.
 
 Features
 --------
-- Axis-0 batching with optional ``batch_on`` schema-level packing
+- Axis-0 batching with optional ``batch_on`` schema-level packing (list-chain and union layouts)
 - Reproducible batch-order shuffle and within-batch shuffle on a schema level
 - DDP sharding via ``world_size`` / ``rank``
 - I/O prefetch via ``workers`` (distinct from ``StreamApply`` transform parallelism)
 - Partial batch reads (leaf ranges only) via the Rust ``StreamBatchesIter``
+- Compact union partial I/O: slice tags/index and referenced scalar/list pools only
 - Subset iteration via ``st[index]`` (int, slice, or sequence of batch indices)
 
-Known limitations
------------------
-- ``UnionScalarList`` and ``Indexed`` layouts: streaming slice loads support unions; ``Indexed`` is still unsupported.
-- Compiled Rust scheduling supports a restricted opcode set (see ``compiler.py``).
+Notes
+-----
+- ``Indexed`` layouts are not yet supported for streaming slice loads.
+- Compiled Rust scheduling supports a restricted opcode set (see ``compiler.py``); scalar
+  elementwise opcodes work on ``UnionScalarList`` batches.
 """
 
 from __future__ import annotations

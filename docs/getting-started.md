@@ -19,12 +19,20 @@ Requirements: Python ≥ 3.10, Rust stable toolchain.
 
 ## First array
 
+Grumpy supports two layout paths from the same constructor: **list-chains** (fixed depth) and **unions** (mixed scalar/list at one axis).
+
 ```python
 import grumpy as gr
 
+# List-chain: each row is a list
 x = gr.array([[1, 2, 3], [4, 5]], dtype=gr.int32)
 print(x.to_list())
 print(x.shape(dim=1))
+
+# Union: singleton and list rows on the same axis
+u = gr.array([1, [2, 3], 4], dtype=gr.int32)
+print(u.to_list())
+print((u * 2).to_list())
 ```
 
 ## Version
