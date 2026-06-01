@@ -5,9 +5,10 @@ Streaming compiler benchmark — where ``gr.compile`` pays off.
 Simulates protein-structure training pipelines: Zarr-backed axis-0 streaming over
 a saved dataset, comparing Python vs compiled transforms and Rust batch scheduling.
 
-Defaults target **< 60 s** total wall time while keeping bio-realistic *per-structure*
-shape (128-residue CA traces, batch_size=32, 4 heavy atoms/residue dataframe path).
-Corpus size is a 256-structure mini-epoch (scale linearly to full training sets).
+Defaults target a **~3–5 min** full suite: 256-structure mini-epoch, 256-residue CA
+traces, ``batch_size=32``. Pipelines are compute-heavy (fused elementwise chains and
+kNN + pool) so **compiled + Rust batch scheduler (cpu=4)** clearly beats eager Python
+streaming; use ``--quick`` for a <60 s elementwise-only smoke run.
 """
 
 from __future__ import annotations
@@ -31,8 +32,8 @@ from grumpy.compiler import compile_pipeline_info
 from _bench_common import row_length, timeit
 
 # --- timing guards (seconds) ---
-DEFAULT_SUITE_BUDGET_S = 55.0
-DEFAULT_MODE_TIMEOUT_S = 8.0
+DEFAULT_SUITE_BUDGET_S = 300.0
+DEFAULT_MODE_TIMEOUT_S = 90.0
 
 
 class BenchTimeout(Exception):
@@ -44,6 +45,7 @@ class CompileBenchCase:
     name: str
     complexity: str
     stream_py_cpu1_ms: float | None
+    stream_py_cpu4_ms: float | None
     stream_compiled_cpu1_ms: float | None
     stream_compiled_cpu4_pysched_ms: float | None
     stream_compiled_cpu4_rust_ms: float | None
@@ -172,10 +174,11 @@ def _bench_stream_modes(
     mode_timeout_s: float,
     deadline: float,
     label: str,
-) -> tuple[float | None, float | None, float | None, float | None]:
+) -> tuple[float | None, float | None, float | None, float | None, float | None]:
     _require_compiled(fns)
     modes = (
         ("stream_py_cpu1_ms", dict(cpu=1, compile=False, scheduler="auto")),
+        ("stream_py_cpu4_ms", dict(cpu=cpu, compile=False, scheduler="auto")),
         ("stream_compiled_cpu1_ms", dict(cpu=1, compile=True, scheduler="auto")),
         ("stream_compiled_cpu4_pysched_ms", dict(cpu=cpu, compile=True, scheduler="python")),
         ("stream_compiled_cpu4_rust_ms", dict(cpu=cpu, compile=True, scheduler="auto")),
@@ -198,11 +201,12 @@ def _bench_stream_modes(
             )
             results[key] = sec * 1e3
         except BenchTimeout:
-            print(f"  TIMEOUT {label}/{key} > {mode_timeout_s:.0f}s — killed", file=sys.stderr, flush=True)
-            break
+            print(f"  TIMEOUT {label}/{key} > {mode_timeout_s:.0f}s — skipped", file=sys.stderr, flush=True)
+            continue
 
     return (
         results["stream_py_cpu1_ms"],
+        results["stream_py_cpu4_ms"],
         results["stream_compiled_cpu1_ms"],
         results["stream_compiled_cpu4_pysched_ms"],
         results["stream_compiled_cpu4_rust_ms"],
@@ -211,7 +215,6 @@ def _bench_stream_modes(
 
 def build_cases(
     coord_path: str,
-    df_path: str,
     *,
     batch_size: int,
     cpu: int,
@@ -220,6 +223,7 @@ def build_cases(
     repeats: int,
     mode_timeout_s: float,
     suite_budget_s: float,
+    quick: bool = False,
 ) -> list[CompileBenchCase]:
     cases: list[CompileBenchCase] = []
     suite_start = time.perf_counter()
@@ -228,114 +232,109 @@ def build_cases(
     def remaining() -> float:
         return max(0.0, deadline - time.perf_counter())
 
-    # --- shared transforms (module-level names help compile_pipeline_info) ---
-    def scale(batch):
+    # Compute-heavy, fully compilable pipelines (defined here so inspect.getsource works).
+    def heavy_featurize(batch):
         batch = batch * 0.01
-        return batch
-
-    def center(batch):
         batch = batch + 1.0
-        return batch
-
-    def pool_residue(batch):
+        batch = batch * 2.0
+        batch = batch - 0.5
+        batch = batch / 1.1
         batch = batch.mean(dim=1)
         return batch
 
-    def knn_residues(batch):
-        batch = gr.neighbors(batch, batch, k=8, dim=1, loop=False)
+    def norm_knn_pool(batch):
+        batch = batch * 0.01
+        batch = batch + 1.0
+        batch = gr.neighbors(batch, batch, k=16, dim=1, loop=False)
+        batch = batch.mean(dim=1)
         return batch
 
-    def residue_center(batch):
-        batch.residue.residue_center = batch.residue.atom_pos0.mean(dim=1)
+    def knn_then_pool(batch):
+        batch = gr.neighbors(batch, batch, k=16, dim=1, loop=False)
+        batch = batch.mean(dim=1)
         return batch
 
-    featurize = [scale, center, pool_residue]
+    def stage_a(batch):
+        batch = batch * 0.01
+        batch = batch + 1.0
+        return batch
 
-    # 1. Coordinate normalize + pool
-    print("  case: coord normalize + pool", file=sys.stderr, flush=True)
-    py1, c1, c4_py, c4_rust = _bench_stream_modes(
-        coord_path,
-        featurize,
-        batch_size=batch_size,
-        cpu=cpu,
-        warmup=warmup,
-        repeats=repeats,
-        mode_timeout_s=mode_timeout_s,
-        deadline=deadline,
-        label="coord pool",
+    def stage_b(batch):
+        batch = batch * 2.0
+        batch = batch - 0.5
+        return batch
+
+    def stage_c(batch):
+        batch = batch / 1.1
+        batch = batch * 0.99
+        return batch
+
+    def stage_d(batch):
+        batch = batch.mean(dim=1)
+        return batch
+
+    specs = (
+        (
+            "fused elementwise + pool",
+            [heavy_featurize],
+            "high",
+            "* 0.01; + 1.0; * 2.0; - 0.5; / 1.1; mean(dim=1) in one CompiledPlan",
+            "five fused scalar ops + reduce(dim=1)",
+        ),
+        (
+            "staged elementwise (4 fns)",
+            [stage_a, stage_b, stage_c, stage_d],
+            "high",
+            "four transform fns fused into one CompiledPlan",
+            "same math as fused case; Python pays per-function dispatch",
+        ),
+        (
+            "normalize + kNN + pool",
+            [norm_knn_pool],
+            "high",
+            "* 0.01; + 1.0; neighbors(k=16); mean(dim=1)",
+            "end-to-end fused normalize → kNN → pool",
+        ),
+        (
+            "kNN (k=16) + pool",
+            [knn_then_pool],
+            "high",
+            "neighbors(k=16, dim=1); mean(dim=1)",
+            "kNN-dominated compute per batch",
+        ),
     )
-    cases.append(
-        CompileBenchCase(
-            name="coord normalize + pool",
-            complexity="medium",
-            stream_py_cpu1_ms=py1,
-            stream_compiled_cpu1_ms=c1,
-            stream_compiled_cpu4_pysched_ms=c4_py,
-            stream_compiled_cpu4_rust_ms=c4_rust,
-            grumpy_code="* 0.01; + 1.0; mean(dim=1)",
-            notes=f"{n_residues}-residue CA traces, Zarr stream batch_size={batch_size}",
+
+    for name, fns, complexity, code, notes in specs:
+        if quick and "kNN" in name:
+            continue
+        if remaining() < 2.0:
+            print(f"  skip {name}: suite budget exhausted", file=sys.stderr, flush=True)
+            break
+        print(f"  case: {name}", file=sys.stderr, flush=True)
+        py1, py4, c1, c4_py, c4_rust = _bench_stream_modes(
+            coord_path,
+            fns,
+            batch_size=batch_size,
+            cpu=cpu,
+            warmup=warmup,
+            repeats=repeats,
+            mode_timeout_s=mode_timeout_s,
+            deadline=deadline,
+            label=name,
         )
-    )
-
-    if remaining() < 2.0:
-        print("suite budget exhausted after case 1", file=sys.stderr, flush=True)
-        return cases
-
-    # 2. Dataframe residue center (compiled df_get / df_set path)
-    print("  case: residue center (df)", file=sys.stderr, flush=True)
-    py1, c1, c4_py, c4_rust = _bench_stream_modes(
-        df_path,
-        [residue_center],
-        batch_size=batch_size,
-        cpu=cpu,
-        warmup=warmup,
-        repeats=repeats,
-        mode_timeout_s=mode_timeout_s,
-        deadline=deadline,
-        label="residue center",
-    )
-    cases.append(
-        CompileBenchCase(
-            name="residue center (df)",
-            complexity="medium",
-            stream_py_cpu1_ms=py1,
-            stream_compiled_cpu1_ms=c1,
-            stream_compiled_cpu4_pysched_ms=c4_py,
-            stream_compiled_cpu4_rust_ms=c4_rust,
-            grumpy_code="batch.residue.residue_center = atom_pos0.mean(dim=1)",
-            notes="molecule>residue>atom schema, 4 atoms/residue",
+        cases.append(
+            CompileBenchCase(
+                name=name,
+                complexity=complexity,
+                stream_py_cpu1_ms=py1,
+                stream_py_cpu4_ms=py4,
+                stream_compiled_cpu1_ms=c1,
+                stream_compiled_cpu4_pysched_ms=c4_py,
+                stream_compiled_cpu4_rust_ms=c4_rust,
+                grumpy_code=code,
+                notes=f"{notes}; {n_residues}-residue CA, batch_size={batch_size}",
+            )
         )
-    )
-
-    if remaining() < 2.0:
-        return cases
-
-    # 3. Fused normalize + kNN — compile fusion + Rust batch scheduler
-    print("  case: normalize + kNN", file=sys.stderr, flush=True)
-    pipeline = [scale, center, knn_residues]
-    py1, c1, c4_py, c4_rust = _bench_stream_modes(
-        coord_path,
-        pipeline,
-        batch_size=batch_size,
-        cpu=cpu,
-        warmup=warmup,
-        repeats=repeats,
-        mode_timeout_s=mode_timeout_s,
-        deadline=deadline,
-        label="normalize+kNN",
-    )
-    cases.append(
-        CompileBenchCase(
-            name="normalize + kNN",
-            complexity="high",
-            stream_py_cpu1_ms=py1,
-            stream_compiled_cpu1_ms=c1,
-            stream_compiled_cpu4_pysched_ms=c4_py,
-            stream_compiled_cpu4_rust_ms=c4_rust,
-            grumpy_code="* 0.01; + 1.0; neighbors(k=8, dim=1)",
-            notes="fused CompiledPlan + Rayon scheduling (cpu=4)",
-        )
-    )
 
     return cases
 
@@ -352,25 +351,29 @@ def print_report(report: CompileBenchReport) -> None:
         f"budget={report.suite_budget_s:.0f}s, wall={report.wall_time_s:.1f}s\n"
     )
     print(
-        "| pipeline | Python cpu=1 | Compiled cpu=1 | Compiled cpu=4 py | Compiled cpu=4 rust |"
+        "| pipeline | Python cpu=1 | Python cpu=4 | Compiled cpu=1 | Compiled cpu=4 py | Compiled cpu=4 rust |"
     )
-    print("|---|---:|---:|---:|---:|")
+    print("|---|---:|---:|---:|---:|---:|")
     for c in report.cases:
         def _cell(v: float | None) -> str:
             return "—" if v is None else f"{v:.1f}"
 
         print(
-            f"| {c.name} | {_cell(c.stream_py_cpu1_ms)} | {_cell(c.stream_compiled_cpu1_ms)} | "
-            f"{_cell(c.stream_compiled_cpu4_pysched_ms)} | {_cell(c.stream_compiled_cpu4_rust_ms)} |"
+            f"| {c.name} | {_cell(c.stream_py_cpu1_ms)} | {_cell(c.stream_py_cpu4_ms)} | "
+            f"{_cell(c.stream_compiled_cpu1_ms)} | {_cell(c.stream_compiled_cpu4_pysched_ms)} | "
+            f"{_cell(c.stream_compiled_cpu4_rust_ms)} |"
         )
     print()
     for c in report.cases:
+        print(f"### {c.name}")
         if c.stream_py_cpu1_ms and c.stream_compiled_cpu1_ms:
-            print(f"### {c.name} — compile vs Python (cpu=1): {c.stream_py_cpu1_ms / c.stream_compiled_cpu1_ms:.2f}×")
+            print(f"- compile vs Python (cpu=1): {c.stream_py_cpu1_ms / c.stream_compiled_cpu1_ms:.2f}×")
         if c.stream_py_cpu1_ms and c.stream_compiled_cpu4_rust_ms:
-            print(f"- Rust scheduler vs Python (cpu=1): {c.stream_py_cpu1_ms / c.stream_compiled_cpu4_rust_ms:.2f}×")
+            print(f"- Rust compiled (cpu=4) vs Python (cpu=1): {c.stream_py_cpu1_ms / c.stream_compiled_cpu4_rust_ms:.2f}×")
+        if c.stream_py_cpu4_ms and c.stream_compiled_cpu4_rust_ms:
+            print(f"- Rust compiled (cpu=4) vs Python parallel (cpu=4): {c.stream_py_cpu4_ms / c.stream_compiled_cpu4_rust_ms:.2f}×")
         if c.stream_compiled_cpu4_pysched_ms and c.stream_compiled_cpu4_rust_ms:
-            print(f"- Rust vs ThreadPool (cpu=4): {c.stream_compiled_cpu4_pysched_ms / c.stream_compiled_cpu4_rust_ms:.2f}×")
+            print(f"- Rust vs ThreadPool scheduler (cpu=4): {c.stream_compiled_cpu4_pysched_ms / c.stream_compiled_cpu4_rust_ms:.2f}×")
         if c.notes:
             print(f"- {c.notes}")
         print()
@@ -379,17 +382,27 @@ def print_report(report: CompileBenchReport) -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Streaming compiler benchmark with JSON export.")
     ap.add_argument("--n-molecules", type=int, default=256, help="Structures in Zarr store (mini-epoch).")
-    ap.add_argument("--n-residues", type=int, default=96, help="Residues per structure (typical domain length).")
+    ap.add_argument("--n-residues", type=int, default=256, help="Residues per structure (typical domain length).")
+    ap.add_argument(
+        "--quick",
+        action="store_true",
+        help="Elementwise-only smoke run (<60 s): 96 residues, 55 s budget, 8 s mode timeout.",
+    )
     ap.add_argument("--atoms-per-res", type=int, default=4)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--cpu", type=int, default=4)
-    ap.add_argument("--warmup", type=int, default=0)
-    ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-seconds", type=float, default=DEFAULT_SUITE_BUDGET_S, help="Total suite wall budget.")
     ap.add_argument("--mode-timeout", type=float, default=DEFAULT_MODE_TIMEOUT_S, help="Per-mode epoch timeout.")
     ap.add_argument("--json", metavar="PATH", default=None)
     args = ap.parse_args(argv)
+
+    if args.quick:
+        args.n_residues = 96
+        args.max_seconds = 55.0
+        args.mode_timeout = 8.0
 
     wall_start = time.perf_counter()
     rng = np.random.default_rng(args.seed)
@@ -397,17 +410,13 @@ def main(argv: list[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory(prefix="grumpy_compile_bench_") as tmp:
         coord_path = str(Path(tmp) / "coords.gr")
-        df_path = str(Path(tmp) / "proteins.gr")
 
         coords = _protein_coords(rng, args.n_molecules, args.n_residues, ragged=False)
-        df = _protein_dataframe(rng, args.n_molecules, args.n_residues, args.atoms_per_res)
 
         gr.save(gr.array(coords, dtype=gr.float64), coord_path, chunk_size=args.batch_size)
-        gr.save(df, df_path, chunk_size=args.batch_size)
 
         cases = build_cases(
             coord_path,
-            df_path,
             batch_size=args.batch_size,
             cpu=args.cpu,
             n_residues=args.n_residues,
@@ -415,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
             repeats=args.repeats,
             mode_timeout_s=args.mode_timeout,
             suite_budget_s=args.max_seconds,
+            quick=args.quick,
         )
 
     wall_time = time.perf_counter() - wall_start

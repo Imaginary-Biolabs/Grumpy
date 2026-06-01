@@ -102,18 +102,19 @@ python benchmarks/generate_perf_charts.py
 
 ## Compiler benchmark (docs / charts)
 
-Compares **streaming** pipelines where ``gr.compile`` is meant to be used — full mini-epoch over a Zarr-backed protein dataset (**< 60 s** wall budget):
+Compares **streaming** pipelines where ``gr.compile`` is meant to be used — full mini-epoch over a Zarr-backed protein dataset:
 
 ```bash
 python benchmarks/benchmark_compile_suite.py
+python benchmarks/benchmark_compile_suite.py --quick          # <60 s elementwise smoke
 python benchmarks/benchmark_compile_suite.py --json docs/generated/performance/compile_suite.json
 ```
 
-Default dataset: **256 proteins × 96 residues × 3 coords** (CA trace), plus a molecule>residue>atom dataframe (4 atoms/residue). Streaming with `batch_size=32`, `cpu=4`. Per-mode timeouts and a 55 s suite budget keep docs builds under one minute.
+Default dataset: **256 proteins × 256 residues × 3 coords** (CA trace). Streaming with `batch_size=32`, `cpu=4`. Full suite budget ~300 s; per-mode timeout 90 s. Use `--quick` for 96-residue elementwise-only runs under 60 s.
 
-Pipelines: coordinate normalize + pool, dataframe residue center, fused normalize + kNN (`k=8`).
+Pipelines: fused elementwise + pool, staged elementwise (4 functions → one plan), normalize + kNN + pool (`k=16`), kNN (`k=16`) + pool.
 
-Each case times four modes: Python stream (cpu=1), compiled (cpu=1), compiled + ThreadPool (cpu=4), compiled + Rust scheduler (cpu=4).
+Each case times five modes: Python stream (cpu=1), Python parallel (cpu=4), compiled (cpu=1), compiled + ThreadPool (cpu=4), compiled + Rust scheduler (cpu=4). **Compile pays off primarily via the Rust batch scheduler (cpu=4)**; cpu=1 compiled and eager paths both dispatch to Rust kernels.
 
 ## In-memory vs streaming
 

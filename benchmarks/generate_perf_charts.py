@@ -31,9 +31,10 @@ COLORS = {
 
 COMPILE_SERIES = (
     ("Python stream (cpu=1)", "stream_py_cpu1_ms", "numpy"),
+    ("Python parallel (cpu=4)", "stream_py_cpu4_ms", "numpy"),
     ("Compiled (cpu=1)", "stream_compiled_cpu1_ms", "grumpy"),
-    ("Compiled + parallel (cpu=4)", "stream_compiled_cpu4_pysched_ms", "grumpy_compiled"),
-    ("Compiled + Rust sched (cpu=4)", "stream_compiled_cpu4_rust_ms", "grumpy_ragged_compiled"),
+    ("Compiled + ThreadPool (cpu=4)", "stream_compiled_cpu4_pysched_ms", "grumpy_compiled"),
+    ("Compiled + Rust (cpu=4)", "stream_compiled_cpu4_rust_ms", "grumpy_ragged_compiled"),
 )
 
 REPRESENTATIVE_OPS = [
