@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
 #[pyfunction]
-#[pyo3(signature = (query, data, k=None, radius=None, dim=0, loop_=true, return_distances=false, gpu="never"))]
+#[pyo3(signature = (query, data, k=None, radius=None, dim=0, loop_=true, return_distances=false, gpu="false"))]
 pub fn neighbors(
     py: Python<'_>,
     query: PyRef<'_, PyGrumpyArray>,

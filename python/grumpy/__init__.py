@@ -71,7 +71,7 @@ from ._core import (
 )
 
 from . import compiler as _compiler_mod
-from .stream import Stream, StreamApply, current_stream_gpu
+from .stream import Stream, StreamApply
 
 compile = _compiler_mod.compile
 
@@ -294,7 +294,7 @@ def neighbors(
     dim: int = 0,
     loop: bool = True,
     return_distances: bool = False,
-    gpu: bool | str | None = False,
+    gpu: bool | str = False,
 ):
     """
     Compute neighbors and return an **edge index** (and optionally distances).
@@ -314,11 +314,9 @@ def neighbors(
     return_distances:
         If ``True``, also return distances aligned with the neighbor axis.
     gpu:
-        ``False`` (default) uses CPU. Optional GPU acceleration for brute-force kNN
-        is available on Metal (macOS) or CUDA (Linux build with ``--features cuda``):
-        pass ``gpu='auto'`` to select GPU only for large enough batches,
-        ``gpu='force'`` to require GPU, or ``gpu=None`` inside
-        :meth:`~grumpy.stream.Stream.apply` to inherit the stream's ``gpu`` setting.
+        ``False`` (default) uses CPU. ``True`` always uses GPU when available
+        (Metal on macOS, CUDA on Linux with ``--features cuda``).
+        ``'auto'`` selects GPU only for large enough batches.
         Use :func:`gpu_available` to check runtime support.
 
     Returns
@@ -328,13 +326,12 @@ def neighbors(
     distances (optional):
         Returned when ``return_distances=True``.
     """
-    if gpu is None:
-        gpu = current_stream_gpu()
-    elif gpu is True:
-        gpu = "auto"
-    elif gpu is False:
-        gpu = "never"
-    return _neighbors(query, data, k, radius, dim, loop_=loop, return_distances=return_distances, gpu=gpu)
+    if gpu not in (True, False, "auto"):
+        from .errors import arg_one_of
+
+        arg_one_of("gpu", gpu, ("True", "False", "'auto'"))
+    gpu_arg = "auto" if gpu == "auto" else ("true" if gpu else "false")
+    return _neighbors(query, data, k, radius, dim, loop_=loop, return_distances=return_distances, gpu=gpu_arg)
 
 
 def pairwise_distances(x: GrumpyArray, *, dim: int = 1) -> GrumpyArray:

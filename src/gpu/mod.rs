@@ -24,13 +24,13 @@ pub enum GpuPreference {
 impl GpuPreference {
     pub fn parse(s: &str) -> PyResult<Self> {
         match s {
-            "never" | "false" | "False" | "0" => Ok(Self::Never),
+            "false" | "False" | "0" => Ok(Self::Never),
             "auto" => Ok(Self::Auto),
-            "true" | "True" | "1" | "force" => Ok(Self::Force),
+            "true" | "True" | "1" => Ok(Self::Force),
             other => Err(crate::error::arg_invalid(
                 "gpu",
                 format!("unknown value '{other}'"),
-                "use gpu='auto', True, or False.",
+                "use gpu=True, False, or 'auto'.",
             )),
         }
     }

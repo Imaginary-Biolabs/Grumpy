@@ -25,7 +25,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Optional, Sequence, TypeVar, Union
 
-import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import warnings
 
@@ -33,23 +32,11 @@ from .errors import arg_invalid, arg_one_of, index_out_of_range, raise_grumpy_er
 
 T = TypeVar("T")
 
-# Default GPU mode for gr.neighbors when called inside Stream.apply (see Stream.gpu).
-_STREAM_GPU: contextvars.ContextVar[str] = contextvars.ContextVar("grumpy_stream_gpu", default="never")
-
-
-def _normalize_gpu(gpu: Union[bool, str]) -> str:
-    if gpu is True:
-        return "auto"
-    if gpu is False:
-        return "never"
-    if gpu not in ("auto", "never", "force"):
-        arg_one_of("gpu", gpu, ("True", "False", "'auto'", "'never'", "'force'"))
-    return gpu
-
-
-def current_stream_gpu() -> str:
-    """Return the active stream GPU mode for nested :func:`grumpy.neighbors` calls."""
-    return _STREAM_GPU.get()
+# GPU mode propagated to compiled stream pipelines (see Stream.gpu).
+def _gpu_mode_str(gpu: Union[bool, str]) -> str:
+    if gpu not in (True, False, "auto"):
+        arg_one_of("gpu", gpu, ("True", "False", "'auto'"))
+    return "auto" if gpu == "auto" else ("true" if gpu else "false")
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -257,12 +244,8 @@ class StreamApply(Iterable[T]):
     gpu: Union[bool, str] = False
 
     def __iter__(self) -> Iterator[T]:
-        gpu_mode = _normalize_gpu(self.gpu)
-        token = _STREAM_GPU.set(gpu_mode)
-        try:
-            yield from self._iter_batches(gpu_mode)
-        finally:
-            _STREAM_GPU.reset(token)
+        gpu_mode = _gpu_mode_str(self.gpu)
+        yield from self._iter_batches(gpu_mode)
 
     def _iter_batches(self, gpu_mode: str) -> Iterator[T]:
         compile_mode = self.compile

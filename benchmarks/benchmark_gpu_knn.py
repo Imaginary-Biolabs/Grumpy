@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     x = gr.array(coords, dtype=gr.float64)
 
     cpu_ms = _bench_neighbors(x, gpu=False, warmup=args.warmup, repeats=args.repeats)
-    gpu_ms = _bench_neighbors(x, gpu="force", warmup=args.warmup, repeats=args.repeats)
+    gpu_ms = _bench_neighbors(x, gpu=True, warmup=args.warmup, repeats=args.repeats)
     auto_ms = _bench_neighbors(x, gpu="auto", warmup=args.warmup, repeats=args.repeats)
 
     stream_cpu_ms = None
@@ -112,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         path = str(Path(tmp) / "coords.gr")
         gr.save(x, path, chunk_size=args.batch_size)
         stream_cpu_ms = _bench_stream(path, gpu=False, batch_size=args.batch_size, warmup=args.warmup, repeats=args.repeats)
-        stream_gpu_ms = _bench_stream(path, gpu="force", batch_size=args.batch_size, warmup=args.warmup, repeats=args.repeats)
+        stream_gpu_ms = _bench_stream(path, gpu=True, batch_size=args.batch_size, warmup=args.warmup, repeats=args.repeats)
         stream_auto_ms = _bench_stream(path, gpu="auto", batch_size=args.batch_size, warmup=args.warmup, repeats=args.repeats)
 
     wall = time.perf_counter() - wall_start
