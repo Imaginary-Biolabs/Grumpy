@@ -14,7 +14,6 @@
 - [Dataframes](dataframes.md)
 - [Saving and loading](saving-loading.md)
 - [Compilation](compilation.md)
-- [GPU Acceleration](gpu-acceleration.md)
 - [API Reference](api.md)
 
 ## Performance

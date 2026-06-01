@@ -427,7 +427,7 @@ fn run_plan_df_rust(ops_plan: &[PlanOp], mut cur: df_ops::GrumpyDataFrame) -> Py
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, batch_size, drop_last, cpu, _prefetch, spec, batch_on=None, shuffle=None, seed=None, world_size=1, rank=0, batch_indices=None, gpu="auto"))]
+#[pyo3(signature = (path, batch_size, drop_last, cpu, _prefetch, spec, batch_on=None, shuffle=None, seed=None, world_size=1, rank=0, batch_indices=None, gpu="never"))]
 pub fn compiled_stream_apply(
     _py: Python<'_>,
     path: String,

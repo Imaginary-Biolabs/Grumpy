@@ -45,7 +45,6 @@ nav:
   - Dataframes: dataframes.md
   - Saving and loading: saving-loading.md
   - Compilation: compilation.md
-  - GPU Acceleration: gpu-acceleration.md
   - License FAQ: license-faq.md
   - API Reference: api.md
 

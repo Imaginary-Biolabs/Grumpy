@@ -294,24 +294,39 @@ def neighbors(
     dim: int = 0,
     loop: bool = True,
     return_distances: bool = False,
-    gpu: bool | str | None = None,
+    gpu: bool | str | None = False,
 ):
     """
     Compute neighbors and return an **edge index** (and optionally distances).
 
     Parameters
     ----------
+    query, data:
+        Coordinate arrays. For ``dim=1``, shape is ``(n_groups, n_points, d)``.
+    k:
+        Number of nearest neighbors (mutually exclusive with ``radius``).
+    radius:
+        Include all neighbors within this distance (mutually exclusive with ``k``).
+    dim:
+        Axis along which groups of points live (``0`` or ``1`` for grouped clouds).
+    loop:
+        If ``True``, include self-matches where query and data share the same point index.
+    return_distances:
+        If ``True``, also return distances aligned with the neighbor axis.
     gpu:
-        ``'auto'``, ``True``, ``False``/``'never'``, or ``'force'``. When ``None``,
-        uses the active :class:`~grumpy.stream.Stream` GPU mode if inside
-        :meth:`~grumpy.stream.Stream.apply`.
+        ``False`` (default) uses CPU. Optional GPU acceleration for brute-force kNN
+        is available on Metal (macOS) or CUDA (Linux build with ``--features cuda``):
+        pass ``gpu='auto'`` to select GPU only for large enough batches,
+        ``gpu='force'`` to require GPU, or ``gpu=None`` inside
+        :meth:`~grumpy.stream.Stream.apply` to inherit the stream's ``gpu`` setting.
+        Use :func:`gpu_available` to check runtime support.
 
     Returns
     -------
     edge_index:
-        Ragged edge index with last axis length 2: [src, dst].
+        Ragged edge index with last axis length 2: ``[src, dst]``.
     distances (optional):
-        If return_distances=True, also returns distances aligned with the neighbors axis.
+        Returned when ``return_distances=True``.
     """
     if gpu is None:
         gpu = current_stream_gpu()
@@ -320,16 +335,6 @@ def neighbors(
     elif gpu is False:
         gpu = "never"
     return _neighbors(query, data, k, radius, dim, loop_=loop, return_distances=return_distances, gpu=gpu)
-
-
-def _normalize_gpu(gpu: bool | str | None) -> str:
-    if gpu is None:
-        return current_stream_gpu()
-    if gpu is True:
-        return "auto"
-    if gpu is False:
-        return "never"
-    return gpu
 
 
 def pairwise_distances(x: GrumpyArray, *, dim: int = 1) -> GrumpyArray:
@@ -415,7 +420,7 @@ def stream(
     seed: Optional[int] = None,
     workers: int = 0,
     in_memory: bool = False,
-    gpu: bool | str = "auto",
+    gpu: bool | str = False,
     world_size: int = 1,
     rank: int = 0,
     batch_indices: Optional[tuple[int, ...]] = None,

@@ -103,7 +103,7 @@ class Stream:
     seed: Optional[int] = None
     workers: int = 0
     in_memory: bool = False
-    gpu: Union[bool, str] = "auto"
+    gpu: Union[bool, str] = False
     world_size: int = 1
     rank: int = 0
     batch_indices: Optional[tuple[int, ...]] = None
@@ -254,7 +254,7 @@ class StreamApply(Iterable[T]):
     prefetch: Optional[int] = None
     compile: Union[bool, str] = "auto"
     scheduler: str = "auto"
-    gpu: Union[bool, str] = "auto"
+    gpu: Union[bool, str] = False
 
     def __iter__(self) -> Iterator[T]:
         gpu_mode = _normalize_gpu(self.gpu)
