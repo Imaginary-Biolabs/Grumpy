@@ -237,14 +237,19 @@ def inject_grumpy_array_docs() -> None:
                 ],
             ),
             "astype": doc(
-                "Cast leaves to another dtype.",
-                params=["dtype : DType", "    Target dtype."],
+                "Cast leaves to another dtype (layout-preserving).",
+                params=[
+                    "dtype : DType",
+                    "    Target dtype.",
+                    "casting : str, optional",
+                    "    ``'safe'`` (default), ``'same_kind'``, or ``'unsafe'``.",
+                ],
                 returns="GrumpyArray\n    Array with converted leaves.",
                 examples=[
                     ">>> import grumpy as gr",
-                    ">>> x = gr.array([1, 2])",
-                    ">>> x.astype(gr.float32).dtype.name()",
-                    "'float32'",
+                    ">>> x = gr.array([1, 2], dtype=gr.int32)",
+                    ">>> x.astype(gr.float64).dtype.name",
+                    "'float64'",
                 ],
             ),
             "to_list": doc(

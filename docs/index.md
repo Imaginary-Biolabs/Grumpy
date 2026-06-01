@@ -9,6 +9,7 @@
 
 - [Getting started](getting-started.md)
 - [Arrays](arrays.md)
+- [Dtypes and casting](dtypes.md)
 - [Dataframes](dataframes.md)
 - [Saving and loading](saving-loading.md)
 - [Compilation](compilation.md)

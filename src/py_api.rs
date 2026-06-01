@@ -957,12 +957,10 @@ impl PyGrumpyArray {
         self.inner.to_py_list(py)
     }
 
-    fn astype(&self, py: Python<'_>, dtype: PyDType) -> PyResult<Self> {
-        let target = dtype.dt;
-        let obj = self.inner.to_py_list(py)?;
-        let bound = obj.bind(py);
-        let arr = build_array(py, &bound, target)?;
-        Ok(Self { inner: arr })
+    fn astype(&self, dtype: PyDType, casting: Option<&str>) -> PyResult<Self> {
+        let mode = crate::cast::CastMode::parse(casting.unwrap_or("safe"))?;
+        let inner = crate::cast::cast_array_with_mode(&self.inner, dtype.dt, mode)?;
+        Ok(Self { inner })
     }
 
     fn shape(&self, py: Python<'_>, dim: usize) -> PyResult<PyObject> {
@@ -3847,6 +3845,20 @@ pub fn dataframe(py: Python<'_>, mapping: Bound<'_, PyAny>, schema: Option<Bound
     Ok(PyGrumpyDataFrame { inner: df })
 }
 
+#[pyfunction]
+#[pyo3(signature = (from_dtype, to_dtype, casting=None))]
+fn py_can_cast(from_dtype: PyDType, to_dtype: PyDType, casting: Option<&str>) -> PyResult<bool> {
+    let mode = crate::cast::CastMode::parse(casting.unwrap_or("safe"))?;
+    Ok(crate::cast::can_cast(from_dtype.dt, to_dtype.dt, mode))
+}
+
+#[pyfunction]
+fn py_promote_types(a: PyDType, b: PyDType) -> PyResult<PyDType> {
+    Ok(PyDType {
+        dt: crate::cast::promote_types(a.dt, b.dt)?,
+    })
+}
+
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDType>()?;
     m.add_class::<PyGenerator>()?;
@@ -3856,6 +3868,8 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompiledPlan>()?;
     m.add_class::<PyCompiledBatchesIter>()?;
     m.add_class::<PyStreamBatchesIter>()?;
+    m.add_function(wrap_pyfunction!(py_can_cast, m)?)?;
+    m.add_function(wrap_pyfunction!(py_promote_types, m)?)?;
     m.add_function(wrap_pyfunction!(py_rng, m)?)?;
     m.add_function(wrap_pyfunction!(array, m)?)?;
     m.add_function(wrap_pyfunction!(multiply, m)?)?;

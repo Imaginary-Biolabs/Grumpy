@@ -1,6 +1,6 @@
 # Arrays
 
-Grumpy arrays represent **ragged nested lists** using a small layout tree. Two layout paths are first-class:
+Grumpy arrays represent **ragged nested lists** using a small layout tree. See [Dtypes and casting](dtypes.md) for dtype rules, promotion, and ``astype`` modes.
 
 | Path | When it appears | Example Python input |
 |------|-----------------|----------------------|

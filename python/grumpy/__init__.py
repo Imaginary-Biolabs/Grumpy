@@ -62,6 +62,8 @@ from ._core import (
     append_batch as _append_batch,
     load as _load,
     rng as _rng,
+    py_can_cast as _can_cast,
+    py_promote_types as _promote_types,
 )
 
 from . import compiler as _compiler_mod
@@ -101,6 +103,16 @@ def array(obj, dtype: DType | None = None) -> GrumpyArray:
         Optional explicit dtype. If omitted, dtype is inferred from non-null leaves.
     """
     return _array(obj, dtype)
+
+
+def can_cast(from_dtype: DType, to_dtype: DType, casting: str = "safe") -> bool:
+    """Return whether ``from_dtype`` can be cast to ``to_dtype`` under ``casting``."""
+    return _can_cast(from_dtype, to_dtype, casting)
+
+
+def promote_types(a: DType, b: DType) -> DType:
+    """NumPy-style binary result dtype for two dtypes."""
+    return _promote_types(a, b)
 
 
 def multiply(a: GrumpyArray, b: GrumpyArray, out: GrumpyArray | None = None) -> GrumpyArray:
@@ -418,6 +430,8 @@ __all__ = [
     "GrumpyArray",
     "DType",
     "array",
+    "can_cast",
+    "promote_types",
     "cat",
     "full_like",
     "zeros_like",
