@@ -57,6 +57,8 @@ from ._core import (
     einsum as _einsum,
     tensordot as _tensordot,
     neighbors as _neighbors,
+    pairwise_distances as _pairwise_distances,
+    grid_pool as _grid_pool,
     gpu_available as _gpu_available,
     gpu_backend as _gpu_backend,
     dataframe as _dataframe,
@@ -320,8 +322,44 @@ def neighbors(
     return _neighbors(query, data, k, radius, dim, loop_=loop, return_distances=return_distances, gpu=gpu)
 
 
+def _normalize_gpu(gpu: bool | str | None) -> str:
+    if gpu is None:
+        return current_stream_gpu()
+    if gpu is True:
+        return "auto"
+    if gpu is False:
+        return "never"
+    return gpu
+
+
+def pairwise_distances(x: GrumpyArray, *, dim: int = 1) -> GrumpyArray:
+    """
+    All-pairs Euclidean distances within each point cloud (group).
+
+    For ``dim=1``, input shape is ``(n_groups, n_points, d)``; output is
+    ``(n_groups, n_points, n_points)`` distance matrices.
+    """
+    return _pairwise_distances(x, dim)
+
+
+def grid_pool(
+    x: GrumpyArray,
+    grid_size: tuple[int, int, int],
+    *,
+    origin: tuple[float, float, float] | None = None,
+    voxel_size: tuple[float, float, float] | None = None,
+    dim: int = 1,
+) -> GrumpyArray:
+    """
+    Voxelize point clouds by counting points per grid cell (occupancy pooling).
+
+    Returns ``(n_groups, nx*ny*nz)`` occupancy grids per group.
+    """
+    return _grid_pool(x, grid_size, origin, voxel_size, dim)
+
+
 def gpu_available() -> bool:
-    """Return True when a GPU backend (Metal or CUDA) is available for kNN."""
+    """Return True when a GPU backend (Metal or CUDA) is available."""
     return _gpu_available()
 
 

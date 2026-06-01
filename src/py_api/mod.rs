@@ -39,6 +39,7 @@ use fns::dataframe::dataframe as gr_dataframe;
 use fns::einsum::{einsum, tensordot};
 use fns::hist::{bincount, digitize, histogram};
 use fns::linalg::{cross, det, dot, inner, inv, norm, outer, trace};
+use fns::geometry::{grid_pool as grid_pool_fn, pairwise_distances};
 use fns::gpu::{gpu_available, gpu_backend};
 use fns::neighbors::neighbors;
 use fns::setops::{isin, setdiff, setunion, setxor, unique};
@@ -97,6 +98,8 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_backend, m)?)?;
     m.add_function(wrap_pyfunction!(neighbors, m)?)?;
+    m.add_function(wrap_pyfunction!(pairwise_distances, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_pool_fn, m)?)?;
     m.add_function(wrap_pyfunction!(gr_dataframe, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
     m.add_function(wrap_pyfunction!(append_batch, m)?)?;

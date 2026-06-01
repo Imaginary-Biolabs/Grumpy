@@ -1,14 +1,15 @@
-//! GPU acceleration for select heavy kernels (kNN today).
+//! GPU acceleration for select heavy kernels (kNN).
 //!
 //! Metal is used on macOS; CUDA when built with `--features cuda`.
 
 pub mod auto;
 pub mod knn;
 
-#[cfg(all(feature = "cuda", not(target_os = "macos")))]
-mod knn_cuda;
 #[cfg(target_os = "macos")]
 mod knn_metal;
+
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
+mod knn_cuda;
 
 use pyo3::prelude::*;
 

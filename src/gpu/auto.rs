@@ -13,8 +13,6 @@ pub enum GpuOp {
     KnnDim0,
     /// Grouped kNN (dim=1); one launch amortizes over many groups.
     KnnDim1,
-    /// All-pairs distances within groups (future).
-    PairwiseDistances,
 }
 
 /// Work estimate for auto routing.
@@ -70,8 +68,6 @@ impl GpuOp {
             Self::KnnDim0 => 128 * 128 * 3,
             // Ragged per-query kernel: stream batch_size=32 × 256 residues is enough on Metal.
             Self::KnnDim1 => 4_000_000,
-            // All-pairs is heavier per point; keep a higher bar until implemented.
-            Self::PairwiseDistances => 24_000_000,
         }
     }
 
@@ -81,7 +77,6 @@ impl GpuOp {
             Self::KnnDim0 => None,
             // One thread per query point; batch_size=32 streams are viable.
             Self::KnnDim1 => Some(32),
-            Self::PairwiseDistances => Some(32),
         }
     }
 }
