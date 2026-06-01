@@ -75,7 +75,7 @@ def test_stream_validation_and_len(tmp_path):
     p = tmp_path / "a.gr"
     gr.save(x, str(p), chunk_size=2)
 
-    with pytest.raises(ValueError, match="batch_size"):
+    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
         Stream(str(p), batch_size=0)
     st = Stream(str(p), batch_size=2, drop_last=True)
     assert len(st) == 1
@@ -89,14 +89,14 @@ def test_stream_apply_validation(tmp_path):
     p = tmp_path / "a.gr"
     gr.save(x, str(p))
     st = gr.stream(str(p), batch_size=2)
-    with pytest.raises(ValueError, match="cpu"):
+    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
         st.apply(lambda b: b, cpu=0)
-    with pytest.raises(ValueError, match="at least one"):
+    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
         st.apply([])
     sa = st.apply(lambda b: b)
-    with pytest.raises(ValueError, match="compile must"):
+    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
         list(StreamApply(sa.base, sa.fns, compile="bogus"))  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="scheduler must"):
+    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
         list(StreamApply(sa.base, sa.fns, scheduler="bogus"))  # type: ignore[arg-type]
 
 
@@ -363,9 +363,9 @@ def test_compile_helpers_and_get_source():
 
     # linecache path for nested functions
     filename = inspect.getsourcefile(outer) or __file__
-    first = outer.__code__.co_firstlineno
     lines = linecache.getlines(filename)
-    assert lines or _get_source(lambda batch: batch) is None or True
+    assert lines
+    assert any("def inner" in line for line in lines)
 
 
 def test_compiled_transform_direct_call():

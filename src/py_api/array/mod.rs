@@ -1,0 +1,11 @@
+mod bench;
+mod binop;
+mod compare;
+mod core;
+mod indexing;
+mod random;
+mod reduce;
+mod reshape;
+mod sortsearch;
+mod stats;
+mod unary;

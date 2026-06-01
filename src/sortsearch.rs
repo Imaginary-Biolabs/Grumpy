@@ -1,5 +1,11 @@
 use crate::dtype::DType;
-use crate::layout::{drop_axis0_select_element, layout_ndim, leaf_view, stack_axis0_broadcast, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
+use crate::error::{dim_out_of_range, dtype_unsupported, internal, unsupported};
+use crate::layout::{drop_axis0_select_element, layout_ndim, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
+use crate::layout_ops::{
+    array_as_leaf_1d, leaf_1d, listoffset_leaf2d, map_last_axis, map_union_axis0, LastAxisLeafMode,
+    new_leaf_bool_from, new_leaf_char_from, new_leaf_f32_from, new_leaf_f64_from, new_leaf_i32_from,
+    new_leaf_i64_from, new_leaf_u32_from, new_leaf_u64_from,
+};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
@@ -21,7 +27,7 @@ pub fn sort(_py: Python<'_>, x: &GrumpyArray) -> PyResult<GrumpyArray> {
         DType::Float64 => sort_f64(&leaf),
         DType::Bool => sort_bool(&leaf),
         DType::Char => sort_char(&leaf),
-        _ => Err(PyValueError::new_err("sort not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("sort", x.dtype)),
     }
 }
 
@@ -30,7 +36,7 @@ pub fn sort_axis(py: Python<'_>, x: &GrumpyArray, dim: isize) -> PyResult<Grumpy
     let axis = normalize_axis(dim, ndim)?;
     if ndim == 1 {
         if axis != 0 {
-            return Err(PyValueError::new_err("sort: dim out of range."));
+            return Err(dim_out_of_range(dim, 1));
         }
         return sort(py, x);
     }
@@ -59,7 +65,7 @@ pub fn argsort(_py: Python<'_>, x: &GrumpyArray) -> PyResult<GrumpyArray> {
         DType::Float64 => argsort_f64(&leaf),
         DType::Bool => argsort_bool(&leaf),
         DType::Char => argsort_char(&leaf),
-        _ => Err(PyValueError::new_err("argsort not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("argsort", x.dtype)),
     }
 }
 
@@ -68,7 +74,7 @@ pub fn argsort_axis(py: Python<'_>, x: &GrumpyArray, dim: isize) -> PyResult<Gru
     let axis = normalize_axis(dim, ndim)?;
     if ndim == 1 {
         if axis != 0 {
-            return Err(PyValueError::new_err("argsort: dim out of range."));
+            return Err(dim_out_of_range(dim, 1));
         }
         return argsort(py, x);
     }
@@ -105,219 +111,8 @@ pub fn argreduce(py: Python<'_>, x: &GrumpyArray, op: ArgOp) -> PyResult<ArgOut>
         DType::Int64 => argreduce_i64(py, &leaf, op),
         DType::UInt32 => argreduce_u32(py, &leaf, op),
         DType::UInt64 => argreduce_u64(py, &leaf, op),
-        _ => Err(PyValueError::new_err("argmin/argmax not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("argmin/argmax", x.dtype)),
     }
-}
-
-#[allow(dead_code)]
-pub fn argreduce_dim1(_py: Python<'_>, x: &GrumpyArray, op: ArgOp) -> PyResult<GrumpyArray> {
-    if x.layout.has_union() {
-        return argreduce_union_last_axis(x, op);
-    }
-    let (lo, leaf) = listoffset_leaf2d(&x.layout)?;
-    let nrows = lo.len();
-
-    let mut out = Leaf::new(DType::Int64);
-    out.len = nrows;
-    out.has_nulls = true;
-    out.validity = Arc::new(bitvec![u8, Lsb0; 0; nrows]);
-    out.buffer = LeafBuffer::I64(Arc::new(vec![0i64; nrows]));
-    let outv = match &mut out.buffer { LeafBuffer::I64(v) => Arc::make_mut(v), _ => unreachable!() };
-    let out_valid = Arc::make_mut(&mut out.validity);
-
-    match x.dtype {
-        DType::Int32 => {
-            let v = match &leaf.buffer { LeafBuffer::I32(v) => v.as_slice(), _ => unreachable!() };
-            for r in 0..nrows {
-                let s = lo.offsets[r] as usize;
-                let e = lo.offsets[r + 1] as usize;
-                let mut best_ix: Option<usize> = None;
-                let mut best_val: i32 = 0;
-                for i in s..e {
-                    if !leaf.validity[i] { continue; }
-                    let x = v[i];
-                    match best_ix {
-                        None => { best_ix = Some(i - s); best_val = x; }
-                        Some(_) => {
-                            let better = match op {
-                                ArgOp::ArgMax | ArgOp::NanArgMax => x > best_val,
-                                ArgOp::ArgMin | ArgOp::NanArgMin => x < best_val,
-                            };
-                            if better { best_ix = Some(i - s); best_val = x; }
-                        }
-                    }
-                }
-                if let Some(ix) = best_ix {
-                    out_valid.set(r, true);
-                    outv[r] = ix as i64;
-                }
-            }
-        }
-        DType::Int64 => {
-            let v = match &leaf.buffer { LeafBuffer::I64(v) => v.as_slice(), _ => unreachable!() };
-            for r in 0..nrows {
-                let s = lo.offsets[r] as usize;
-                let e = lo.offsets[r + 1] as usize;
-                let mut best_ix: Option<usize> = None;
-                let mut best_val: i64 = 0;
-                for i in s..e {
-                    if !leaf.validity[i] { continue; }
-                    let x = v[i];
-                    match best_ix {
-                        None => { best_ix = Some(i - s); best_val = x; }
-                        Some(_) => {
-                            let better = match op {
-                                ArgOp::ArgMax | ArgOp::NanArgMax => x > best_val,
-                                ArgOp::ArgMin | ArgOp::NanArgMin => x < best_val,
-                            };
-                            if better { best_ix = Some(i - s); best_val = x; }
-                        }
-                    }
-                }
-                if let Some(ix) = best_ix {
-                    out_valid.set(r, true);
-                    outv[r] = ix as i64;
-                }
-            }
-        }
-        DType::UInt32 => {
-            let v = match &leaf.buffer { LeafBuffer::U32(v) => v.as_slice(), _ => unreachable!() };
-            for r in 0..nrows {
-                let s = lo.offsets[r] as usize;
-                let e = lo.offsets[r + 1] as usize;
-                let mut best_ix: Option<usize> = None;
-                let mut best_val: u32 = 0;
-                for i in s..e {
-                    if !leaf.validity[i] { continue; }
-                    let x = v[i];
-                    match best_ix {
-                        None => { best_ix = Some(i - s); best_val = x; }
-                        Some(_) => {
-                            let better = match op {
-                                ArgOp::ArgMax | ArgOp::NanArgMax => x > best_val,
-                                ArgOp::ArgMin | ArgOp::NanArgMin => x < best_val,
-                            };
-                            if better { best_ix = Some(i - s); best_val = x; }
-                        }
-                    }
-                }
-                if let Some(ix) = best_ix {
-                    out_valid.set(r, true);
-                    outv[r] = ix as i64;
-                }
-            }
-        }
-        DType::UInt64 => {
-            let v = match &leaf.buffer { LeafBuffer::U64(v) => v.as_slice(), _ => unreachable!() };
-            for r in 0..nrows {
-                let s = lo.offsets[r] as usize;
-                let e = lo.offsets[r + 1] as usize;
-                let mut best_ix: Option<usize> = None;
-                let mut best_val: u64 = 0;
-                for i in s..e {
-                    if !leaf.validity[i] { continue; }
-                    let x = v[i];
-                    match best_ix {
-                        None => { best_ix = Some(i - s); best_val = x; }
-                        Some(_) => {
-                            let better = match op {
-                                ArgOp::ArgMax | ArgOp::NanArgMax => x > best_val,
-                                ArgOp::ArgMin | ArgOp::NanArgMin => x < best_val,
-                            };
-                            if better { best_ix = Some(i - s); best_val = x; }
-                        }
-                    }
-                }
-                if let Some(ix) = best_ix {
-                    out_valid.set(r, true);
-                    outv[r] = ix as i64;
-                }
-            }
-        }
-        DType::Float64 => {
-            let v = match &leaf.buffer { LeafBuffer::F64(v) => v.as_slice(), _ => unreachable!() };
-            for r in 0..nrows {
-                let s = lo.offsets[r] as usize;
-                let e = lo.offsets[r + 1] as usize;
-                let mut best_ix: Option<usize> = None;
-                let mut best_val: f64 = 0.0;
-                let mut seen_non_nan = false;
-                for i in s..e {
-                    if !leaf.validity[i] { continue; }
-                    let x = v[i];
-                    if matches!(op, ArgOp::NanArgMax | ArgOp::NanArgMin) && x.is_nan() {
-                        continue;
-                    }
-                    match best_ix {
-                        None => { best_ix = Some(i - s); best_val = x; seen_non_nan = !x.is_nan(); }
-                        Some(_) => {
-                            let better = match op {
-                                ArgOp::ArgMax => cmp_f64_argmax(x, best_val),
-                                ArgOp::ArgMin => cmp_f64_argmin(x, best_val),
-                                ArgOp::NanArgMax => x > best_val,
-                                ArgOp::NanArgMin => x < best_val,
-                            };
-                            if better {
-                                best_ix = Some(i - s);
-                                best_val = x;
-                                seen_non_nan = seen_non_nan || !x.is_nan();
-                            }
-                        }
-                    }
-                }
-                if matches!(op, ArgOp::NanArgMax | ArgOp::NanArgMin) && !seen_non_nan {
-                    continue;
-                }
-                if let Some(ix) = best_ix {
-                    out_valid.set(r, true);
-                    outv[r] = ix as i64;
-                }
-            }
-        }
-        DType::Float32 => {
-            let v = match &leaf.buffer { LeafBuffer::F32(v) => v.as_slice(), _ => unreachable!() };
-            for r in 0..nrows {
-                let s = lo.offsets[r] as usize;
-                let e = lo.offsets[r + 1] as usize;
-                let mut best_ix: Option<usize> = None;
-                let mut best_val: f32 = 0.0;
-                let mut seen_non_nan = false;
-                for i in s..e {
-                    if !leaf.validity[i] { continue; }
-                    let x = v[i];
-                    if matches!(op, ArgOp::NanArgMax | ArgOp::NanArgMin) && x.is_nan() {
-                        continue;
-                    }
-                    match best_ix {
-                        None => { best_ix = Some(i - s); best_val = x; seen_non_nan = !x.is_nan(); }
-                        Some(_) => {
-                            let better = match op {
-                                ArgOp::ArgMax => cmp_f32_argmax(x, best_val),
-                                ArgOp::ArgMin => cmp_f32_argmin(x, best_val),
-                                ArgOp::NanArgMax => x > best_val,
-                                ArgOp::NanArgMin => x < best_val,
-                            };
-                            if better {
-                                best_ix = Some(i - s);
-                                best_val = x;
-                                seen_non_nan = seen_non_nan || !x.is_nan();
-                            }
-                        }
-                    }
-                }
-                if matches!(op, ArgOp::NanArgMax | ArgOp::NanArgMin) && !seen_non_nan {
-                    continue;
-                }
-                if let Some(ix) = best_ix {
-                    out_valid.set(r, true);
-                    outv[r] = ix as i64;
-                }
-            }
-        }
-        _ => return Err(PyValueError::new_err("argmin/argmax(dim=1) not implemented for this dtype.")),
-    }
-
-    Ok(GrumpyArray { dtype: DType::Int64, layout: Layout::Leaf(out) })
 }
 
 pub fn argreduce_axis_array(_py: Python<'_>, x: &GrumpyArray, dim: isize, op: ArgOp) -> PyResult<GrumpyArray> {
@@ -343,7 +138,7 @@ fn normalize_axis(dim: isize, ndim: usize) -> PyResult<usize> {
         d += ndim as isize;
     }
     if d < 0 || d as usize >= ndim {
-        return Err(PyValueError::new_err("dim out of range."));
+        return Err(dim_out_of_range(dim, ndim));
     }
     Ok(d as usize)
 }
@@ -353,38 +148,31 @@ fn layout_ndim_for_sort(layout: &Layout) -> PyResult<usize> {
         layout_ndim(layout)
     } else {
         let depth = crate::layout::list_chain_depth(layout).ok_or_else(|| {
-            PyValueError::new_err("sort/search requires a list-chain or union array.")
+            unsupported(
+                "sort/search",
+                "requires a list-chain or union array.",
+                "build inputs with gr.array(...) as a list-chain or UnionScalarList layout.",
+            )
         })?;
         Ok(depth + 1)
     }
 }
 
-fn array_as_leaf_1d(x: &GrumpyArray) -> PyResult<Leaf> {
-    if let Ok(l) = leaf_1d(&x.layout) {
-        Ok(l.clone())
-    } else {
-        leaf_view(&x.layout, x.dtype)
-    }
-}
-
 fn map_union_last_axis(
-    py: Python<'_>,
+    _py: Python<'_>,
     x: &GrumpyArray,
     mut f: impl FnMut(&GrumpyArray) -> PyResult<GrumpyArray>,
 ) -> PyResult<GrumpyArray> {
-    let n = x.len();
-    let mut segs: Vec<Layout> = Vec::with_capacity(n);
-    for i in 0..n {
-        let sub = drop_axis0_select_element(&x.layout, i)?;
-        let sub_arr = GrumpyArray {
+    let layout = map_union_axis0(&x.layout, x.dtype, |sub| {
+        Ok(f(&GrumpyArray {
             dtype: x.dtype,
             layout: sub,
-        };
-        segs.push(f(&sub_arr)?.layout);
-    }
+        })?
+        .layout)
+    })?;
     Ok(GrumpyArray {
         dtype: x.dtype,
-        layout: stack_axis0_broadcast(&segs, x.dtype)?,
+        layout,
     })
 }
 
@@ -438,161 +226,29 @@ fn read_first_i64_layout(layout: &Layout) -> PyResult<i64> {
     match layout {
         Layout::Leaf(l) => match &l.buffer {
             LeafBuffer::I64(v) => Ok(v[0]),
-            _ => Err(PyValueError::new_err("Internal error: expected int64 leaf.")),
+            _ => Err(internal("sort/search", "expected int64 leaf")),
         },
         Layout::ListOffset(lo) => read_first_i64_layout(lo.content.as_ref()),
-        _ => Err(PyValueError::new_err("Internal error: expected int64 layout.")),
+        _ => Err(internal("sort/search", "expected int64 layout")),
     }
 }
 
 fn sort_last_layout(layout: &Layout, dt: DType) -> PyResult<Layout> {
-    match layout {
-        Layout::Leaf(l) => {
-            if l.len <= 1 {
-                return Ok(layout.clone());
-            }
-            let lo = ListOffset {
-                offsets: Arc::new(vec![0i64, l.len as i64]),
-                content: Box::new(Layout::Leaf(l.clone())),
-            };
-            Ok(sort_listoffset_leaf(&lo, l, dt)?.layout)
-        }
-        Layout::ListOffset(lo) => match lo.content.as_ref() {
-            Layout::Leaf(leaf) => Ok(sort_listoffset_leaf(lo, leaf, dt)?.layout),
-            _ => Ok(Layout::ListOffset(ListOffset {
-                offsets: lo.offsets.clone(),
-                content: Box::new(sort_last_layout(lo.content.as_ref(), dt)?),
-            })),
-        },
-        Layout::UnionScalarList(u) => {
-            let list_content = sort_last_layout(u.lists.content.as_ref(), dt)?;
-            Ok(Layout::UnionScalarList(UnionScalarList {
-                tags: u.tags.clone(),
-                index: u.index.clone(),
-                scalars: u.scalars.clone(),
-                lists: ListOffset {
-                    offsets: u.lists.offsets.clone(),
-                    content: Box::new(list_content),
-                },
-            }))
-        }
-        Layout::OffsetView(v) => {
-            let content = sort_last_layout(v.content.as_ref(), dt)?;
-            Ok(Layout::OffsetView(crate::layout::OffsetView {
-                offsets: v.offsets.clone(),
-                start: v.start,
-                stop: v.stop,
-                content: Box::new(content),
-            }))
-        }
-        Layout::Indexed(ix) => {
-            let content = sort_last_layout(ix.content.as_ref(), dt)?;
-            Ok(Layout::Indexed(crate::layout::Indexed {
-                index: ix.index.clone(),
-                content: Box::new(content),
-            }))
-        }
-    }
+    map_last_axis(layout, LastAxisLeafMode::PromoteShortLeaf, &|lo, leaf| {
+        Ok(sort_listoffset_leaf(lo, leaf, dt)?.layout)
+    })
 }
 
 fn argsort_last_layout(layout: &Layout, dt: DType) -> PyResult<Layout> {
-    match layout {
-        Layout::Leaf(l) => {
-            if l.len <= 1 {
-                return Ok(layout.clone());
-            }
-            let lo = ListOffset {
-                offsets: Arc::new(vec![0i64, l.len as i64]),
-                content: Box::new(Layout::Leaf(l.clone())),
-            };
-            Ok(argsort_listoffset_leaf(&lo, l, dt)?.layout)
-        }
-        Layout::ListOffset(lo) => match lo.content.as_ref() {
-            Layout::Leaf(leaf) => Ok(argsort_listoffset_leaf(lo, leaf, dt)?.layout),
-            _ => Ok(Layout::ListOffset(ListOffset {
-                offsets: lo.offsets.clone(),
-                content: Box::new(argsort_last_layout(lo.content.as_ref(), dt)?),
-            })),
-        },
-        Layout::UnionScalarList(u) => {
-            let list_content = argsort_last_layout(u.lists.content.as_ref(), dt)?;
-            Ok(Layout::UnionScalarList(UnionScalarList {
-                tags: u.tags.clone(),
-                index: u.index.clone(),
-                scalars: u.scalars.clone(),
-                lists: ListOffset {
-                    offsets: u.lists.offsets.clone(),
-                    content: Box::new(list_content),
-                },
-            }))
-        }
-        Layout::OffsetView(v) => {
-            let content = argsort_last_layout(v.content.as_ref(), dt)?;
-            Ok(Layout::OffsetView(crate::layout::OffsetView {
-                offsets: v.offsets.clone(),
-                start: v.start,
-                stop: v.stop,
-                content: Box::new(content),
-            }))
-        }
-        Layout::Indexed(ix) => {
-            let content = argsort_last_layout(ix.content.as_ref(), dt)?;
-            Ok(Layout::Indexed(crate::layout::Indexed {
-                index: ix.index.clone(),
-                content: Box::new(content),
-            }))
-        }
-    }
+    map_last_axis(layout, LastAxisLeafMode::PromoteShortLeaf, &|lo, leaf| {
+        Ok(argsort_listoffset_leaf(lo, leaf, dt)?.layout)
+    })
 }
 
 fn argreduce_last_layout(layout: &Layout, dt: DType, op: ArgOp) -> PyResult<Layout> {
-    match layout {
-        Layout::Leaf(l) => {
-            if l.len <= 1 {
-                return Ok(layout.clone());
-            }
-            let lo = ListOffset {
-                offsets: Arc::new(vec![0i64, l.len as i64]),
-                content: Box::new(Layout::Leaf(l.clone())),
-            };
-            Ok(argreduce_listoffset_leaf(&lo, l, dt, op)?.layout)
-        }
-        Layout::ListOffset(lo) => match lo.content.as_ref() {
-            Layout::Leaf(leaf) => Ok(argreduce_listoffset_leaf(lo, leaf, dt, op)?.layout),
-            _ => Ok(Layout::ListOffset(ListOffset {
-                offsets: lo.offsets.clone(),
-                content: Box::new(argreduce_last_layout(lo.content.as_ref(), dt, op)?),
-            })),
-        },
-        Layout::UnionScalarList(u) => {
-            let list_content = argreduce_last_layout(u.lists.content.as_ref(), dt, op)?;
-            Ok(Layout::UnionScalarList(UnionScalarList {
-                tags: u.tags.clone(),
-                index: u.index.clone(),
-                scalars: u.scalars.clone(),
-                lists: ListOffset {
-                    offsets: u.lists.offsets.clone(),
-                    content: Box::new(list_content),
-                },
-            }))
-        }
-        Layout::OffsetView(v) => {
-            let content = argreduce_last_layout(v.content.as_ref(), dt, op)?;
-            Ok(Layout::OffsetView(crate::layout::OffsetView {
-                offsets: v.offsets.clone(),
-                start: v.start,
-                stop: v.stop,
-                content: Box::new(content),
-            }))
-        }
-        Layout::Indexed(ix) => {
-            let content = argreduce_last_layout(ix.content.as_ref(), dt, op)?;
-            Ok(Layout::Indexed(crate::layout::Indexed {
-                index: ix.index.clone(),
-                content: Box::new(content),
-            }))
-        }
-    }
+    map_last_axis(layout, LastAxisLeafMode::PromoteShortLeaf, &|lo, leaf| {
+        Ok(argreduce_listoffset_leaf(lo, leaf, dt, op)?.layout)
+    })
 }
 
 fn sort_listoffset_leaf(lo: &ListOffset, leaf: &Leaf, dt: DType) -> PyResult<GrumpyArray> {
@@ -670,7 +326,7 @@ fn sort_listoffset_leaf(lo: &ListOffset, leaf: &Leaf, dt: DType) -> PyResult<Gru
                 layout: Layout::ListOffset(ListOffset { offsets: lo.offsets.clone(), content: Box::new(Layout::Leaf(new_leaf_f64_from(outv))) }),
             }
         }
-        _ => return Err(PyValueError::new_err("sort(dim=-1) not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("sort(dim=-1)", dt)),
     };
     Ok(out)
 }
@@ -742,7 +398,7 @@ fn argsort_listoffset_leaf(lo: &ListOffset, leaf: &Leaf, dt: DType) -> PyResult<
                 }
             }
         }
-        _ => return Err(PyValueError::new_err("argsort(dim=-1) not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("argsort(dim=-1)", dt)),
     }
     Ok(GrumpyArray {
         dtype: DType::Int64,
@@ -876,7 +532,7 @@ fn argreduce_listoffset_leaf(lo: &ListOffset, leaf: &Leaf, dt: DType, op: ArgOp)
                 }
             }
         }
-        _ => return Err(PyValueError::new_err("argmax/argmin(dim=-1) not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("argmax/argmin(dim=-1)", dt)),
     }
 
     Ok(GrumpyArray { dtype: DType::Int64, layout: Layout::Leaf(out) })
@@ -967,7 +623,7 @@ pub fn search_sorted(_py: Python<'_>, x: &GrumpyArray, v: &GrumpyArray, right: b
                 };
             }
         }
-        _ => return Err(PyValueError::new_err("search_sorted not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("search_sorted", x.dtype)),
     }
     Ok(GrumpyArray { dtype: DType::Int64, layout: Layout::Leaf(out) })
 }
@@ -1029,7 +685,7 @@ pub fn partition(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<Grump
             out.select_nth_unstable_by(kth, |a, b| cmp_f32_numpy(*a, *b));
             Ok(GrumpyArray { dtype: DType::Float32, layout: Layout::Leaf(new_leaf_f32_from(out)) })
         }
-        _ => Err(PyValueError::new_err("partition not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("partition", x.dtype)),
     }
 }
 
@@ -1110,7 +766,7 @@ pub fn partition_dim1(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<
             }
             Ok(GrumpyArray { dtype: DType::Float32, layout: Layout::ListOffset(ListOffset { offsets: lo.offsets.clone(), content: Box::new(Layout::Leaf(new_leaf_f32_from(outv))) }) })
         }
-        _ => Err(PyValueError::new_err("partition(dim=1) not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("partition(dim=1)", x.dtype)),
     }
 }
 
@@ -1156,7 +812,7 @@ pub fn argpartition(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResult<Gr
             let v = match &leaf.buffer { LeafBuffer::F32(v) => v.as_slice(), _ => unreachable!() };
             idx.select_nth_unstable_by(kth, |&i, &j| cmp_f32_numpy(v[i], v[j]));
         }
-        _ => return Err(PyValueError::new_err("argpartition not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("argpartition", x.dtype)),
     }
     Ok(GrumpyArray { dtype: DType::Int64, layout: Layout::Leaf(new_leaf_i64_from(idx.into_iter().map(|i| i as i64).collect())) })
 }
@@ -1212,7 +868,7 @@ pub fn argpartition_dim1(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResu
                 }
             }
         }
-        _ => return Err(PyValueError::new_err("argpartition(dim=1) not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("argpartition(dim=1)", x.dtype)),
     }
     Ok(GrumpyArray {
         dtype: DType::Int64,
@@ -1220,202 +876,153 @@ pub fn argpartition_dim1(_py: Python<'_>, x: &GrumpyArray, kth: usize) -> PyResu
     })
 }
 
-fn partition_last_layout(layout: &Layout, dt: DType, kth: usize) -> PyResult<Layout> {
-    match layout {
-        Layout::Leaf(_) => Err(PyValueError::new_err("Internal error: partition_last_layout expected list.")),
-        Layout::ListOffset(lo) => match lo.content.as_ref() {
-            Layout::Leaf(_) => {
-                let tmp = GrumpyArray {
-                    dtype: dt,
-                    layout: layout.clone(),
-                };
-                Ok(Python::with_gil(|py| partition_dim1(py, &tmp, kth))?.layout)
-            }
-            _ => Ok(Layout::ListOffset(ListOffset {
-                offsets: lo.offsets.clone(),
-                content: Box::new(partition_last_layout(lo.content.as_ref(), dt, kth)?),
-            })),
-        },
-        Layout::UnionScalarList(u) => {
-            let list_content = partition_last_layout(u.lists.content.as_ref(), dt, kth)?;
-            Ok(Layout::UnionScalarList(UnionScalarList {
-                tags: u.tags.clone(),
-                index: u.index.clone(),
-                scalars: u.scalars.clone(),
-                lists: ListOffset {
-                    offsets: u.lists.offsets.clone(),
-                    content: Box::new(list_content),
-                },
-            }))
-        }
-        Layout::OffsetView(v) => {
-            let content = partition_last_layout(v.content.as_ref(), dt, kth)?;
-            Ok(Layout::OffsetView(crate::layout::OffsetView {
-                offsets: v.offsets.clone(),
-                start: v.start,
-                stop: v.stop,
-                content: Box::new(content),
-            }))
-        }
-        Layout::Indexed(ix) => {
-            let content = partition_last_layout(ix.content.as_ref(), dt, kth)?;
-            Ok(Layout::Indexed(crate::layout::Indexed {
-                index: ix.index.clone(),
-                content: Box::new(content),
-            }))
+fn partition_listoffset_leaf(lo: &ListOffset, leaf: &Leaf, dt: DType, kth: usize) -> PyResult<Layout> {
+    if leaf.has_nulls {
+        return Err(PyValueError::new_err("partition(dim=1) does not support nulls yet."));
+    }
+    let nrows = lo.len();
+    for r in 0..nrows {
+        let s = lo.offsets[r] as usize;
+        let e = lo.offsets[r + 1] as usize;
+        if kth >= (e - s) {
+            return Err(PyValueError::new_err("kth out of bounds for at least one row."));
         }
     }
+    match dt {
+        DType::Int32 => {
+            let v = match &leaf.buffer { LeafBuffer::I32(v) => v.as_slice(), _ => unreachable!() };
+            let mut outv = vec![0i32; leaf.len];
+            let mut scratch: Vec<i32> = Vec::new();
+            for r in 0..nrows {
+                let s = lo.offsets[r] as usize;
+                let e = lo.offsets[r + 1] as usize;
+                scratch.clear();
+                scratch.extend_from_slice(&v[s..e]);
+                scratch.select_nth_unstable(kth);
+                outv[s..e].copy_from_slice(&scratch);
+            }
+            Ok(Layout::ListOffset(ListOffset {
+                offsets: lo.offsets.clone(),
+                content: Box::new(Layout::Leaf(new_leaf_i32_from(outv))),
+            }))
+        }
+        DType::Int64 => {
+            let v = match &leaf.buffer { LeafBuffer::I64(v) => v.as_slice(), _ => unreachable!() };
+            let mut outv = vec![0i64; leaf.len];
+            let mut scratch: Vec<i64> = Vec::new();
+            for r in 0..nrows {
+                let s = lo.offsets[r] as usize;
+                let e = lo.offsets[r + 1] as usize;
+                scratch.clear();
+                scratch.extend_from_slice(&v[s..e]);
+                scratch.select_nth_unstable(kth);
+                outv[s..e].copy_from_slice(&scratch);
+            }
+            Ok(Layout::ListOffset(ListOffset {
+                offsets: lo.offsets.clone(),
+                content: Box::new(Layout::Leaf(new_leaf_i64_from(outv))),
+            }))
+        }
+        DType::Float64 => {
+            let v = match &leaf.buffer { LeafBuffer::F64(v) => v.as_slice(), _ => unreachable!() };
+            let mut outv = vec![0f64; leaf.len];
+            let mut scratch: Vec<f64> = Vec::new();
+            for r in 0..nrows {
+                let s = lo.offsets[r] as usize;
+                let e = lo.offsets[r + 1] as usize;
+                scratch.clear();
+                scratch.extend_from_slice(&v[s..e]);
+                scratch.select_nth_unstable_by(kth, |a, b| cmp_f64_numpy(*a, *b));
+                outv[s..e].copy_from_slice(&scratch);
+            }
+            Ok(Layout::ListOffset(ListOffset {
+                offsets: lo.offsets.clone(),
+                content: Box::new(Layout::Leaf(new_leaf_f64_from(outv))),
+            }))
+        }
+        DType::Float32 => {
+            let v = match &leaf.buffer { LeafBuffer::F32(v) => v.as_slice(), _ => unreachable!() };
+            let mut outv = vec![0f32; leaf.len];
+            let mut scratch: Vec<f32> = Vec::new();
+            for r in 0..nrows {
+                let s = lo.offsets[r] as usize;
+                let e = lo.offsets[r + 1] as usize;
+                scratch.clear();
+                scratch.extend_from_slice(&v[s..e]);
+                scratch.select_nth_unstable_by(kth, |a, b| cmp_f32_numpy(*a, *b));
+                outv[s..e].copy_from_slice(&scratch);
+            }
+            Ok(Layout::ListOffset(ListOffset {
+                offsets: lo.offsets.clone(),
+                content: Box::new(Layout::Leaf(new_leaf_f32_from(outv))),
+            }))
+        }
+        _ => Err(dtype_unsupported("partition(dim=1)", dt)),
+    }
+}
+
+fn argpartition_listoffset_leaf(lo: &ListOffset, leaf: &Leaf, dt: DType, kth: usize) -> PyResult<Layout> {
+    if leaf.has_nulls {
+        return Err(PyValueError::new_err("argpartition(dim=1) does not support nulls yet."));
+    }
+    let nrows = lo.len();
+    for r in 0..nrows {
+        let s = lo.offsets[r] as usize;
+        let e = lo.offsets[r + 1] as usize;
+        if kth >= (e - s) {
+            return Err(PyValueError::new_err("kth out of bounds for at least one row."));
+        }
+    }
+    let mut outv: Vec<i64> = vec![0; leaf.len];
+    match dt {
+        DType::Int32 => {
+            let v = match &leaf.buffer { LeafBuffer::I32(v) => v.as_slice(), _ => unreachable!() };
+            let mut idx: Vec<usize> = Vec::new();
+            for r in 0..nrows {
+                let s = lo.offsets[r] as usize;
+                let e = lo.offsets[r + 1] as usize;
+                let m = e - s;
+                idx.clear();
+                idx.extend(0..m);
+                idx.select_nth_unstable_by(kth, |&i, &j| v[s + i].cmp(&v[s + j]));
+                for (k, &ix) in idx.iter().enumerate() {
+                    outv[s + k] = ix as i64;
+                }
+            }
+        }
+        DType::Float64 => {
+            let v = match &leaf.buffer { LeafBuffer::F64(v) => v.as_slice(), _ => unreachable!() };
+            let mut idx: Vec<usize> = Vec::new();
+            for r in 0..nrows {
+                let s = lo.offsets[r] as usize;
+                let e = lo.offsets[r + 1] as usize;
+                let m = e - s;
+                idx.clear();
+                idx.extend(0..m);
+                idx.select_nth_unstable_by(kth, |&i, &j| cmp_f64_numpy(v[s + i], v[s + j]));
+                for (k, &ix) in idx.iter().enumerate() {
+                    outv[s + k] = ix as i64;
+                }
+            }
+        }
+        _ => return Err(dtype_unsupported("argpartition(dim=1)", dt)),
+    }
+    Ok(Layout::ListOffset(ListOffset {
+        offsets: lo.offsets.clone(),
+        content: Box::new(Layout::Leaf(new_leaf_i64_from(outv))),
+    }))
+}
+
+fn partition_last_layout(layout: &Layout, dt: DType, kth: usize) -> PyResult<Layout> {
+    map_last_axis(layout, LastAxisLeafMode::RequireListOffset, &|lo, leaf| {
+        partition_listoffset_leaf(lo, leaf, dt, kth)
+    })
 }
 
 fn argpartition_last_layout(layout: &Layout, dt: DType, kth: usize) -> PyResult<Layout> {
-    match layout {
-        Layout::Leaf(_) => Err(PyValueError::new_err("Internal error: argpartition_last_layout expected list.")),
-        Layout::ListOffset(lo) => match lo.content.as_ref() {
-            Layout::Leaf(_) => {
-                let tmp = GrumpyArray {
-                    dtype: dt,
-                    layout: layout.clone(),
-                };
-                Ok(Python::with_gil(|py| argpartition_dim1(py, &tmp, kth))?.layout)
-            }
-            _ => Ok(Layout::ListOffset(ListOffset {
-                offsets: lo.offsets.clone(),
-                content: Box::new(argpartition_last_layout(lo.content.as_ref(), dt, kth)?),
-            })),
-        },
-        Layout::UnionScalarList(u) => {
-            let list_content = argpartition_last_layout(u.lists.content.as_ref(), dt, kth)?;
-            Ok(Layout::UnionScalarList(UnionScalarList {
-                tags: u.tags.clone(),
-                index: u.index.clone(),
-                scalars: u.scalars.clone(),
-                lists: ListOffset {
-                    offsets: u.lists.offsets.clone(),
-                    content: Box::new(list_content),
-                },
-            }))
-        }
-        Layout::OffsetView(v) => {
-            let content = argpartition_last_layout(v.content.as_ref(), dt, kth)?;
-            Ok(Layout::OffsetView(crate::layout::OffsetView {
-                offsets: v.offsets.clone(),
-                start: v.start,
-                stop: v.stop,
-                content: Box::new(content),
-            }))
-        }
-        Layout::Indexed(ix) => {
-            let content = argpartition_last_layout(ix.content.as_ref(), dt, kth)?;
-            Ok(Layout::Indexed(crate::layout::Indexed {
-                index: ix.index.clone(),
-                content: Box::new(content),
-            }))
-        }
-    }
-}
-
-// -------- leaf helpers --------
-
-fn leaf_1d<'a>(layout: &'a Layout) -> PyResult<&'a Leaf> {
-    match layout {
-        Layout::Leaf(l) => Ok(l),
-        Layout::OffsetView(v) => leaf_1d(v.content.as_ref()),
-        Layout::Indexed(ix) => leaf_1d(ix.content.as_ref()),
-        Layout::ListOffset(_) => Err(PyValueError::new_err("Expected 1D leaf array.")),
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err("Union not supported.")),
-    }
-}
-
-fn listoffset_leaf2d<'a>(layout: &'a Layout) -> PyResult<(&'a ListOffset, &'a Leaf)> {
-    match layout {
-        Layout::ListOffset(lo) => match lo.content.as_ref() {
-            Layout::Leaf(l) => Ok((lo, l)),
-            _ => Err(PyValueError::new_err("Expected 2D list->leaf array.")),
-        },
-        Layout::OffsetView(v) => listoffset_leaf2d(v.content.as_ref()),
-        Layout::Indexed(ix) => listoffset_leaf2d(ix.content.as_ref()),
-        _ => Err(PyValueError::new_err("Expected 2D list->leaf array.")),
-    }
-}
-
-fn new_leaf_i64_from(v: Vec<i64>) -> Leaf {
-    let n = v.len();
-    let mut leaf = Leaf::new(DType::Int64);
-    leaf.len = n;
-    leaf.has_nulls = false;
-    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
-    leaf.buffer = LeafBuffer::I64(Arc::new(v));
-    leaf
-}
-
-fn new_leaf_i32_from(v: Vec<i32>) -> Leaf {
-    let n = v.len();
-    let mut leaf = Leaf::new(DType::Int32);
-    leaf.len = n;
-    leaf.has_nulls = false;
-    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
-    leaf.buffer = LeafBuffer::I32(Arc::new(v));
-    leaf
-}
-
-fn new_leaf_u32_from(v: Vec<u32>) -> Leaf {
-    let n = v.len();
-    let mut leaf = Leaf::new(DType::UInt32);
-    leaf.len = n;
-    leaf.has_nulls = false;
-    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
-    leaf.buffer = LeafBuffer::U32(Arc::new(v));
-    leaf
-}
-
-fn new_leaf_u64_from(v: Vec<u64>) -> Leaf {
-    let n = v.len();
-    let mut leaf = Leaf::new(DType::UInt64);
-    leaf.len = n;
-    leaf.has_nulls = false;
-    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
-    leaf.buffer = LeafBuffer::U64(Arc::new(v));
-    leaf
-}
-
-fn new_leaf_f32_from(v: Vec<f32>) -> Leaf {
-    let n = v.len();
-    let mut leaf = Leaf::new(DType::Float32);
-    leaf.len = n;
-    leaf.has_nulls = false;
-    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
-    leaf.buffer = LeafBuffer::F32(Arc::new(v));
-    leaf
-}
-
-fn new_leaf_f64_from(v: Vec<f64>) -> Leaf {
-    let n = v.len();
-    let mut leaf = Leaf::new(DType::Float64);
-    leaf.len = n;
-    leaf.has_nulls = false;
-    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
-    leaf.buffer = LeafBuffer::F64(Arc::new(v));
-    leaf
-}
-
-fn new_leaf_bool_from(v: Vec<u8>) -> Leaf {
-    let n = v.len();
-    let mut leaf = Leaf::new(DType::Bool);
-    leaf.len = n;
-    leaf.has_nulls = false;
-    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
-    leaf.buffer = LeafBuffer::Bool(Arc::new(v));
-    leaf
-}
-
-fn new_leaf_char_from(v: Vec<u32>) -> Leaf {
-    let n = v.len();
-    let mut leaf = Leaf::new(DType::Char);
-    leaf.len = n;
-    leaf.has_nulls = false;
-    leaf.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
-    leaf.buffer = LeafBuffer::Char(Arc::new(v));
-    leaf
+    map_last_axis(layout, LastAxisLeafMode::RequireListOffset, &|lo, leaf| {
+        argpartition_listoffset_leaf(lo, leaf, dt, kth)
+    })
 }
 
 // -------- sort implementations --------

@@ -1,6 +1,8 @@
 use crate::dtype::DType;
+use crate::error::{
+    arg_invalid, dtype_unsupported, index_out_of_bounds, internal, schema_violation, unknown_column,
+};
 use crate::layout::{drop_axis0_select_element, take_range, GrumpyArray, Layout};
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyDict, PySequence, PySlice, PyTuple};
 use std::collections::HashMap;
@@ -15,9 +17,13 @@ pub struct Schema {
 
 impl Schema {
     pub fn parse(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let seq = obj
-            .downcast::<PySequence>()
-            .map_err(|_| PyValueError::new_err("schema must be a list/tuple of strings or tuples of strings."))?;
+        let seq = obj.downcast::<PySequence>().map_err(|_| {
+            schema_violation(
+                "schema must be a list/tuple of strings or tuples of strings",
+                "schema= must be a sequence of level names.",
+                "pass schema=['level0', 'level1'] or schema=[('a','alias'), 'b'].",
+            )
+        })?;
         let mut levels: Vec<Vec<String>> = Vec::new();
         for i in 0..seq.len()? {
             let it = seq.get_item(i)?;
@@ -27,30 +33,45 @@ impl Schema {
                 let mut al: Vec<String> = Vec::new();
                 for j in 0..t.len() {
                     al.push(t.get_item(j)?.extract::<String>().map_err(|_| {
-                        PyValueError::new_err("schema tuples must contain only strings.")
+                        schema_violation(
+                            "schema tuples must contain only strings",
+                            "each alias tuple must hold str names only.",
+                            "use schema=[('primary', 'alias'), 'other'].",
+                        )
                     })?);
                 }
                 if al.is_empty() {
-                    return Err(PyValueError::new_err("schema tuples cannot be empty."));
+                    return Err(schema_violation(
+                        "schema tuples cannot be empty",
+                        "each alias tuple must name at least one level.",
+                        "remove empty tuples from schema=.",
+                    ));
                 }
                 levels.push(al);
             } else {
-                return Err(PyValueError::new_err(
-                    "schema must contain strings or tuples of strings.",
+                return Err(schema_violation(
+                    "schema must contain strings or tuples of strings",
+                    "each schema level must be a str or tuple[str, ...].",
+                    "pass schema=['level0'] or schema=[('a', 'b')].",
                 ));
             }
         }
         if levels.is_empty() {
-            return Err(PyValueError::new_err("schema cannot be empty."));
+            return Err(schema_violation(
+                "schema cannot be empty",
+                "at least one nesting level is required when schema= is provided.",
+                "pass schema=['level0'] or omit schema= for flat columns.",
+            ));
         }
         let mut name_to_level = HashMap::new();
         for (lvl, names) in levels.iter().enumerate() {
             for n in names {
                 if name_to_level.insert(n.clone(), lvl).is_some() {
-                    return Err(PyValueError::new_err(format!(
-                        "schema name '{}' appears more than once.",
-                        n
-                    )));
+                    return Err(schema_violation(
+                        format!("schema name '{n}' appears more than once"),
+                        "each schema level alias must be unique across all levels.",
+                        "rename duplicate aliases or merge them into one tuple.",
+                    ));
                 }
             }
         }
@@ -66,10 +87,11 @@ impl Schema {
                 }
             }
         }
-        Err(PyValueError::new_err(format!(
-            "Column '{}' does not start with any valid schema prefix.",
-            colname
-        )))
+        Err(schema_violation(
+            format!("column '{colname}' does not start with any valid schema prefix"),
+            "column names must begin with a declared schema level prefix.",
+            "rename the column or extend schema= with the expected prefix.",
+        ))
     }
 }
 
@@ -91,7 +113,7 @@ pub struct GrumpyDataFrame {
 impl GrumpyDataFrame {
     pub fn new(names: Vec<String>, cols: Vec<GrumpyArray>, schema: Option<Schema>) -> PyResult<Self> {
         if names.len() != cols.len() {
-            return Err(PyValueError::new_err("Internal error: names/cols mismatch."));
+            return Err(internal("GrumpyDataFrame::new", "names/cols length mismatch"));
         }
         let mut df = Self { names, cols, schema, canon: CanonShape::default() };
         df.recompute_canon()?;
@@ -104,13 +126,17 @@ impl GrumpyDataFrame {
 
     pub fn concat_axis0(&self, other: &Self) -> PyResult<Self> {
         if self.names != other.names {
-            return Err(PyValueError::new_err(
-                "concat axis 0 requires dataframes with the same column names.",
+            return Err(schema_violation(
+                "concat axis 0 requires matching column names",
+                "both dataframes must have the same columns in the same order.",
+                "align column names before concatenating.",
             ));
         }
         if self.schema.is_some() != other.schema.is_some() {
-            return Err(PyValueError::new_err(
-                "concat axis 0 requires matching schema presence.",
+            return Err(schema_violation(
+                "concat axis 0 requires matching schema presence",
+                "both sides must either have schema= or neither.",
+                "construct both dataframes with the same schema= setting.",
             ));
         }
         let mut cols: Vec<GrumpyArray> = Vec::with_capacity(self.cols.len());
@@ -156,7 +182,7 @@ impl GrumpyDataFrame {
                 }
             }
             if !found {
-                return Err(PyValueError::new_err(format!("Unknown column '{}'.", n)));
+                return Err(unknown_column(n));
             }
         }
         GrumpyDataFrame::new(out_names, out_cols, self.schema.clone())
@@ -194,43 +220,6 @@ impl GrumpyDataFrame {
                 })
             } else {
                 Layout::Indexed(crate::layout::Indexed { index: Arc::new(sub), content: Box::new(c.layout.clone()) })
-            };
-            out_cols.push(GrumpyArray { dtype: c.dtype, layout });
-        }
-        GrumpyDataFrame::new(self.names.clone(), out_cols, self.schema.clone())
-    }
-
-    /// Fast axis-0 slice without building an explicit index vector.
-    ///
-    /// Uses `OffsetView` for top-level `ListOffset` columns to preserve offsets semantics and
-    /// avoid copies. For non-ListOffset columns, falls back to `take_range`.
-    pub fn row_slice_view(&self, start: usize, stop: usize) -> PyResult<Self> {
-        if start > stop {
-            return Err(PyValueError::new_err("Invalid slice range."));
-        }
-        let mut out_cols: Vec<GrumpyArray> = Vec::with_capacity(self.cols.len());
-        for c in &self.cols {
-            let n = c.len();
-            let s = start.min(n);
-            let e = stop.min(n);
-            let layout = match &c.layout {
-                Layout::ListOffset(lo) => Layout::OffsetView(crate::layout::OffsetView {
-                    offsets: lo.offsets.clone(),
-                    start: s,
-                    stop: e,
-                    content: lo.content.clone(),
-                }),
-                Layout::OffsetView(v) => {
-                    let ss = (v.start + s).min(v.stop);
-                    let ee = (v.start + e).min(v.stop);
-                    Layout::OffsetView(crate::layout::OffsetView {
-                        offsets: v.offsets.clone(),
-                        start: ss,
-                        stop: ee,
-                        content: v.content.clone(),
-                    })
-                }
-                _ => take_range(&c.layout, s, e)?,
             };
             out_cols.push(GrumpyArray { dtype: c.dtype, layout });
         }
@@ -283,17 +272,25 @@ impl GrumpyDataFrame {
             .get(level)
             .and_then(|x| x.as_ref())
             .ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "Cannot re-nest: missing canonical offsets for schema level {level} ('{level_name}')."
-                ))
+                schema_violation(
+                    format!(
+                        "cannot re-nest: missing canonical offsets for schema level {level} ('{level_name}')"
+                    ),
+                    "canonical offsets for this schema level were not recorded.",
+                    "ensure all columns at this level share the same nested shape before assignment.",
+                )
             })?;
         let total = *canon_off_level.last().unwrap() as usize;
         if rhs.len() != total {
-            return Err(PyValueError::new_err(format!(
-                "Dot-notation assignment at '{level_name}': RHS must have outer length {total} (total elements at that level) or {} (axis-0 length), but has {}.",
-                self.nrows(),
-                rhs.len()
-            )));
+            return Err(schema_violation(
+                format!("dot-notation assignment at '{level_name}': RHS length mismatch"),
+                format!(
+                    "expected outer length {total} (total elements at that level) or {} (axis-0 length), but got {}.",
+                    self.nrows(),
+                    rhs.len()
+                ),
+                "match the canonical nested shape or pass a column with axis-0 length equal to nrows.",
+            ));
         }
         let mut cur = rhs.layout;
         for lev in (1..=level).rev() {
@@ -303,9 +300,11 @@ impl GrumpyDataFrame {
                 .get(lev)
                 .and_then(|x| x.as_ref())
                 .ok_or_else(|| {
-                    PyValueError::new_err(format!(
-                        "Cannot re-nest: missing canonical offsets for schema level {lev}."
-                    ))
+                    schema_violation(
+                        format!("cannot re-nest: missing canonical offsets for schema level {lev}"),
+                        "canonical offsets for this schema level were not recorded.",
+                        "ensure all columns at this level share the same nested shape before assignment.",
+                    )
                 })?
                 .clone();
             cur = Layout::ListOffset(crate::layout::ListOffset {
@@ -321,10 +320,11 @@ impl GrumpyDataFrame {
         let n = arr.len();
         if let Some(cur) = self.canon.nrows {
             if self.schema.is_some() && cur != n {
-                return Err(PyValueError::new_err(format!(
-                    "Column '{}' has length {}, but dataframe has length {} (schema requires equal lengths).",
-                    name, n, cur
-                )));
+                return Err(schema_violation(
+                    format!("column '{name}' has length {n}, but dataframe has length {cur}"),
+                    "under a schema, all columns must share the same axis-0 length.",
+                    "reshape or re-nest the column to match dataframe nrows.",
+                ));
             }
         }
 
@@ -332,12 +332,14 @@ impl GrumpyDataFrame {
             let lvl = schema.level_for_column(name)?;
             let ndim = crate::layout::layout_ndim(&arr.layout)?;
             if ndim < lvl + 1 {
-                return Err(PyValueError::new_err(format!(
-                    "Column '{}' must have at least {} dimensions due to schema prefix, but has {}.",
-                    name,
-                    lvl + 1,
-                    ndim
-                )));
+                return Err(schema_violation(
+                    format!(
+                        "column '{name}' must have at least {} dimensions due to schema prefix, but has {ndim}",
+                        lvl + 1
+                    ),
+                    "column nesting depth is below the schema level declared by its name prefix.",
+                    "wrap the column in ListOffset nesting to match the schema level.",
+                ));
             }
             // Validate canonical shapes up to the schema level of this column.
             // Axis 0 is length; for each further schema level L>=1, compare the listoffset offsets at axis L-1.
@@ -351,10 +353,11 @@ impl GrumpyDataFrame {
                     }
                     if let Some(canon_off) = self.canon.offsets.get(lev).and_then(|x| x.as_ref()) {
                         if canon_off.as_slice() != off.as_slice() {
-                            return Err(PyValueError::new_err(format!(
-                                "Column '{}' does not match schema shape at level {}.",
-                                name, lev
-                            )));
+                            return Err(schema_violation(
+                                format!("column '{name}' does not match schema shape at level {lev}"),
+                                "listoffset offsets at this level differ from the canonical dataframe shape.",
+                                "align nested structure with other columns at the same schema level.",
+                            ));
                         }
                     }
                 }
@@ -380,10 +383,14 @@ impl GrumpyDataFrame {
             for (i, c) in self.cols.iter().enumerate() {
                 let n = c.len();
                 if n != nrows {
-                    return Err(PyValueError::new_err(format!(
-                        "Dataframe columns must have same length under a schema; '{}' has {} but first column has {}.",
-                        self.names[i], n, nrows
-                    )));
+                    return Err(schema_violation(
+                        format!(
+                            "dataframe columns must have same length under a schema; '{}' has {n} but first column has {nrows}",
+                            self.names[i]
+                        ),
+                        "all columns must share axis-0 length when schema= is set.",
+                        "reshape columns to the same outer length before constructing the dataframe.",
+                    ));
                 }
             }
             self.canon.nrows = Some(nrows);
@@ -488,7 +495,7 @@ fn flat_max_scalar(py: Python<'_>, arr: &GrumpyArray) -> PyResult<PyObject> {
         DType::Int32 | DType::Int64 => flat_max_int(py, arr),
         DType::UInt32 | DType::UInt64 => flat_max_uint(py, arr),
         DType::Float32 | DType::Float64 => flat_max_float(py, arr),
-        _ => Err(PyValueError::new_err("DataFrame max currently only supports numeric dtypes.")),
+        _ => Err(dtype_unsupported("DataFrame.max", arr.dtype)),
     }
 }
 
@@ -595,7 +602,7 @@ where
                         (crate::layout::LeafBuffer::U64(v), _) => f(0, v[i] as u64, 0.0, NumKind::UInt)?,
                         (crate::layout::LeafBuffer::F32(v), _) => f(0, 0, v[i] as f64, NumKind::Float)?,
                         (crate::layout::LeafBuffer::F64(v), _) => f(0, 0, v[i], NumKind::Float)?,
-                        _ => return Err(PyValueError::new_err("Unsupported dtype for DataFrame reduction.")),
+                        _ => return Err(dtype_unsupported("DataFrame reduction", dtype)),
                     }
                 }
                 Ok(())
@@ -640,7 +647,7 @@ where
                                     (crate::layout::LeafBuffer::U64(v), _) => f(0, v[ix] as u64, 0.0, NumKind::UInt)?,
                                     (crate::layout::LeafBuffer::F32(v), _) => f(0, 0, v[ix] as f64, NumKind::Float)?,
                                     (crate::layout::LeafBuffer::F64(v), _) => f(0, 0, v[ix], NumKind::Float)?,
-                                    _ => return Err(PyValueError::new_err("Unsupported dtype for DataFrame reduction.")),
+                                    _ => return Err(dtype_unsupported("DataFrame reduction", dtype)),
                                 }
                             }
                         }
@@ -651,7 +658,7 @@ where
                             let sub = take_range(u.lists.content.as_ref(), start, end)?;
                             walk(&sub, dtype, f)?;
                         }
-                        _ => return Err(PyValueError::new_err("Invalid union tag.")),
+                        _ => return Err(internal("DataFrame walk", "invalid union tag")),
                     }
                 }
                 Ok(())
@@ -670,7 +677,11 @@ pub fn parse_row_index(py: Python<'_>, idx: &Bound<'_, PyAny>, n: usize) -> PyRe
         let stop = t.get_item(1)?.extract::<i64>()?;
         let step = t.get_item(2)?.extract::<i64>()?;
         if step == 0 {
-            return Err(PyValueError::new_err("slice step cannot be zero."));
+            return Err(arg_invalid(
+                "slice step",
+                "step cannot be zero",
+                "use a non-zero step for row slicing.",
+            ));
         }
         let mut out: Vec<i64> = Vec::new();
         let mut i = start;
@@ -693,7 +704,7 @@ pub fn parse_row_index(py: Python<'_>, idx: &Bound<'_, PyAny>, n: usize) -> PyRe
             i += n as i64;
         }
         if i < 0 || i >= n as i64 {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(i as usize, n, "for dataframe row index"));
         }
         return Ok(Arc::new(vec![i]));
     }
@@ -713,8 +724,10 @@ pub fn parse_row_index(py: Python<'_>, idx: &Bound<'_, PyAny>, n: usize) -> PyRe
         }
         if all_bool {
             if m != n {
-                return Err(PyValueError::new_err(
-                    "Boolean indexing requires mask length to match dataframe length.",
+                return Err(schema_violation(
+                    "boolean indexing requires mask length to match dataframe length",
+                    format!("mask has length {m} but dataframe has {n} rows."),
+                    "pass a boolean mask with one entry per row.",
                 ));
             }
             let mut out: Vec<i64> = Vec::new();
@@ -726,8 +739,10 @@ pub fn parse_row_index(py: Python<'_>, idx: &Bound<'_, PyAny>, n: usize) -> PyRe
             return Ok(Arc::new(out));
         }
     }
-    Err(PyValueError::new_err(
-        "Row index must be int, slice, or boolean mask.",
+    Err(arg_invalid(
+        "index",
+        "row index must be int, slice, or boolean mask",
+        "use df[i], df[start:stop], or df[mask] for row selection.",
     ))
 }
 

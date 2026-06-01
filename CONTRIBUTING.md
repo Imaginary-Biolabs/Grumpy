@@ -25,9 +25,27 @@ Rust changes require a recent stable toolchain. `Cargo.lock` is committed for re
 
 ## Code style
 
-- Rust: performance-first kernels in `src/`, thin bindings in `py_api.rs`.
+- Rust: performance-first kernels in `src/`, thin bindings in `src/py_api/`.
 - Python: thin wrappers in `python/grumpy/__init__.py`; streaming/compiler logic in dedicated modules.
 - Docstrings: NumPy-style for public Python APIs.
+
+## Error reporting
+
+User-facing errors must explain **what** failed, **why** (root cause), and **how to fix** it. Use the shared format:
+
+```text
+grumpy.<Code>: <summary>
+  cause: …
+  fix: …
+```
+
+- **Rust:** `crate::error` in `src/error.rs` — see helpers like `index_out_of_bounds`, `broadcast_failed`, `cast_not_allowed`.
+- **Python:** `python/grumpy/errors.py` — `raise_grumpy_error`, `arg_invalid`, etc.
+- **Docs:** [docs/errors.md](docs/errors.md) lists codes and the contributor checklist.
+- **Tests:** add cases to `tests/test_errors.py` for new failure modes; assert `grumpy.<Code>`, `cause:`, and `fix:` appear.
+
+Avoid vague messages (`"Index out of bounds."`, `"Internal error: …"`) for conditions users can correct.
+Reserve `InternalError` for invariant violations and include a bug-report `fix:` line.
 
 ## Reporting issues
 

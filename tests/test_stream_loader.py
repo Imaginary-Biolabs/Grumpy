@@ -59,6 +59,15 @@ def test_load_slice_parity_array(tmp_path):
         assert partial.to_list() == expected.to_list()
 
 
+def test_load_slice_parity_union(tmp_path):
+    x = gr.array([1, [2, 3], 4, [5]], dtype=gr.int64)
+    path = str(tmp_path / "union.gr")
+    gr.save(x, path, chunk_size=2)
+    full = gr.load(path)
+    partial = gr._core.load_slice(path, 1, 3)
+    assert partial.to_list() == full[1:3].to_list()
+
+
 def test_load_slice_parity_dataframe(tmp_path):
     df = _make_protein_like_df(n_scenes=5, mols_per_scene=2)
     path = str(tmp_path / "df.gr")
@@ -148,7 +157,7 @@ def test_shuffle_requires_seed(tmp_path):
     x = gr.array(list(range(10)), dtype=gr.int64)
     path = str(tmp_path / "a.gr")
     gr.save(x, path)
-    with pytest.raises(ValueError, match="seed is required"):
+    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
         gr.stream(path, batch_size=4, shuffle=True)
 
 
@@ -245,6 +254,18 @@ def test_save_generator_array(tmp_path):
     gr.save(batches(), path, chunk_size=2)
     loaded = gr.load(path)
     assert loaded.to_list() == [[0], [1], [2], [3], [4]]
+
+
+def test_save_generator_union(tmp_path):
+    path = str(tmp_path / "gen_union.gr")
+
+    def batches():
+        yield gr.array([1, [2]], dtype=gr.int64)
+        yield gr.array([[3, 4]], dtype=gr.int64)
+
+    gr.save(batches(), path)
+    loaded = gr.load(path)
+    assert loaded.to_list() == [1, [2], [3, 4]]
 
 
 def test_save_generator_dataframe(tmp_path):

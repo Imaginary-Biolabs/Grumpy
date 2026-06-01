@@ -2,6 +2,11 @@ use crate::dtype::{is_sequence_like, DType};
 use bitvec::prelude::*;
 use half::f16;
 use numpy::PyUntypedArrayMethods;
+use crate::error::{
+    arg_invalid, concat_incompatible, dtype_mismatch, dtype_unsupported, index_out_of_bounds,
+    index_out_of_bounds_simple, internal, internal_dtype_buffer_mismatch, invalid_slice_range,
+    layout_unsupported, shape_mismatch, unsupported,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyFloat, PyInt, PyList, PySequence};
@@ -89,7 +94,7 @@ impl Indexed {
 
     pub fn element_to_py(&self, py: Python<'_>, idx: usize) -> PyResult<PyObject> {
         if idx >= self.len() {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, self.len(), "on indexed view"));
         }
         // Negative indices are supported (Python-style) against the content length.
         let n = self.content.len() as i64;
@@ -98,7 +103,7 @@ impl Indexed {
             ix += n;
         }
         if ix < 0 || ix >= n {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         self.content.element_to_py(py, ix as usize)
     }
@@ -119,11 +124,11 @@ impl OffsetView {
 
     pub fn list_element_to_py(&self, py: Python<'_>, idx: usize) -> PyResult<PyObject> {
         if idx >= self.len() {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, self.len(), "on indexed view"));
         }
         let abs = self.start + idx;
         if abs + 1 >= self.offsets.len() {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         let start = self.offsets[abs] as usize;
         let end = self.offsets[abs + 1] as usize;
@@ -143,7 +148,7 @@ impl OffsetView {
 /// batches are typically `OffsetView`s.
 pub fn offsetview_to_listoffset(v: &OffsetView) -> PyResult<ListOffset> {
     if v.start > v.stop || v.stop >= v.offsets.len() {
-        return Err(PyValueError::new_err("Invalid OffsetView range."));
+        return Err(invalid_slice_range(v.start, v.stop, v.offsets.len().saturating_sub(1)));
     }
     let base = v.offsets[v.start];
     let mut offs: Vec<i64> = Vec::with_capacity(v.stop - v.start + 1);
@@ -334,7 +339,7 @@ impl LeafBuffer {
             out.extend(b.iter().cloned());
             Ok(LeafBuffer::String(Arc::new(out)))
         }
-            _ => Err(PyValueError::new_err("Internal error: dtype mismatch in leaf concat.")),
+            _ => Err(internal_dtype_buffer_mismatch("leaf concat", DType::Int8)),
         }
     }
 
@@ -353,7 +358,7 @@ impl LeafBuffer {
             (LeafBuffer::F64(o), LeafBuffer::F64(s)) => { Arc::make_mut(o).push(s[idx]); Ok(()) }
             (LeafBuffer::Bool(o), LeafBuffer::Bool(s)) => { Arc::make_mut(o).push(s[idx]); Ok(()) }
             (LeafBuffer::Char(o), LeafBuffer::Char(s)) => { Arc::make_mut(o).push(s[idx]); Ok(()) }
-            _ => Err(PyValueError::new_err("Internal error: dtype mismatch in push_from_index.")),
+            _ => Err(internal("push_from_index", "dtype mismatch in leaf buffer")),
         }
     }
 
@@ -380,7 +385,7 @@ impl LeafBuffer {
                 Arc::make_mut(o).extend(std::iter::repeat(val).take(count));
                 Ok(())
             }
-            _ => Err(PyValueError::new_err("Internal error: dtype mismatch in extend_repeat_first.")),
+            _ => Err(internal("extend_repeat_first", "dtype mismatch in leaf buffer")),
         }
     }
     pub fn as_bytes(&self) -> &[u8] {
@@ -419,8 +424,8 @@ impl LeafBuffer {
             (LeafBuffer::U64(v), DType::UInt64) => { Arc::make_mut(v).push(u64::from_ne_bytes(bytes.try_into().unwrap())); Ok(()) }
             (LeafBuffer::F64(v), DType::Float64) => { Arc::make_mut(v).push(f64::from_ne_bytes(bytes.try_into().unwrap())); Ok(()) }
             (LeafBuffer::Char(v), DType::Char) => { Arc::make_mut(v).push(u32::from_ne_bytes(bytes.try_into().unwrap())); Ok(()) }
-            (LeafBuffer::String(_), DType::String) => Err(PyValueError::new_err("Internal error: push_from_bytes not supported for dtype=string.")),
-            _ => Err(PyValueError::new_err("Internal error: dtype mismatch in push_from_bytes.")),
+            (LeafBuffer::String(_), DType::String) => Err(dtype_unsupported("push_from_bytes", DType::String)),
+            _ => Err(internal("push_from_bytes", "dtype mismatch in leaf buffer")),
         }
     }
 
@@ -439,8 +444,8 @@ impl LeafBuffer {
             (LeafBuffer::U64(v), DType::UInt64) => { Arc::make_mut(v)[idx] = u64::from_ne_bytes(bytes.try_into().unwrap()); Ok(()) }
             (LeafBuffer::F64(v), DType::Float64) => { Arc::make_mut(v)[idx] = f64::from_ne_bytes(bytes.try_into().unwrap()); Ok(()) }
             (LeafBuffer::Char(v), DType::Char) => { Arc::make_mut(v)[idx] = u32::from_ne_bytes(bytes.try_into().unwrap()); Ok(()) }
-            (LeafBuffer::String(_), DType::String) => Err(PyValueError::new_err("Internal error: set_from_bytes not supported for dtype=string.")),
-            _ => Err(PyValueError::new_err("Internal error: dtype mismatch in set_from_bytes.")),
+            (LeafBuffer::String(_), DType::String) => Err(dtype_unsupported("set_from_bytes", DType::String)),
+            _ => Err(internal("set_from_bytes", "dtype mismatch in leaf buffer")),
         }
     }
 }
@@ -473,36 +478,36 @@ impl Leaf {
 
     pub fn scalar_to_py(&self, py: Python<'_>, idx: usize) -> PyResult<PyObject> {
         if idx >= self.len {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, self.len, "on leaf"));
         }
         if !self.validity[idx] {
             return Ok(py.None());
         }
         match self.dtype {
-            DType::Int8 => match &self.buffer { LeafBuffer::I8(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
-            DType::UInt8 => match &self.buffer { LeafBuffer::U8(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
-            DType::Bool => match &self.buffer { LeafBuffer::Bool(v) => Ok((v[idx] != 0).into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
-            DType::Int16 => match &self.buffer { LeafBuffer::I16(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
-            DType::UInt16 => match &self.buffer { LeafBuffer::U16(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
+            DType::Int8 => match &self.buffer { LeafBuffer::I8(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
+            DType::UInt8 => match &self.buffer { LeafBuffer::U8(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
+            DType::Bool => match &self.buffer { LeafBuffer::Bool(v) => Ok((v[idx] != 0).into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
+            DType::Int16 => match &self.buffer { LeafBuffer::I16(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
+            DType::UInt16 => match &self.buffer { LeafBuffer::U16(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
             DType::Float16 => {
-                let bits = match &self.buffer { LeafBuffer::F16(v) => v[idx], _ => return Err(PyValueError::new_err("Internal dtype mismatch")) };
+                let bits = match &self.buffer { LeafBuffer::F16(v) => v[idx], _ => return Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) };
                 let v = f16::from_bits(bits);
                 Ok(f32::from(v).into_py(py))
             }
-            DType::Int32 => match &self.buffer { LeafBuffer::I32(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
-            DType::UInt32 => match &self.buffer { LeafBuffer::U32(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
-            DType::Float32 => match &self.buffer { LeafBuffer::F32(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
-            DType::Int64 => match &self.buffer { LeafBuffer::I64(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
-            DType::UInt64 => match &self.buffer { LeafBuffer::U64(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
-            DType::Float64 => match &self.buffer { LeafBuffer::F64(v) => Ok(v[idx].into_py(py)), _ => Err(PyValueError::new_err("Internal dtype mismatch")) },
+            DType::Int32 => match &self.buffer { LeafBuffer::I32(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
+            DType::UInt32 => match &self.buffer { LeafBuffer::U32(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
+            DType::Float32 => match &self.buffer { LeafBuffer::F32(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
+            DType::Int64 => match &self.buffer { LeafBuffer::I64(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
+            DType::UInt64 => match &self.buffer { LeafBuffer::U64(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
+            DType::Float64 => match &self.buffer { LeafBuffer::F64(v) => Ok(v[idx].into_py(py)), _ => Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) },
             DType::Char => {
-                let v = match &self.buffer { LeafBuffer::Char(v) => v[idx], _ => return Err(PyValueError::new_err("Internal dtype mismatch")) };
+                let v = match &self.buffer { LeafBuffer::Char(v) => v[idx], _ => return Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) };
                 let c = char::from_u32(v)
-                    .ok_or_else(|| PyValueError::new_err("Invalid char value."))?;
+                    .ok_or_else(|| arg_invalid("char", "invalid Unicode scalar value", "use a valid UTF-32 code point."))?;
                 Ok(c.to_string().into_py(py))
             }
             DType::String => {
-                let s = match &self.buffer { LeafBuffer::String(v) => &v[idx], _ => return Err(PyValueError::new_err("Internal dtype mismatch")) };
+                let s = match &self.buffer { LeafBuffer::String(v) => &v[idx], _ => return Err(internal_dtype_buffer_mismatch("leaf scalar_to_py", self.dtype)) };
                 Ok(s.clone().into_py(py))
             }
         }
@@ -510,7 +515,7 @@ impl Leaf {
 
     pub fn encode_scalar(py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType) -> PyResult<(bool, Vec<u8>)> {
         if dtype == DType::String {
-            return Err(PyValueError::new_err("encode_scalar is not supported for dtype=string."));
+            return Err(dtype_unsupported("encode_scalar", DType::String));
         }
         let mut tmp = Leaf::new(dtype);
         push_scalar(py, obj, dtype, &mut tmp)?;
@@ -520,10 +525,10 @@ impl Leaf {
 
     pub fn set_encoded(&mut self, idx: usize, valid: bool, bytes: &[u8]) -> PyResult<()> {
         if idx >= self.len {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, self.len, "on leaf"));
         }
         if bytes.len() != self.dtype.size_bytes() {
-            return Err(PyValueError::new_err("Internal error: dtype byte width mismatch."));
+            return Err(internal("Leaf::set_encoded", "dtype byte width mismatch"));
         }
         if !valid {
             self.has_nulls = true;
@@ -535,14 +540,14 @@ impl Leaf {
 
     pub fn set_i32(&mut self, idx: usize, value: i32) -> PyResult<()> {
         if idx >= self.len {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, self.len, "on leaf"));
         }
         if self.dtype != DType::Int32 {
-            return Err(PyValueError::new_err("Internal error: set_i32 requires dtype=int32."));
+            return Err(internal("Leaf::set_i32", "requires dtype=int32"));
         }
         match &mut self.buffer {
             LeafBuffer::I32(v) => Arc::make_mut(v)[idx] = value,
-            _ => return Err(PyValueError::new_err("Internal error: dtype mismatch.")),
+            _ => return Err(internal("Leaf::set_i32", "dtype mismatch")),
         }
         Ok(())
     }
@@ -609,7 +614,7 @@ impl ListOffset {
 
     pub fn list_element_to_py(&self, py: Python<'_>, idx: usize) -> PyResult<PyObject> {
         if idx >= self.len() {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, self.len(), "on indexed view"));
         }
         let start = self.offsets[idx] as usize;
         let end = self.offsets[idx + 1] as usize;
@@ -622,14 +627,14 @@ impl ListOffset {
 
     pub fn child_len_total(&self, idx: usize) -> PyResult<usize> {
         if idx >= self.len() {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, self.len(), "on indexed view"));
         }
         Ok((self.offsets[idx + 1] - self.offsets[idx]) as usize)
     }
 
     pub fn child_len_non_null_scalars(&self, idx: usize) -> PyResult<usize> {
         if idx >= self.len() {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, self.len(), "on indexed view"));
         }
         let start = self.offsets[idx] as usize;
         let end = self.offsets[idx + 1] as usize;
@@ -657,20 +662,20 @@ impl UnionScalarList {
 
     pub fn element_to_py(&self, py: Python<'_>, idx: usize) -> PyResult<PyObject> {
         if idx >= self.len() {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, self.len(), "on indexed view"));
         }
         let tag = self.tags[idx];
         let ix = self.index[idx] as usize;
         match tag {
             0 => self.scalars.scalar_to_py(py, ix),
             1 => self.lists.list_element_to_py(py, ix),
-            _ => Err(PyValueError::new_err("Invalid union tag.")),
+            _ => Err(internal("union element", "invalid union tag")),
         }
     }
 
     pub fn count_non_null_scalars_in_range(&self, start: usize, end: usize) -> PyResult<usize> {
         if end > self.len() || start > end {
-            return Err(PyValueError::new_err("Invalid range."));
+            return Err(invalid_slice_range(start, end, self.len()));
         }
         let mut c = 0usize;
         for i in start..end {
@@ -760,12 +765,12 @@ pub fn list_chain_depth(layout: &Layout) -> Option<usize> {
 
 pub fn take_range(layout: &Layout, start: usize, end: usize) -> PyResult<Layout> {
     if start > end {
-        return Err(PyValueError::new_err("Invalid range."));
+        return Err(invalid_slice_range(start, end, layout.len()));
     }
     match layout {
         Layout::Leaf(l) => {
             if end > l.len {
-                return Err(PyValueError::new_err("Index out of bounds."));
+                return Err(index_out_of_bounds(end, l.len, "on leaf slice"));
             }
             let mut out = Leaf::new(l.dtype);
             out.len = end - start;
@@ -776,7 +781,7 @@ pub fn take_range(layout: &Layout, start: usize, end: usize) -> PyResult<Layout>
         }
         Layout::ListOffset(lo) => {
             if end > lo.len() {
-                return Err(PyValueError::new_err("Index out of bounds."));
+                return Err(index_out_of_bounds(end, lo.len(), "on list slice"));
             }
             let child_start = lo.offsets[start] as usize;
             let child_end = lo.offsets[end] as usize;
@@ -796,7 +801,7 @@ pub fn take_range(layout: &Layout, start: usize, end: usize) -> PyResult<Layout>
         }
         Layout::OffsetView(v) => {
             if end > v.len() {
-                return Err(PyValueError::new_err("Index out of bounds."));
+                return Err(index_out_of_bounds(end, v.len(), "on offset view slice"));
             }
             Ok(Layout::OffsetView(OffsetView {
                 offsets: v.offsets.clone(),
@@ -807,7 +812,7 @@ pub fn take_range(layout: &Layout, start: usize, end: usize) -> PyResult<Layout>
         }
         Layout::Indexed(ix) => {
             if end > ix.len() {
-                return Err(PyValueError::new_err("Index out of bounds."));
+                return Err(index_out_of_bounds(end, ix.len(), "on indexed slice"));
             }
             let sub = ix.index[start..end].to_vec();
             Ok(Layout::Indexed(Indexed {
@@ -822,7 +827,7 @@ pub fn take_range(layout: &Layout, start: usize, end: usize) -> PyResult<Layout>
 /// Concatenate layout segments along the innermost leaf axis (used by union list compaction).
 pub fn concat_layout_segments(segments: &[Layout]) -> PyResult<Layout> {
     if segments.is_empty() {
-        return Err(PyValueError::new_err("Cannot concat empty layout segments."));
+        return Err(concat_incompatible("cannot concat empty layout segments", "pass at least one layout segment."));
     }
     if segments.len() == 1 {
         return Ok(segments[0].clone());
@@ -831,9 +836,7 @@ pub fn concat_layout_segments(segments: &[Layout]) -> PyResult<Layout> {
         Layout::Leaf(l) => l.dtype,
         Layout::ListOffset(lo) => leaf_dtype(lo.content.as_ref())?,
         _ => {
-            return Err(PyValueError::new_err(
-                "concat_layout_segments: unsupported layout kind.",
-            ))
+            return Err(layout_unsupported("concat_layout_segments", "unsupported layout kind for segment concat"))
         }
     };
     let mut cur = segments[0].clone();
@@ -857,7 +860,7 @@ fn concat_two_layout_segments(a: &Layout, b: &Layout, dt: DType) -> PyResult<Lay
     match (a, b) {
         (Layout::Leaf(la), Layout::Leaf(lb)) => {
             if la.dtype != lb.dtype {
-                return Err(PyValueError::new_err("concat leaf dtype mismatch."));
+                return Err(dtype_mismatch(dt, lb.dtype, "in concat_layout_segments"));
             }
             let mut out = Leaf::new(dt);
             out.len = la.len + lb.len;
@@ -880,18 +883,16 @@ fn concat_two_layout_segments(a: &Layout, b: &Layout, dt: DType) -> PyResult<Lay
                 content: Box::new(content),
             }))
         }
-        _ => Err(PyValueError::new_err(
-            "concat_layout_segments: incompatible layout kinds.",
-        )),
+        _ => Err(concat_incompatible("incompatible layout kinds in concat_layout_segments", "ensure both segments share the same layout structure.")),
     }
 }
 
 fn take_union_scalar_list_range(u: &UnionScalarList, start: usize, end: usize) -> PyResult<UnionScalarList> {
     if start > end {
-        return Err(PyValueError::new_err("Invalid range."));
+        return Err(invalid_slice_range(start, end, u.len()));
     }
     if end > u.len() {
-        return Err(PyValueError::new_err("Index out of bounds."));
+        return Err(index_out_of_bounds(end, u.len(), "on union slice"));
     }
     let positions: Vec<usize> = (start..end).collect();
     pick_union_scalar_list_indices(u, &positions)
@@ -924,7 +925,7 @@ pub fn remap_union_pick(
                 n
             });
         } else {
-            return Err(PyValueError::new_err("Invalid union tag."));
+            return Err(internal("union remap", "invalid union tag"));
         }
     }
 
@@ -1021,7 +1022,7 @@ pub fn gather_union_axis0_fancy(u: &UnionScalarList, indices: &[i64]) -> PyResul
 fn concat_len1_leaves(elems: &[Layout]) -> PyResult<Layout> {
     let dt = match &elems[0] {
         Layout::Leaf(l) => l.dtype,
-        _ => return Err(PyValueError::new_err("Internal error: expected leaves.")),
+        _ => return Err(internal("concat_len1_leaves", "expected leaf layouts")),
     };
     let mut out = Leaf::new(dt);
     out.len = elems.len();
@@ -1032,10 +1033,10 @@ fn concat_len1_leaves(elems: &[Layout]) -> PyResult<Layout> {
     for (i, e) in elems.iter().enumerate() {
         let l = match e {
             Layout::Leaf(l) => l,
-            _ => return Err(PyValueError::new_err("Internal error: expected leaves.")),
+            _ => return Err(internal("concat_len1_leaves", "expected leaf layouts")),
         };
         if l.len != 1 {
-            return Err(PyValueError::new_err("Internal error: expected length-1 leaves."));
+            return Err(internal("concat_len1_leaves", "expected length-1 leaves"));
         }
         if !l.validity[0] {
             out_valid.set(i, false);
@@ -1049,7 +1050,7 @@ fn concat_len1_leaves(elems: &[Layout]) -> PyResult<Layout> {
 /// Stack axis-0 element selections into a single layout (list-chain path).
 pub fn stack_axis0_selects(elems: &[Layout]) -> PyResult<Layout> {
     if elems.is_empty() {
-        return Err(PyValueError::new_err("Cannot stack empty selection."));
+        return Err(concat_incompatible("cannot stack empty selection", "pass at least one selected element."));
     }
     let all_scalar1 = elems
         .iter()
@@ -1077,9 +1078,7 @@ pub fn stack_axis0_selects(elems: &[Layout]) -> PyResult<Layout> {
             content: Box::new(content),
         }));
     }
-    Err(PyValueError::new_err(
-        "Unsupported stacked layout kinds for axis-0 gather.",
-    ))
+    Err(layout_unsupported("axis-0 gather", "unsupported stacked layout kinds"))
 }
 
 fn is_scalar_segment(seg: &Layout) -> bool {
@@ -1172,7 +1171,7 @@ fn build_union_from_broadcast_segments(segs: &[Layout], dtype: DType) -> PyResul
 /// Stack per-row broadcast segments; builds a union when rows mix scalars and lists.
 pub fn stack_axis0_broadcast(segs: &[Layout], dtype: DType) -> PyResult<Layout> {
     if segs.is_empty() {
-        return Err(PyValueError::new_err("Cannot stack empty broadcast segments."));
+        return Err(concat_incompatible("cannot stack empty broadcast segments", "pass at least one broadcast segment."));
     }
     let all_scalar1 = segs.iter().all(is_scalar_segment);
     if all_scalar1 {
@@ -1210,7 +1209,7 @@ pub fn gather_axis0_fancy(layout: &Layout, indices: &[i64]) -> PyResult<Layout> 
 /// Coordinate indexing: apply ``coords`` axis-by-axis, returning the selected sub-layout.
 pub fn index_by_coordinates(layout: &Layout, coords: &[i64]) -> PyResult<Layout> {
     if coords.is_empty() {
-        return Err(PyValueError::new_err("Empty coordinate index."));
+        return Err(arg_invalid("index", "empty coordinate index", "pass at least one coordinate."));
     }
     let ix = normalize_index(coords[0], layout.len() as i64)?;
     let elem = drop_axis0_select_element(layout, ix)?;
@@ -1231,9 +1230,7 @@ pub fn index_by_coordinates(layout: &Layout, coords: &[i64]) -> PyResult<Layout>
 /// 2D fancy coordinate gather; result is a flat leaf when every selection is a scalar.
 pub fn gather_coordinate_fancy_2d(layout: &Layout, rows: &[i64], cols: &[i64]) -> PyResult<Layout> {
     if rows.len() != cols.len() {
-        return Err(PyValueError::new_err(
-            "Fancy coordinate arrays must have same length.",
-        ));
+        return Err(shape_mismatch("fancy coordinate indexing", "row and column index arrays must have the same length", "ensure len(rows) == len(cols)."));
     }
     let mut elems = Vec::with_capacity(rows.len());
     for k in 0..rows.len() {
@@ -1245,9 +1242,7 @@ pub fn gather_coordinate_fancy_2d(layout: &Layout, rows: &[i64], cols: &[i64]) -
     if all_scalar1 {
         return concat_len1_leaves(&elems);
     }
-    Err(PyValueError::new_err(
-        "Fancy coordinate gather produced non-scalar elements.",
-    ))
+    Err(layout_unsupported("fancy coordinate gather", "selection produced non-scalar elements"))
 }
 
 /// Peel one outer nesting axis (ListOffset content or union element concat).
@@ -1282,7 +1277,7 @@ pub fn drop_layout_axes(layout: &Layout, drops: usize) -> PyResult<Layout> {
 
 fn append_leaf_into(out: &mut Leaf, src: &Leaf) -> PyResult<()> {
     if out.dtype != src.dtype {
-        return Err(PyValueError::new_err("Internal error: dtype mismatch while flattening."));
+        return Err(dtype_mismatch(out.dtype, src.dtype, "while flattening layout to leaf"));
     }
     if src.has_nulls {
         out.has_nulls = true;
@@ -1371,7 +1366,7 @@ pub fn layout_ndim(layout: &Layout) -> PyResult<usize> {
         }
         _ => {
             let depth = list_chain_depth(layout).ok_or_else(|| {
-                PyValueError::new_err("Internal error: could not determine layout depth.")
+                internal("layout_ndim", "could not determine layout depth")
             })?;
             Ok(depth + 1)
         }
@@ -1382,7 +1377,7 @@ pub fn drop_axis0_select_element(layout: &Layout, idx: usize) -> PyResult<Layout
     match layout {
         Layout::ListOffset(lo) => {
             if idx >= lo.len() {
-                return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, lo.len(), "on list axis"));
             }
             let start = lo.offsets[idx] as usize;
             let end = lo.offsets[idx + 1] as usize;
@@ -1390,7 +1385,7 @@ pub fn drop_axis0_select_element(layout: &Layout, idx: usize) -> PyResult<Layout
         }
         Layout::OffsetView(v) => {
             if idx >= v.len() {
-                return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, v.len(), "on offset view"));
             }
             let abs = v.start + idx;
             let start = v.offsets[abs] as usize;
@@ -1399,7 +1394,7 @@ pub fn drop_axis0_select_element(layout: &Layout, idx: usize) -> PyResult<Layout
         }
         Layout::Indexed(ix) => {
             if idx >= ix.len() {
-                return Err(PyValueError::new_err("Index out of bounds."));
+                return Err(index_out_of_bounds_simple("on this axis"));
             }
             // Return a scalar/list element view by redirecting to content.
             let n = ix.content.len() as i64;
@@ -1408,19 +1403,19 @@ pub fn drop_axis0_select_element(layout: &Layout, idx: usize) -> PyResult<Layout
                 j += n;
             }
             if j < 0 || j >= n {
-                return Err(PyValueError::new_err("Index out of bounds."));
+                return Err(index_out_of_bounds_simple("on this axis"));
             }
             drop_axis0_select_element(ix.content.as_ref(), j as usize)
         }
         Layout::Leaf(l) => {
             if idx >= l.len {
-                return Err(PyValueError::new_err("Index out of bounds."));
+                return Err(index_out_of_bounds_simple("on this axis"));
             }
             Ok(Layout::Leaf(take_leaf_indices(l, &[idx])?))
         }
         Layout::UnionScalarList(u) => {
             if idx >= u.len() {
-                return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(idx, u.len(), "on union axis"));
             }
             match u.tags[idx] {
                 0 => {
@@ -1433,7 +1428,7 @@ pub fn drop_axis0_select_element(layout: &Layout, idx: usize) -> PyResult<Layout
                     let end = u.lists.offsets[li + 1] as usize;
                     take_range(u.lists.content.as_ref(), start, end)
                 }
-                _ => Err(PyValueError::new_err("Invalid union tag.")),
+                _ => Err(internal("union element", "invalid union tag")),
             }
         }
     }
@@ -1446,7 +1441,7 @@ fn take_leaf_indices(l: &Leaf, indices: &[usize]) -> PyResult<Leaf> {
     out.buffer.reserve(indices.len());
     for &ix in indices {
         if ix >= l.len {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds(ix, l.len, "on leaf gather"));
         }
         Arc::make_mut(&mut out.validity).push(l.validity[ix]);
         out.buffer.push_from_index(&l.buffer, ix)?;
@@ -1483,27 +1478,21 @@ pub fn coord_to_leaf_index(layout: &Layout, coords: &[i64]) -> PyResult<usize> {
             }
             Layout::OffsetView(_v) => {
                 // Map to a synthetic ListOffset reference is messy; reject for now.
-                return Err(PyValueError::new_err(
-                    "Fast coordinate indexing not supported for OffsetView yet.",
-                ));
+                return Err(unsupported("coordinate indexing", "OffsetView layouts are not supported yet", "materialize the view with gr.array(...) first."));
             }
             Layout::Indexed(_) => {
-                return Err(PyValueError::new_err(
-                    "Fast coordinate indexing not supported for Indexed views.",
-                ));
+                return Err(unsupported("coordinate indexing", "Indexed views are not supported yet", "materialize the view with gr.array(...) first."));
             }
             Layout::Leaf(_) => break,
             Layout::UnionScalarList(_) => {
-                return Err(PyValueError::new_err(
-                    "Internal error: union should be handled above.",
-                ))
+                return Err(internal("coord_to_leaf_index", "union should be handled above"))
             }
         }
     }
     if list_offsets.is_empty() {
         // 1D leaf
         if coords.len() != 1 {
-            return Err(PyValueError::new_err("Coordinate length does not match array depth."));
+            return Err(shape_mismatch("coordinate indexing", "coordinate length does not match array depth", "pass one coordinate per nesting axis plus the leaf axis."));
         }
         let leaf = match layout {
             Layout::Leaf(l) => l,
@@ -1513,7 +1502,7 @@ pub fn coord_to_leaf_index(layout: &Layout, coords: &[i64]) -> PyResult<usize> {
     }
 
     if coords.len() != list_offsets.len() + 1 {
-        return Err(PyValueError::new_err("Coordinate length does not match array depth."));
+        return Err(shape_mismatch("coordinate indexing", "coordinate length does not match array depth", "pass one coordinate per nesting axis plus the leaf axis."));
     }
 
     // Select list element at axis 0
@@ -1540,7 +1529,7 @@ pub fn coord_to_leaf_index(layout: &Layout, coords: &[i64]) -> PyResult<usize> {
 
 fn coord_to_leaf_index_union(u: &UnionScalarList, coords: &[i64]) -> PyResult<usize> {
     if coords.is_empty() {
-        return Err(PyValueError::new_err("Coordinate length does not match array depth."));
+        return Err(shape_mismatch("coordinate indexing", "coordinate length does not match array depth", "pass one coordinate per nesting axis plus the leaf axis."));
     }
     let outer = normalize_index(coords[0], u.len() as i64)?;
     match u.tags[outer] {
@@ -1561,9 +1550,7 @@ fn coord_to_leaf_index_union(u: &UnionScalarList, coords: &[i64]) -> PyResult<us
             let start = u.lists.offsets[li] as usize;
             let end = u.lists.offsets[li + 1] as usize;
             if coords.len() == 1 {
-                return Err(PyValueError::new_err(
-                    "Coordinate length does not match array depth.",
-                ));
+                return Err(shape_mismatch("coordinate indexing", "coordinate length does not match array depth", "pass one coordinate per nesting axis plus the leaf axis."));
             }
             if coords.len() == 2 {
                 let local = normalize_index(coords[1], (end - start) as i64)?;
@@ -1572,32 +1559,36 @@ fn coord_to_leaf_index_union(u: &UnionScalarList, coords: &[i64]) -> PyResult<us
             let sub = take_range(u.lists.content.as_ref(), start, end)?;
             coord_to_leaf_index(&sub, &coords[1..])
         }
-        _ => Err(PyValueError::new_err("Invalid union tag.")),
+        _ => Err(internal("union element", "invalid union tag")),
     }
 }
 
 fn normalize_index(i: i64, len: i64) -> PyResult<usize> {
     if len < 0 {
-        return Err(PyValueError::new_err("Internal error: negative length."));
+        return Err(internal("normalize_index", "negative length"));
     }
     let mut j = i;
     if j < 0 {
         j += len;
     }
     if j < 0 || j >= len {
-        return Err(PyValueError::new_err("Index out of bounds."));
+        return Err(index_out_of_bounds(
+            if i >= 0 { i as usize } else { 0 },
+            len as usize,
+            "on this axis",
+        ));
     }
     Ok(j as usize)
 }
 
 pub fn gather_2d_fancy_leaf(layout: &Layout, rows: &[i64], cols: &[i64]) -> PyResult<Leaf> {
     // Only supports depth=2 (ListOffset -> Leaf)
-    let depth = list_chain_depth(layout).ok_or_else(|| PyValueError::new_err("Not a pure list chain."))?;
+    let depth = list_chain_depth(layout).ok_or_else(|| layout_unsupported("fancy gather", "array is not a pure list chain"))?;
     if depth != 1 {
-        return Err(PyValueError::new_err("Fast fancy gather only supports 2D arrays for now."));
+        return Err(unsupported("fancy gather", "only 2D arrays are supported for now", "reduce dimensionality or use general indexing."));
     }
     if rows.len() != cols.len() {
-        return Err(PyValueError::new_err("Fancy coordinate arrays must have same length."));
+        return Err(shape_mismatch("fancy gather", "row and column index arrays must have the same length", "ensure len(rows) == len(cols)."));
     }
     let (lo_offsets, lo_content, lo_len, row_base): (&[i64], &Layout, usize, usize) = match layout {
         Layout::ListOffset(lo) => (lo.offsets.as_slice(), lo.content.as_ref(), lo.len(), 0),
@@ -1620,7 +1611,7 @@ pub fn gather_2d_fancy_leaf(layout: &Layout, rows: &[i64], cols: &[i64]) -> PyRe
             r += lo_len as i64;
         }
         if r < 0 || r >= lo_len as i64 {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         let rr = row_base + (r as usize);
         let start = lo_offsets[rr] as usize;
@@ -1631,7 +1622,7 @@ pub fn gather_2d_fancy_leaf(layout: &Layout, rows: &[i64], cols: &[i64]) -> PyRe
             c += len;
         }
         if c < 0 || c >= len {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         let ix = start + c as usize;
         Arc::make_mut(&mut out.validity).push(leaf.validity[ix]);
@@ -1642,12 +1633,12 @@ pub fn gather_2d_fancy_leaf(layout: &Layout, rows: &[i64], cols: &[i64]) -> PyRe
 
 pub fn gather_2d_fancy_sum_i64(layout: &Layout, rows: &[i64], cols: &[i64], dtype: DType) -> PyResult<i64> {
     // Only supports depth=2 (ListOffset -> Leaf)
-    let depth = list_chain_depth(layout).ok_or_else(|| PyValueError::new_err("Not a pure list chain."))?;
+    let depth = list_chain_depth(layout).ok_or_else(|| layout_unsupported("fancy gather", "array is not a pure list chain"))?;
     if depth != 1 {
-        return Err(PyValueError::new_err("Fast fancy gather only supports 2D arrays for now."));
+        return Err(unsupported("fancy gather", "only 2D arrays are supported for now", "reduce dimensionality or use general indexing."));
     }
     if rows.len() != cols.len() {
-        return Err(PyValueError::new_err("Fancy coordinate arrays must have same length."));
+        return Err(shape_mismatch("fancy gather", "row and column index arrays must have the same length", "ensure len(rows) == len(cols)."));
     }
     let (lo_offsets, lo_content, lo_len, row_base): (&[i64], &Layout, usize, usize) = match layout {
         Layout::ListOffset(lo) => (lo.offsets.as_slice(), lo.content.as_ref(), lo.len(), 0),
@@ -1659,13 +1650,13 @@ pub fn gather_2d_fancy_sum_i64(layout: &Layout, rows: &[i64], cols: &[i64], dtyp
         _ => return Err(PyValueError::new_err("Expected leaf at depth 2.")),
     };
     if leaf.dtype != dtype {
-        return Err(PyValueError::new_err("Internal error: dtype mismatch in gather checksum."));
+        return Err(internal_dtype_buffer_mismatch("gather checksum", dtype));
     }
     if leaf.has_nulls {
-        return Err(PyValueError::new_err("gather checksum requires all-valid leaf (no nulls)."));
+        return Err(arg_invalid("gather checksum", "leaf contains nulls", "filter nulls or use a path that skips null entries."));
     }
     if dtype != DType::Int32 && dtype != DType::Int64 {
-        return Err(PyValueError::new_err("gather checksum only implemented for int32/int64."));
+        return Err(dtype_unsupported("gather checksum", dtype));
     }
 
     let mut acc: i64 = 0;
@@ -1675,7 +1666,7 @@ pub fn gather_2d_fancy_sum_i64(layout: &Layout, rows: &[i64], cols: &[i64], dtyp
             r += lo_len as i64;
         }
         if r < 0 || r >= lo_len as i64 {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         let rr = row_base + (r as usize);
         let start = lo_offsets[rr] as usize;
@@ -1686,7 +1677,7 @@ pub fn gather_2d_fancy_sum_i64(layout: &Layout, rows: &[i64], cols: &[i64], dtyp
             c += len;
         }
         if c < 0 || c >= len {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         let ix = start + c as usize;
         match &leaf.buffer {
@@ -1717,7 +1708,7 @@ pub fn scatter_2d_fancy_numeric(
         _ => return Err(PyValueError::new_err("Expected leaf at depth 2.")),
     };
     if rows.len() != cols.len() {
-        return Err(PyValueError::new_err("Fancy coordinate arrays must have same length."));
+        return Err(shape_mismatch("fancy gather", "row and column index arrays must have the same length", "ensure len(rows) == len(cols)."));
     }
     let n = rows.len();
 
@@ -1735,33 +1726,31 @@ pub fn scatter_2d_fancy_numeric(
     let values_parsed: Values<'_, '_> = if let Ok(ro) = values.extract::<numpy::PyReadonlyArray1<'_, i32>>() {
         let s = ro.as_slice()?;
         if s.len() != n {
-            return Err(PyValueError::new_err("Assignment value length must match number of selected coordinates."));
+            return Err(shape_mismatch("fancy assignment", "value length must match number of selected coordinates", "pass a value array with one element per (row, col) pair."));
         }
         Values::NpI32(s.to_vec())
     } else if let Ok(ro) = values.extract::<numpy::PyReadonlyArray1<'_, i64>>() {
         let s = ro.as_slice()?;
         if s.len() != n {
-            return Err(PyValueError::new_err("Assignment value length must match number of selected coordinates."));
+            return Err(shape_mismatch("fancy assignment", "value length must match number of selected coordinates", "pass a value array with one element per (row, col) pair."));
         }
         Values::NpI64(s.to_vec())
     } else if let Ok(ro) = values.extract::<numpy::PyReadonlyArray1<'_, f64>>() {
         let s = ro.as_slice()?;
         if s.len() != n {
-            return Err(PyValueError::new_err("Assignment value length must match number of selected coordinates."));
+            return Err(shape_mismatch("fancy assignment", "value length must match number of selected coordinates", "pass a value array with one element per (row, col) pair."));
         }
         Values::NpF64(s.to_vec())
     } else if let Ok(ro) = values.extract::<numpy::PyReadonlyArray1<'_, bool>>() {
         let s = ro.as_slice()?;
         if s.len() != n {
-            return Err(PyValueError::new_err("Assignment value length must match number of selected coordinates."));
+            return Err(shape_mismatch("fancy assignment", "value length must match number of selected coordinates", "pass a value array with one element per (row, col) pair."));
         }
         Values::NpBool(s.to_vec())
     } else if is_sequence_like(py, values)? {
         let s = values.downcast::<PySequence>()?;
         if s.len()? as usize != n {
-            return Err(PyValueError::new_err(
-                "Assignment value length must match number of selected coordinates.",
-            ));
+            return Err(shape_mismatch("fancy assignment", "value length must match number of selected coordinates", "pass a value array with one element per (row, col) pair."));
         }
         Values::Seq(s.clone())
     } else {
@@ -1775,7 +1764,7 @@ pub fn scatter_2d_fancy_numeric(
             r += nrows;
         }
         if r < 0 || r >= nrows {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         let start = lo.offsets[r as usize] as usize;
         let end = lo.offsets[r as usize + 1] as usize;
@@ -1785,7 +1774,7 @@ pub fn scatter_2d_fancy_numeric(
             c += len;
         }
         if c < 0 || c >= len {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         let ix = start + c as usize;
 
@@ -1841,9 +1830,7 @@ pub fn scatter_2d_fancy_numeric(
             DType::Float32 => (v.extract::<f64>()? as f32).to_ne_bytes().to_vec(),
             DType::Float64 => (v.extract::<f64>()?).to_ne_bytes().to_vec(),
             DType::Char => {
-                return Err(PyValueError::new_err(
-                    "Vectorized scatter does not support dtype=char.",
-                ))
+                return Err(dtype_unsupported("scatter", DType::Char))
             }
             DType::String => {
                 return Err(PyValueError::new_err(
@@ -1875,10 +1862,10 @@ pub fn scatter_2d_fancy_i32(
         _ => return Err(PyValueError::new_err("Expected leaf at depth 2.")),
     };
     if leaf.dtype != DType::Int32 {
-        return Err(PyValueError::new_err("Internal error: dtype mismatch for i32 scatter."));
+        return Err(internal_dtype_buffer_mismatch("scatter_2d_fancy_i32", DType::Int32));
     }
     if rows.len() != cols.len() || rows.len() != values.len() {
-        return Err(PyValueError::new_err("Index/value length mismatch."));
+        return Err(shape_mismatch("fancy scatter", "index and value lengths must match", "pass one value per (row, col) pair."));
     }
     let v = match &mut leaf.buffer {
         LeafBuffer::I32(buf) => Arc::make_mut(buf),
@@ -1890,7 +1877,7 @@ pub fn scatter_2d_fancy_i32(
             r += nrows;
         }
         if r < 0 || r >= nrows {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         let start = offsets[r as usize] as usize;
         let end = offsets[r as usize + 1] as usize;
@@ -1900,7 +1887,7 @@ pub fn scatter_2d_fancy_i32(
             c += len;
         }
         if c < 0 || c >= len {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("on this axis"));
         }
         let ix = start + c as usize;
         v[ix] = values[k];
@@ -1924,7 +1911,7 @@ pub fn fill_layout_like(
             let mut tmp = Leaf::new(dtype);
             push_scalar(py, fill_value, dtype, &mut tmp)?;
             if tmp.len != 1 {
-                return Err(PyValueError::new_err("Internal error: fill scalar length mismatch."));
+                return Err(internal("fill_layout_like", "fill scalar length mismatch"));
             }
             out.buffer.extend_repeat_first(&tmp.buffer, l.len)?;
             Ok(Layout::Leaf(out))
@@ -1975,7 +1962,7 @@ pub fn fill_layout_like(
 
 pub fn concat_to_py_list(py: Python<'_>, arrays: &[GrumpyArray], dim: usize) -> PyResult<PyObject> {
     if arrays.is_empty() {
-        return Err(PyValueError::new_err("cat() requires at least one array."));
+        return Err(concat_incompatible("cat() requires at least one array", "pass one or more arrays to concatenate."));
     }
     let mut cur = arrays[0].to_py_list(py)?;
     for a in &arrays[1..] {
@@ -2113,7 +2100,7 @@ fn try_build_listoffset_i32_from_pylist_fast(
     for i in 0..nrows {
         let row = list.get_item(i)?;
         let row_list = row.downcast::<PyList>().map_err(|_| {
-            PyValueError::new_err("Internal error: expected list row.")
+            internal("build_layout", "expected list row element")
         })?;
         let row_len = row_lens[i];
         for j in 0..row_len {
@@ -2244,7 +2231,7 @@ fn try_build_rect2d_listoffset_i32(_py: Python<'_>, seq: &Bound<'_, PySequence>)
     for i in 0..nrows {
         let row = seq.get_item(i)?;
         let row_seq = row.downcast::<PySequence>().map_err(|_| {
-            PyValueError::new_err("Internal error: expected sequence element.")
+            internal("build_layout", "expected sequence element")
         })?;
         if row_seq.len()? as usize != ncols {
             return Ok(None);
@@ -2366,7 +2353,7 @@ fn build_listoffset_from_lists(
     for i in 0..n {
         let item = seq.get_item(i)?;
         let child_seq = item.downcast::<PySequence>().map_err(|_| {
-            PyValueError::new_err("Internal error: expected sequence element.")
+            internal("build_layout", "expected sequence element")
         })?;
         let m = child_seq.len()?;
         for j in 0..m {
@@ -2471,7 +2458,7 @@ fn push_scalar(_py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType, leaf: &mut
     if dtype == DType::String {
         let s = obj
             .extract::<String>()
-            .map_err(|_| PyValueError::new_err("Expected a Python string for dtype=string."))?;
+            .map_err(|_| arg_invalid("value", "expected a Python string for dtype=string", "pass str values for string arrays."))?;
         Arc::make_mut(&mut leaf.validity).push(true);
         leaf.len += 1;
         match &mut leaf.buffer {
@@ -2509,7 +2496,7 @@ fn push_scalar(_py: Python<'_>, obj: &Bound<'_, PyAny>, dtype: DType, leaf: &mut
             let mut it = s.chars();
             let c = it
                 .next()
-                .ok_or_else(|| PyValueError::new_err("Empty string is not a char."))?;
+                .ok_or_else(|| arg_invalid("char", "empty string is not a valid char", "pass a single-character string."))?;
             if it.next().is_some() {
                 return Err(PyValueError::new_err(
                     "Only single-character strings are allowed for dtype=char.",

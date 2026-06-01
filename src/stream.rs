@@ -1,8 +1,8 @@
 //! ML dataloader batch planning, shuffle, and DDP sharding for saved datasets.
 
+use crate::error::{arg_invalid, arg_must_be_positive, index_out_of_bounds, schema_violation};
 use crate::io::{self, DatasetHandle, RootMeta};
 use crate::random::GrumpyRng;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,7 +23,7 @@ pub fn build_batch_plan(
     batch_on: Option<&str>,
 ) -> PyResult<BatchPlan> {
     if batch_size == 0 {
-        return Err(PyValueError::new_err("batch_size must be > 0"));
+        return Err(arg_must_be_positive("batch_size", batch_size));
     }
     let n = handle.axis0_len()?;
     if n == 0 {
@@ -56,7 +56,13 @@ fn layout_meta_for_batch_on<'a>(
             columns
                 .first()
                 .map(|c| &c.layout)
-                .ok_or_else(|| PyValueError::new_err("Empty dataframe has no columns."))
+                .ok_or_else(|| {
+                    schema_violation(
+                        "empty dataframe has no columns",
+                        "batch_on requires at least one column to infer layout.",
+                        "save a non-empty dataframe or use batch_on=None for axis-0 batching.",
+                    )
+                })
         }
     }
 }
@@ -66,9 +72,13 @@ fn resolve_batch_on_depth(handle: &DatasetHandle, level: &str) -> PyResult<usize
         schema.level_index(level)
     } else {
         // Arrays without schema: interpret batch_on as numeric depth string.
-        level
-            .parse::<usize>()
-            .map_err(|_| PyValueError::new_err(format!("Unknown batch_on level '{level}'.")))
+        level.parse::<usize>().map_err(|_| {
+            arg_invalid(
+                "batch_on",
+                format!("unknown batch_on level '{level}'"),
+                "use a schema level name or a numeric depth for arrays without schema.",
+            )
+        })
     }
 }
 
@@ -124,10 +134,14 @@ pub fn shuffle_batch_plan(plan: &mut BatchPlan, seed: u64) {
 
 pub fn shard_batch_plan(plan: &mut BatchPlan, world_size: usize, rank: usize) -> PyResult<()> {
     if world_size == 0 {
-        return Err(PyValueError::new_err("world_size must be > 0"));
+        return Err(arg_must_be_positive("world_size", world_size));
     }
     if rank >= world_size {
-        return Err(PyValueError::new_err("rank must be < world_size"));
+        return Err(arg_invalid(
+            "rank",
+            format!("got {rank}, expected < world_size={world_size}"),
+            "pass rank in [0, world_size).",
+        ));
     }
     plan.batches = plan
         .batches
@@ -190,9 +204,7 @@ pub fn filter_batch_plan(plan: &BatchPlan, indices: &[usize]) -> PyResult<BatchP
     let mut batches = Vec::with_capacity(indices.len());
     for &i in indices {
         if i >= n {
-            return Err(PyValueError::new_err(format!(
-                "batch index {i} out of range (num_batches={n})."
-            )));
+            return Err(index_out_of_bounds(i, n, "for batch plan indices"));
         }
         batches.push(plan.batches[i].clone());
     }

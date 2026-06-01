@@ -321,7 +321,16 @@ def save(obj, path: str, chunk_size: int = 1024, chunk_dim=None):
         try:
             first = next(it)
         except StopIteration as exc:
-            raise ValueError("save(generator): iterator produced no batches.") from exc
+            from .errors import format_grumpy_error
+
+            raise ValueError(
+                format_grumpy_error(
+                    "ArgumentInvalid",
+                    "save(generator): iterator produced no batches",
+                    cause="gr.save from a generator requires at least one yielded batch to infer schema and layout.",
+                    fix="yield at least one GrumpyArray or GrumpyDataFrame before the generator ends.",
+                )
+            ) from exc
         _save(first, path, chunk_size, chunk_arg)
         for batch in it:
             _append_batch(batch, path, chunk_size, chunk_arg)

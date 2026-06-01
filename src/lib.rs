@@ -1,8 +1,9 @@
 mod cast;
+mod error;
 mod dtype;
 mod kernels;
 mod layout;
-mod layout_map;
+mod layout_ops;
 mod ops;
 mod reduce;
 mod unary;

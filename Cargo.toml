@@ -9,7 +9,7 @@ name = "grumpy"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["abi3-py310", "extension-module"] }
+pyo3 = { version = "0.22", features = ["abi3-py310", "extension-module", "multiple-pymethods"] }
 numpy = "0.22"
 thiserror = "1.0"
 half = { version = "2.4", features = ["std"] }

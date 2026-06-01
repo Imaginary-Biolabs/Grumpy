@@ -14,6 +14,7 @@
 //! - Supports `OffsetView` batches produced by streaming
 
 use crate::dtype::DType;
+use crate::error::{arg_invalid, dtype_mismatch, internal, layout_unsupported, unsupported};
 use crate::layout::{drop_axis0_select_element, stack_axis0_broadcast, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
@@ -51,10 +52,14 @@ pub fn neighbors_edge_index_and_distances(
     return_distances: bool,
 ) -> PyResult<(GrumpyArray, Option<GrumpyArray>)> {
     if k.is_some() == radius.is_some() {
-        return Err(PyValueError::new_err("neighbors requires exactly one of k or radius."));
+        return Err(arg_invalid(
+            "k|radius",
+            "exactly one of k or radius must be set",
+            "pass neighbors(..., k=3) or neighbors(..., radius=1.5), not both or neither.",
+        ));
     }
     if query.dtype != data.dtype {
-        return Err(PyValueError::new_err("neighbors requires matching dtypes for query and data (for now)."));
+        return Err(dtype_mismatch(data.dtype, query.dtype, "in neighbors(query, data)"));
     }
     if query.layout.has_union() || data.layout.has_union() {
         return neighbors_union(query, data, k, radius, dim, loop_, return_distances);
@@ -62,7 +67,11 @@ pub fn neighbors_edge_index_and_distances(
     match dim {
         0 | -2 => neighbors_dim0_edges(query, data, k, radius, loop_, return_distances),
         1 | -3 => neighbors_dim1_edges(query, data, k, radius, loop_, return_distances),
-        _ => Err(PyValueError::new_err("neighbors: only dim=0 or dim=1 supported for now.")),
+        _ => Err(unsupported(
+            "neighbors",
+            "only dim=0 (single point cloud) or dim=1 (grouped point clouds) are supported",
+            "pass dim=0 for (n_points, d) arrays or dim=1 for groups->points->coords.",
+        )),
     }
 }
 
@@ -886,32 +895,6 @@ fn build_grouped_distances(
     Ok(GrumpyArray { dtype: DType::Float64, layout })
 }
 
-#[allow(dead_code)]
-fn gather_knn_coords(dtype: DType, doff: &Arc<Vec<i64>>, dbase: usize, dleaf: &Leaf, dn: usize, d: usize, nn_idx: &[usize], qn: usize, k: usize) -> PyResult<GrumpyArray> {
-    let _ = dn;
-    let data = coords_as_f64(dtype, dleaf)?;
-    let mut out_vals: Vec<f64> = Vec::with_capacity(qn * k * d);
-    for qi in 0..qn {
-        for t in 0..k {
-            let j = nn_idx[qi * k + t];
-            let jstart = doff[dbase + j] as usize;
-            out_vals.extend_from_slice(&data[jstart..jstart + d]);
-        }
-    }
-    // Build (qn) -> (k) -> (d) nested lists.
-    let mut off_q: Vec<i64> = Vec::with_capacity(qn + 1);
-    off_q.push(0);
-    for i in 0..qn {
-        off_q.push(off_q[i] + (k as i64));
-    }
-    let mut off_k: Vec<i64> = Vec::with_capacity(qn * k + 1);
-    off_k.push(0);
-    for i in 0..(qn * k) {
-        off_k.push(off_k[i] + (d as i64));
-    }
-    Ok(build_nested_coords(dtype, off_q, off_k, out_vals))
-}
-
 fn leaf_shares_storage(a: &Leaf, b: &Leaf) -> bool {
     if !Arc::ptr_eq(&a.validity, &b.validity) {
         return false;
@@ -931,28 +914,6 @@ fn leafbuffer_shares_storage(a: &LeafBuffer, b: &LeafBuffer) -> bool {
     }
 }
 
-#[allow(dead_code)]
-fn gather_radius_coords(dtype: DType, doff: &Arc<Vec<i64>>, dbase: usize, dleaf: &Leaf, d: usize, per_q_counts: &[usize], all_idx: &[usize]) -> PyResult<GrumpyArray> {
-    let data = coords_as_f64(dtype, dleaf)?;
-    let mut out_vals: Vec<f64> = Vec::with_capacity(all_idx.len() * d);
-    for &j in all_idx {
-        let jstart = doff[dbase + j] as usize;
-        out_vals.extend_from_slice(&data[jstart..jstart + d]);
-    }
-    let qn = per_q_counts.len();
-    let mut off_q: Vec<i64> = Vec::with_capacity(qn + 1);
-    off_q.push(0);
-    for i in 0..qn {
-        off_q.push(off_q[i] + per_q_counts[i] as i64);
-    }
-    let mut off_n: Vec<i64> = Vec::with_capacity(all_idx.len() + 1);
-    off_n.push(0);
-    for i in 0..all_idx.len() {
-        off_n.push(off_n[i] + d as i64);
-    }
-    Ok(build_nested_coords(dtype, off_q, off_n, out_vals))
-}
-
 fn build_nested_coords(dtype: DType, off0: Vec<i64>, off1: Vec<i64>, vals_f64: Vec<f64>) -> GrumpyArray {
     let leaf = leaf_from_f64(dtype, vals_f64);
     let inner = Layout::ListOffset(ListOffset { offsets: Arc::new(off1), content: Box::new(Layout::Leaf(leaf)) });
@@ -963,36 +924,6 @@ fn empty_knn_out(dtype: DType, qn: usize, _d: usize) -> GrumpyArray {
     let off_q: Vec<i64> = (0..=qn as i64).collect();
     let off_k: Vec<i64> = vec![0];
     build_nested_coords(dtype, off_q, off_k, Vec::new())
-}
-
-#[allow(dead_code)]
-fn empty_knn_out_grouped(dtype: DType, qg: &ListOffset, qp: &ListOffset, qg_n: usize, _d: usize) -> GrumpyArray {
-    let _ = qg;
-    let _ = qp;
-    // groups->points->0->d
-    let mut off_g: Vec<i64> = Vec::with_capacity(qg_n + 1);
-    off_g.push(0);
-    for g in 0..qg_n {
-        // number of points in group = qg offsets delta
-        let nqp = (qg.offsets[g + 1] - qg.offsets[g]) as i64;
-        off_g.push(off_g[g] + nqp);
-    }
-    let off_p: Vec<i64> = vec![0; (off_g.last().unwrap() + 1) as usize];
-    let off_n: Vec<i64> = vec![0];
-    let leaf = leaf_from_f64(dtype, Vec::new());
-    let lvl2 = Layout::ListOffset(ListOffset { offsets: Arc::new(off_n), content: Box::new(Layout::Leaf(leaf)) });
-    let lvl1 = Layout::ListOffset(ListOffset { offsets: Arc::new(off_p), content: Box::new(lvl2) });
-    GrumpyArray { dtype, layout: Layout::ListOffset(ListOffset { offsets: Arc::new(off_g), content: Box::new(lvl1) }) }
-}
-
-#[allow(dead_code)]
-fn build_grouped_out(dtype: DType, n_groups: usize, d: usize, off_g: Vec<i64>, off_p: Vec<i64>, off_n: Vec<i64>, vals: Vec<f64>) -> PyResult<GrumpyArray> {
-    let _ = n_groups;
-    let _ = d;
-    let leaf = leaf_from_f64(dtype, vals);
-    let lvl2 = Layout::ListOffset(ListOffset { offsets: Arc::new(off_n), content: Box::new(Layout::Leaf(leaf)) });
-    let lvl1 = Layout::ListOffset(ListOffset { offsets: Arc::new(off_p), content: Box::new(lvl2) });
-    Ok(GrumpyArray { dtype, layout: Layout::ListOffset(ListOffset { offsets: Arc::new(off_g), content: Box::new(lvl1) }) })
 }
 
 fn leaf_from_f64(dtype: DType, vals: Vec<f64>) -> Leaf {

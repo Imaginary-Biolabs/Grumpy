@@ -20,7 +20,15 @@
 //!   - Add parity tests including `OffsetView` batches and null propagation.
 
 use crate::dtype::DType;
-use crate::layout::{drop_axis0_select_element, stack_axis0_broadcast, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
+use crate::error::{
+    broadcast_failed, broadcast_union_layout_kind, broadcast_union_outer_mismatch, dtype_mismatch,
+    internal, internal_dtype_buffer_mismatch, shape_mismatch,
+};
+use crate::layout::{
+    drop_axis0_select_element, stack_axis0_broadcast, GrumpyArray, Layout, Leaf, LeafBuffer,
+    ListOffset, UnionScalarList,
+};
+use crate::layout_ops::concat_axis0_layouts;
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use pyo3::exceptions::PyValueError;
@@ -316,11 +324,24 @@ pub fn elementwise_with_scalar(
 
 pub fn elementwise(a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyResult<GrumpyArray> {
     let out_dtype = elementwise_out_dtype(a.dtype, b.dtype, op)?;
-    let (a2, b2) = if a.dtype != b.dtype {
-        crate::cast::cast_array_pair(a, b)?
-    } else {
-        (a.clone(), b.clone())
-    };
+    if a.dtype == b.dtype {
+        if let Some(out) = elementwise_rect2d_fast(a, b, op)? {
+            return Ok(out);
+        }
+        if let Some(out) = elementwise_same_listoffset2d_fast(a, b, op)? {
+            return Ok(out);
+        }
+        if let Some(out) = elementwise_ragged2d_fast(a, b, op)? {
+            return Ok(out);
+        }
+        if layouts_compatible(&a.layout, &b.layout) {
+            let layout = elementwise_layout(&a.layout, &b.layout, a.dtype, b.dtype, out_dtype, op)?;
+            return Ok(GrumpyArray { dtype: out_dtype, layout });
+        }
+        let layout = elementwise_layout_broadcast(&a.layout, &b.layout, a.dtype, b.dtype, out_dtype, op)?;
+        return Ok(GrumpyArray { dtype: out_dtype, layout });
+    }
+    let (a2, b2) = crate::cast::cast_array_pair(a, b)?;
     // Rectangular 2D fast path (ListOffset -> Leaf) for common dtypes, no nulls.
     if let Some(out) = elementwise_rect2d_fast(&a2, &b2, op)? {
         return Ok(out);
@@ -411,32 +432,6 @@ pub fn mul_scalar_sum_all_i64(a: &GrumpyArray, scalar: i32) -> PyResult<i64> {
         _ => return Err(PyValueError::new_err("mul_scalar_sum_all requires int32 leaf.")),
     };
     Ok(crate::kernels::sum_i32_mul_scalar_to_i64(v, scalar))
-}
-
-/// Fused ``(a * b).sum()`` over all leaves for matching 2D list->leaf int32 arrays.
-pub fn mul_sum_all_i64(a: &GrumpyArray, b: &GrumpyArray) -> PyResult<i64> {
-    if a.dtype != DType::Int32 || b.dtype != DType::Int32 {
-        return Err(PyValueError::new_err("mul_sum_all requires int32 arrays."));
-    }
-    let (off_a, leaf_a) = listoffset2d_leaf_view(&a.layout)
-        .ok_or_else(|| PyValueError::new_err("mul_sum_all requires 2D list->leaf layout."))?;
-    let (off_b, leaf_b) = listoffset2d_leaf_view(&b.layout)
-        .ok_or_else(|| PyValueError::new_err("mul_sum_all requires 2D list->leaf layout."))?;
-    if off_a != off_b {
-        return Err(PyValueError::new_err("mul_sum_all requires matching offsets."));
-    }
-    if leaf_a.has_nulls || leaf_b.has_nulls {
-        return Err(PyValueError::new_err("mul_sum_all requires all-valid arrays."));
-    }
-    let aa = match &leaf_a.buffer {
-        LeafBuffer::I32(v) => v.as_slice(),
-        _ => return Err(PyValueError::new_err("mul_sum_all requires int32 leaf.")),
-    };
-    let bb = match &leaf_b.buffer {
-        LeafBuffer::I32(v) => v.as_slice(),
-        _ => return Err(PyValueError::new_err("mul_sum_all requires int32 leaf.")),
-    };
-    Ok(crate::kernels::sum_i32_mul_to_i64(aa, bb))
 }
 
 fn elementwise_out_dtype(a: DType, b: DType, op: BinOp) -> PyResult<DType> {
@@ -559,8 +554,10 @@ fn elementwise_ragged2d_fast(a: &GrumpyArray, b: &GrumpyArray, op: BinOp) -> PyR
         } else if lenb == 1 {
             lena
         } else {
-            return Err(PyValueError::new_err(
-                "Broadcasting failed for ragged2d: per-row lengths incompatible.",
+            return Err(broadcast_failed(
+                "incompatible per-row lengths for ragged 2D broadcast",
+                "ragged list->leaf broadcasting requires equal row lengths, or one side with a single row.",
+                "align row lengths or broadcast a length-1 row.",
             ));
         };
         total += out_len;
@@ -1341,7 +1338,11 @@ fn elementwise_layout_broadcast(
                 }
                 return Ok(Layout::ListOffset(ListOffset { offsets: Arc::new(offsets), content: Box::new(content) }));
             }
-            Err(PyValueError::new_err("Broadcasting failed: incompatible outer lengths."))
+            Err(broadcast_failed(
+                "incompatible outer lengths during list broadcast",
+                "list->list broadcasting requires equal outer length, or one side with outer length 1.",
+                "align outer lengths, insert a length-1 axis, or reshape so one array broadcasts.",
+            ))
         }
 
         // Scalar broadcast: leaf(len=1) over list
@@ -1390,7 +1391,11 @@ fn elementwise_layout_broadcast(
             broadcast_union_with_other(u, other, false, a_dt, b_dt, out_dt, op)
         }
 
-        _ => Err(PyValueError::new_err("Broadcasting failed: incompatible layouts.")),
+        _ => Err(broadcast_failed(
+            "incompatible layouts for elementwise broadcast",
+            "operands must be list-chains, union arrays, or a broadcastable scalar leaf.",
+            "reshape inputs to a compatible layout or use gr.array(...) to normalize structure.",
+        )),
     }
 }
 
@@ -1453,20 +1458,39 @@ fn broadcast_union_pair(
 ) -> PyResult<Layout> {
     let na = ua.len();
     let nb = ub.len();
-    let a_layout = Layout::UnionScalarList(ua.clone());
-    let b_layout = Layout::UnionScalarList(ub.clone());
     if na == 1 && nb > 1 {
-        return broadcast_one_to_many_axis0(&a_layout, &b_layout, a_dt, b_dt, out_dt, op, true);
+        return broadcast_one_to_many_axis0(
+            &Layout::UnionScalarList(ua.clone()),
+            &Layout::UnionScalarList(ub.clone()),
+            a_dt,
+            b_dt,
+            out_dt,
+            op,
+            true,
+        );
     }
     if nb == 1 && na > 1 {
-        return broadcast_one_to_many_axis0(&b_layout, &a_layout, b_dt, a_dt, out_dt, op, false);
+        return broadcast_one_to_many_axis0(
+            &Layout::UnionScalarList(ub.clone()),
+            &Layout::UnionScalarList(ua.clone()),
+            b_dt,
+            a_dt,
+            out_dt,
+            op,
+            false,
+        );
     }
     if na != nb {
-        return Err(PyValueError::new_err(
-            "Broadcasting failed: incompatible union outer lengths.",
-        ));
+        return Err(broadcast_union_outer_mismatch(na, nb));
     }
-    broadcast_same_outer_axis0(&a_layout, &b_layout, a_dt, b_dt, out_dt, op)
+    broadcast_same_outer_axis0(
+        &Layout::UnionScalarList(ua.clone()),
+        &Layout::UnionScalarList(ub.clone()),
+        a_dt,
+        b_dt,
+        out_dt,
+        op,
+    )
 }
 
 fn broadcast_union_with_other(
@@ -1531,8 +1555,10 @@ fn broadcast_union_with_other(
                     op,
                 )
             } else {
-                Err(PyValueError::new_err(
-                    "Broadcasting failed: incompatible outer lengths between union and list.",
+                Err(broadcast_failed(
+                    format!("incompatible outer lengths {nu} and {nb} between union and list"),
+                    "UnionScalarList broadcasting requires equal outer length, or one side with outer length 1.",
+                    "align outer lengths, insert a length-1 axis, or reshape so one array broadcasts.",
                 ))
             }
         }
@@ -1551,9 +1577,7 @@ fn broadcast_union_with_other(
             });
             broadcast_union_with_other(u, &as_lo, union_is_a, a_dt, b_dt, out_dt, op)
         }
-        _ => Err(PyValueError::new_err(
-            "Broadcasting failed: incompatible union and layout kind.",
-        )),
+        _ => Err(broadcast_union_layout_kind()),
     }
 }
 
@@ -1595,208 +1619,10 @@ fn broadcast_listoffset_axis0(
     Ok(Layout::ListOffset(ListOffset { offsets: Arc::new(offsets), content: Box::new(content) }))
 }
 
-fn concat_axis0_layouts(layouts: &[Layout]) -> PyResult<Layout> {
-    if layouts.is_empty() {
-        return Err(PyValueError::new_err("Internal error: cannot concat empty layouts."));
-    }
-    let has_union = layouts.iter().any(|l| matches!(l, Layout::UnionScalarList(_)));
-    if has_union {
-        let normalized: Vec<Layout> = layouts
-            .iter()
-            .map(|l| match l {
-                Layout::UnionScalarList(_) => Ok(l.clone()),
-                Layout::ListOffset(lo) => {
-                    let dt = union_scalar_dtype_from_list(lo)?;
-                    Ok(Layout::UnionScalarList(lift_listoffset_to_union(lo, dt)))
-                }
-                _ => Err(PyValueError::new_err(
-                    "concat axis 0: cannot mix union arrays with this layout kind.",
-                )),
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        return concat_union_scalar_lists_axis0(&normalized);
-    }
-    match &layouts[0] {
-        Layout::Leaf(first) => {
-            let dt = first.dtype;
-            let total: usize = layouts.iter().map(|l| l.len()).sum();
-            let mut out = Leaf::new(dt);
-            out.len = total;
-            out.validity = Arc::new(bitvec![u8, Lsb0; 1; total]);
-            out.has_nulls = false;
-            // allocate buffer with capacity and then extend
-            out.buffer = match dt {
-                DType::Int8 => LeafBuffer::I8(Arc::new(Vec::with_capacity(total))),
-                DType::Int16 => LeafBuffer::I16(Arc::new(Vec::with_capacity(total))),
-                DType::Int32 => LeafBuffer::I32(Arc::new(Vec::with_capacity(total))),
-                DType::Int64 => LeafBuffer::I64(Arc::new(Vec::with_capacity(total))),
-                DType::UInt8 => LeafBuffer::U8(Arc::new(Vec::with_capacity(total))),
-                DType::UInt16 => LeafBuffer::U16(Arc::new(Vec::with_capacity(total))),
-                DType::UInt32 => LeafBuffer::U32(Arc::new(Vec::with_capacity(total))),
-                DType::UInt64 => LeafBuffer::U64(Arc::new(Vec::with_capacity(total))),
-                DType::Float16 => LeafBuffer::F16(Arc::new(Vec::with_capacity(total))),
-                DType::Float32 => LeafBuffer::F32(Arc::new(Vec::with_capacity(total))),
-                DType::Float64 => LeafBuffer::F64(Arc::new(Vec::with_capacity(total))),
-                DType::Bool => LeafBuffer::Bool(Arc::new(Vec::with_capacity(total))),
-                DType::Char => LeafBuffer::Char(Arc::new(Vec::with_capacity(total))),
-                DType::String => LeafBuffer::String(Arc::new(Vec::with_capacity(total))),
-            };
-
-            let mut pos = 0usize;
-            for l in layouts {
-                let leaf = match l {
-                    Layout::Leaf(x) => x,
-                    _ => return Err(PyValueError::new_err("Internal error: concat mixed layout kinds.")),
-                };
-                if leaf.dtype != dt {
-                    return Err(PyValueError::new_err("Internal error: concat leaf dtype mismatch."));
-                }
-                if leaf.has_nulls {
-                    out.has_nulls = true;
-                }
-                for i in 0..leaf.len {
-                    if !leaf.validity[i] {
-                        Arc::make_mut(&mut out.validity).set(pos + i, false);
-                    }
-                }
-                match (&leaf.buffer, &mut out.buffer) {
-                    (LeafBuffer::I8(v), LeafBuffer::I8(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::I16(v), LeafBuffer::I16(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::I32(v), LeafBuffer::I32(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::I64(v), LeafBuffer::I64(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::U8(v), LeafBuffer::U8(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::U16(v), LeafBuffer::U16(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::U32(v), LeafBuffer::U32(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::U64(v), LeafBuffer::U64(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::F16(v), LeafBuffer::F16(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::F32(v), LeafBuffer::F32(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::F64(v), LeafBuffer::F64(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::Bool(v), LeafBuffer::Bool(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::Char(v), LeafBuffer::Char(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::String(v), LeafBuffer::String(o)) => Arc::make_mut(o).extend(v.iter().cloned()),
-                    _ => return Err(PyValueError::new_err("Internal error: concat leaf buffer mismatch.")),
-                }
-                pos += leaf.len;
-            }
-            Ok(Layout::Leaf(out))
-        }
-        Layout::ListOffset(_) => {
-            // Concatenate listoffset arrays along axis0 by concatenating offsets (with shift)
-            // and recursively concatenating the flattened contents.
-            let mut all_offsets: Vec<i64> = Vec::new();
-            all_offsets.push(0);
-            let mut content_segs: Vec<Layout> = Vec::with_capacity(layouts.len());
-            let mut acc: i64 = 0;
-            for l in layouts {
-                let lo = match l {
-                    Layout::ListOffset(lo) => lo,
-                    _ => return Err(PyValueError::new_err("Internal error: concat mixed layout kinds.")),
-                };
-                let offs = lo.offsets.as_slice();
-                if offs.is_empty() {
-                    return Err(PyValueError::new_err("Internal error: invalid offsets."));
-                }
-                // append offsets[1..] shifted by acc
-                for &o in &offs[1..] {
-                    all_offsets.push(acc + o);
-                }
-                acc += *offs.last().unwrap();
-                content_segs.push(lo.content.as_ref().clone());
-            }
-            let content = concat_axis0_layouts(&content_segs)?;
-            Ok(Layout::ListOffset(ListOffset { offsets: Arc::new(all_offsets), content: Box::new(content) }))
-        }
-        _ => Err(PyValueError::new_err("concat_axis0_layouts: unsupported layout kind.")),
-    }
-}
-
-fn union_scalar_dtype_from_list(lo: &ListOffset) -> PyResult<DType> {
-    match lo.content.as_ref() {
-        Layout::Leaf(l) => Ok(l.dtype),
-        Layout::ListOffset(inner) => union_scalar_dtype_from_list(inner),
-        _ => Err(PyValueError::new_err(
-            "concat axis 0: cannot infer dtype for list layout.",
-        )),
-    }
-}
-
-fn lift_listoffset_to_union(lo: &ListOffset, dt: DType) -> UnionScalarList {
-    let n = lo.len();
-    UnionScalarList {
-        tags: vec![1u8; n],
-        index: (0..n as i64).collect(),
-        scalars: Leaf::new(dt),
-        lists: lo.clone(),
-    }
-}
-
-fn concat_union_scalar_lists_axis0(layouts: &[Layout]) -> PyResult<Layout> {
-    let mut unions: Vec<&UnionScalarList> = Vec::with_capacity(layouts.len());
-    for l in layouts {
-        match l {
-            Layout::UnionScalarList(u) => unions.push(u),
-            _ => {
-                return Err(PyValueError::new_err(
-                    "Internal error: concat mixed layout kinds.",
-                ))
-            }
-        }
-    }
-    if unions.is_empty() {
-        return Err(PyValueError::new_err("Internal error: cannot concat empty layouts."));
-    }
-    let mut all_tags: Vec<u8> = Vec::new();
-    let mut all_index: Vec<i64> = Vec::new();
-    let mut scalar_segs: Vec<Layout> = Vec::with_capacity(unions.len());
-    let mut list_segs: Vec<Layout> = Vec::with_capacity(unions.len());
-    let mut scalar_base = 0i64;
-    let mut list_base = 0i64;
-    for u in &unions {
-        for i in 0..u.len() {
-            all_tags.push(u.tags[i]);
-            all_index.push(match u.tags[i] {
-                0 => scalar_base + u.index[i],
-                1 => list_base + u.index[i],
-                _ => {
-                    return Err(PyValueError::new_err("Invalid union tag."));
-                }
-            });
-        }
-        scalar_base += u.scalars.len as i64;
-        list_base += u.lists.len() as i64;
-        scalar_segs.push(Layout::Leaf(u.scalars.clone()));
-        list_segs.push(Layout::ListOffset(u.lists.clone()));
-    }
-    let scalars = match concat_axis0_layouts(&scalar_segs)? {
-        Layout::Leaf(l) => l,
-        _ => {
-            return Err(PyValueError::new_err(
-                "Internal error: union scalar concat did not produce a leaf.",
-            ))
-        }
-    };
-    let lists = match concat_axis0_layouts(&list_segs)? {
-        Layout::ListOffset(lo) => lo,
-        _ => {
-            return Err(PyValueError::new_err(
-                "Internal error: union list concat did not produce ListOffset.",
-            ))
-        }
-    };
-    Ok(Layout::UnionScalarList(UnionScalarList {
-        tags: all_tags,
-        index: all_index,
-        scalars,
-        lists,
-    }))
-}
-
 /// Concatenate two arrays along axis 0 (pure list-chains).
 pub fn concat_arrays_axis0(a: &GrumpyArray, b: &GrumpyArray) -> PyResult<GrumpyArray> {
     if a.dtype != b.dtype {
-        return Err(PyValueError::new_err(
-            "concat axis 0 requires arrays with the same dtype.",
-        ));
+        return Err(dtype_mismatch(a.dtype, b.dtype, "in concat axis 0"));
     }
     let layout = concat_axis0_layouts(&[a.layout.clone(), b.layout.clone()])?;
     Ok(GrumpyArray {
@@ -1814,10 +1640,14 @@ fn elementwise_leaf_broadcast(
     op: BinOp,
 ) -> PyResult<Leaf> {
     if a_dt != b_dt && !(op == BinOp::Div && out_dt == DType::Float64) {
-        return Err(PyValueError::new_err("Broadcasting still requires matching dtypes (casting not implemented)."));
+        return Err(dtype_mismatch(a_dt, b_dt, "for elementwise leaf broadcast"));
     }
     let n = if a.len == b.len { a.len } else if a.len == 1 { b.len } else if b.len == 1 { a.len } else {
-        return Err(PyValueError::new_err("Broadcasting failed: leaf lengths incompatible."));
+        return Err(broadcast_failed(
+            "incompatible leaf lengths for broadcast",
+            "leaf broadcasting requires equal length, or one leaf with length 1.",
+            "ensure operands have the same length or broadcast a length-1 scalar leaf.",
+        ));
     };
     let mut out = Leaf::new(out_dt);
     out.len = n;
@@ -2336,7 +2166,7 @@ fn elementwise_layout(
                 lists: ListOffset { offsets: ua.lists.offsets.clone(), content: Box::new(list_content) },
             }))
         }
-        _ => Err(PyValueError::new_err("Internal error: incompatible layouts.")),
+        _ => Err(internal("elementwise", "incompatible layouts for same-structure elementwise")),
     }
 }
 
@@ -2349,7 +2179,11 @@ fn elementwise_leaf(
     op: BinOp,
 ) -> PyResult<Leaf> {
     if a.len != b.len {
-        return Err(PyValueError::new_err("Internal error: leaf length mismatch."));
+        return Err(shape_mismatch(
+            "elementwise",
+            format!("leaf length mismatch: {} vs {}", a.len, b.len),
+            "ensure both operands have the same shape along this axis.",
+        ));
     }
     let n = a.len;
     let mut out = Leaf::new(out_dt);
@@ -2426,7 +2260,7 @@ fn elementwise_leaf(
 
     // Same dtype operations
     if a_dt != b_dt {
-        return Err(PyValueError::new_err("Internal error: dtype mismatch in elementwise leaf."));
+        return Err(dtype_mismatch(a_dt, b_dt, "in elementwise leaf operation"));
     }
 
     match (a_dt, &a.buffer, &b.buffer, &mut out.buffer) {
@@ -2577,7 +2411,7 @@ fn elementwise_leaf(
                 };
             }
         }
-        _ => return Err(PyValueError::new_err("Internal error: dtype buffer mismatch in elementwise.")),
+        _ => return Err(internal_dtype_buffer_mismatch("elementwise", a_dt)),
     }
 
     Ok(out)
@@ -2585,21 +2419,21 @@ fn elementwise_leaf(
 
 fn read_as_f64(dt: DType, buf: &LeafBuffer, i: usize) -> PyResult<f64> {
     match dt {
-        DType::Int32 => match buf { LeafBuffer::I32(v) => Ok(v[i] as f64), _ => Err(PyValueError::new_err("dtype mismatch")) },
-        DType::Int64 => match buf { LeafBuffer::I64(v) => Ok(v[i] as f64), _ => Err(PyValueError::new_err("dtype mismatch")) },
-        DType::UInt32 => match buf { LeafBuffer::U32(v) => Ok(v[i] as f64), _ => Err(PyValueError::new_err("dtype mismatch")) },
-        DType::UInt64 => match buf { LeafBuffer::U64(v) => Ok(v[i] as f64), _ => Err(PyValueError::new_err("dtype mismatch")) },
-        DType::Int8 => match buf { LeafBuffer::I8(v) => Ok(v[i] as f64), _ => Err(PyValueError::new_err("dtype mismatch")) },
-        DType::Int16 => match buf { LeafBuffer::I16(v) => Ok(v[i] as f64), _ => Err(PyValueError::new_err("dtype mismatch")) },
-        DType::UInt8 => match buf { LeafBuffer::U8(v) => Ok(v[i] as f64), _ => Err(PyValueError::new_err("dtype mismatch")) },
-        DType::UInt16 => match buf { LeafBuffer::U16(v) => Ok(v[i] as f64), _ => Err(PyValueError::new_err("dtype mismatch")) },
-        DType::Float32 => match buf { LeafBuffer::F32(v) => Ok(v[i] as f64), _ => Err(PyValueError::new_err("dtype mismatch")) },
-        DType::Float64 => match buf { LeafBuffer::F64(v) => Ok(v[i]), _ => Err(PyValueError::new_err("dtype mismatch")) },
+        DType::Int32 => match buf { LeafBuffer::I32(v) => Ok(v[i] as f64), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
+        DType::Int64 => match buf { LeafBuffer::I64(v) => Ok(v[i] as f64), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
+        DType::UInt32 => match buf { LeafBuffer::U32(v) => Ok(v[i] as f64), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
+        DType::UInt64 => match buf { LeafBuffer::U64(v) => Ok(v[i] as f64), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
+        DType::Int8 => match buf { LeafBuffer::I8(v) => Ok(v[i] as f64), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
+        DType::Int16 => match buf { LeafBuffer::I16(v) => Ok(v[i] as f64), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
+        DType::UInt8 => match buf { LeafBuffer::U8(v) => Ok(v[i] as f64), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
+        DType::UInt16 => match buf { LeafBuffer::U16(v) => Ok(v[i] as f64), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
+        DType::Float32 => match buf { LeafBuffer::F32(v) => Ok(v[i] as f64), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
+        DType::Float64 => match buf { LeafBuffer::F64(v) => Ok(v[i]), _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)) },
         DType::Float16 => {
             use half::f16;
             match buf {
                 LeafBuffer::F16(v) => Ok(f16::from_bits(v[i]).to_f32() as f64),
-                _ => Err(PyValueError::new_err("dtype mismatch")),
+                _ => Err(internal_dtype_buffer_mismatch("elementwise", dt)),
             }
         }
         _ => Err(PyValueError::new_err("Non-numeric dtype in division.")),

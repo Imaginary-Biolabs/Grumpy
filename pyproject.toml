@@ -42,8 +42,11 @@ features = ["pyo3/extension-module"]
 include = ["docs/assets/*.svg"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = ["-q", "-m", "not coverage"]
 testpaths = ["tests"]
+markers = [
+    "coverage: compiler/coverage instrumentation tests",
+]
 
 [tool.coverage.run]
 source = ["grumpy"]

@@ -14,7 +14,12 @@
 //! - Add parity tests for deep list-chains and for streamed `OffsetView` batches.
 
 use crate::dtype::DType;
-use crate::layout::{offsetview_to_listoffset, drop_axis0_select_element, GrumpyArray, Layout, Leaf, LeafBuffer, UnionScalarList};
+use crate::error::{
+    dim_out_of_range, internal, reduction_empty, reduction_scalar_unsupported, union_op_dim_unsupported,
+    unsupported,
+};
+use crate::layout::{layout_ndim, offsetview_to_listoffset, drop_axis0_select_element, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
+use crate::layout_ops::{concat_axis0_layouts, map_last_axis, map_union_axis0, LastAxisLeafMode};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use half::f16;
@@ -55,15 +60,46 @@ pub fn reduce_array(arr: &GrumpyArray, dim: isize, op: ReduceOp) -> PyResult<Gru
         _ => &arr.layout,
     };
 
+    if layout.has_union() {
+        let ndim = layout_ndim(layout)?;
+        let axis = normalize_axis(dim, ndim)?;
+        if axis == 0 {
+            return reduce_union_axis0_nogil(arr, op);
+        }
+        if axis == ndim - 1 {
+            let out_dt = reduce_out_dtype(arr.dtype, op)?;
+            let out_layout = if layout.has_union() && matches!(layout, Layout::UnionScalarList(_)) {
+                map_union_axis0(layout, out_dt, |sub| {
+                    reduce_element_last_axis(&sub, arr.dtype, out_dt, op)
+                })?
+            } else {
+                reduce_last_layout(layout, arr.dtype, out_dt, op)?
+            };
+            return Ok(GrumpyArray {
+                dtype: out_dt,
+                layout: out_layout,
+            });
+        }
+        return Err(union_op_dim_unsupported(
+            "reduce",
+            dim,
+            "dim=0 and the innermost axis",
+        ));
+    }
+
     let depth = crate::layout::list_chain_depth(layout)
-        .ok_or_else(|| PyValueError::new_err("reduce currently only supports pure list-chain arrays."))?;
+        .ok_or_else(|| {
+            unsupported(
+                "reduce",
+                "currently only supports pure list-chain arrays.",
+                "use union-aware reductions (dim=0 or innermost) for UnionScalarList arrays.",
+            )
+        })?;
     let axis = normalize_axis(dim, depth)?;
 
     // Scalar outputs are not supported in Rust scheduling (returning PyObject would require the GIL).
     if depth == 0 {
-        return Err(PyValueError::new_err(
-            "Rust scheduled reductions do not support scalar outputs (reduce on 1D leaf).",
-        ));
+        return Err(reduction_scalar_unsupported("reduce"));
     }
 
     // 2D list->leaf fast paths first.
@@ -74,7 +110,7 @@ pub fn reduce_array(arr: &GrumpyArray, dim: isize, op: ReduceOp) -> PyResult<Gru
         return match axis {
             0 => Ok(reduce_2d_dim0_to_leaf(layout, arr.dtype, op)?),
             1 => Ok(reduce_2d_dim1_to_leaf(layout, arr.dtype, op)?),
-            _ => Err(PyValueError::new_err("Invalid dim for 2D reduction.")),
+            _ => Err(dim_out_of_range(dim, 2)),
         };
     }
 
@@ -98,7 +134,13 @@ pub fn reduce(py: Python<'_>, arr: &GrumpyArray, dim: Option<isize>, op: ReduceO
     }
 
     let depth = crate::layout::list_chain_depth(layout)
-        .ok_or_else(|| PyValueError::new_err("reduce currently only supports pure list-chain arrays."))?;
+        .ok_or_else(|| {
+            unsupported(
+                "reduce",
+                "currently only supports pure list-chain arrays.",
+                "use union-aware reductions (dim=0 or innermost) for UnionScalarList arrays.",
+            )
+        })?;
 
     // Sum/mean over all leaves (no dim): flatten reduction for 2D list->leaf.
     if dim.is_none() {
@@ -120,7 +162,7 @@ pub fn reduce(py: Python<'_>, arr: &GrumpyArray, dim: Option<isize>, op: ReduceO
 
     if depth == 0 {
         if axis != 0 {
-            return Err(PyValueError::new_err("Invalid dim for 1D reduction."));
+            return Err(dim_out_of_range(dim, 1));
         }
         return Ok(ReduceOutput::Scalar(reduce_leaf_to_scalar(py, layout, arr.dtype, op)?));
     }
@@ -135,7 +177,7 @@ pub fn reduce(py: Python<'_>, arr: &GrumpyArray, dim: Option<isize>, op: ReduceO
         return match axis {
             0 => Ok(ReduceOutput::Array(reduce_2d_dim0_to_leaf(layout, arr.dtype, op)?)),
             1 => Ok(ReduceOutput::Array(reduce_2d_dim1_to_leaf(layout, arr.dtype, op)?)),
-            _ => Err(PyValueError::new_err("Invalid dim for 2D reduction.")),
+            _ => Err(dim_out_of_range(dim, 2)),
         };
     }
 
@@ -183,8 +225,9 @@ fn scalar_to_leaf_layout(dt: DType, v: Option<ScalarValue>) -> PyResult<Layout> 
         (DType::Int64, ScalarValue::Bool(x)) => LeafBuffer::I64(Arc::new(vec![if x { 1 } else { 0 }])),
         (DType::Int64, ScalarValue::U64(x)) => LeafBuffer::I64(Arc::new(vec![x as i64])),
         _ => {
-            return Err(PyValueError::new_err(
-                "Internal error: unsupported scalar-to-leaf conversion in no-GIL reduction.",
+            return Err(internal(
+                "reduce",
+                "unsupported scalar-to-leaf conversion in no-GIL reduction",
             ))
         }
     };
@@ -194,7 +237,7 @@ fn scalar_to_leaf_layout(dt: DType, v: Option<ScalarValue>) -> PyResult<Layout> 
 fn reduce_leaf_to_scalar_value(layout: &Layout, dt: DType, op: ReduceOp) -> PyResult<Option<ScalarValue>> {
     let leaf = match layout {
         Layout::Leaf(l) => l,
-        _ => return Err(PyValueError::new_err("Internal error: expected leaf layout.")),
+        _ => return Err(internal("reduce", "expected leaf layout")),
     };
     if leaf.len == 0 {
         return Ok(None);
@@ -427,7 +470,7 @@ fn reduce_list_chain_to_layout_nogil(
                 op,
             );
         }
-        _ => return Err(PyValueError::new_err("Internal error: expected ListOffset at top.")),
+        _ => return Err(internal("reduce", "expected ListOffset at top")),
     };
     if axis == 0 {
         return reduce_axis0_listoffset_nogil(lo, in_dt, out_dt, depth, op);
@@ -450,7 +493,7 @@ fn reduce_axis_gt0_listoffset_nogil(
         let el_depth = depth - 1;
         let reduced = if el_depth == 0 {
             if axis - 1 != 0 {
-                return Err(PyValueError::new_err("dim out of range."));
+                return Err(dim_out_of_range(axis as isize, depth));
             }
             let s = reduce_leaf_to_scalar_value(&el, in_dt, op)?;
             scalar_to_leaf_layout(out_dt, s)?
@@ -459,7 +502,7 @@ fn reduce_axis_gt0_listoffset_nogil(
             match axis - 1 {
                 0 => reduce_2d_dim0_to_leaf(&arr.layout, in_dt, op)?.layout,
                 1 => reduce_2d_dim1_to_leaf(&arr.layout, in_dt, op)?.layout,
-                _ => return Err(PyValueError::new_err("dim out of range.")),
+                _ => return Err(dim_out_of_range(axis as isize, depth)),
             }
         } else {
             reduce_list_chain_to_layout_nogil(&el, in_dt, out_dt, el_depth, axis - 1, op)?
@@ -519,6 +562,16 @@ fn reduce_axis0_listoffset_nogil(
     stack_elements_as_list(out_dt, &reduced_cols)
 }
 
+fn reduce_op_name(op: ReduceOp) -> &'static str {
+    match op {
+        ReduceOp::Sum => "sum",
+        ReduceOp::Min => "min",
+        ReduceOp::Max => "max",
+        ReduceOp::Mean => "mean",
+        ReduceOp::Ptp => "ptp",
+    }
+}
+
 fn normalize_axis(dim: isize, depth: usize) -> PyResult<usize> {
     let ndims = depth as isize + 1;
     let mut d = dim;
@@ -526,7 +579,7 @@ fn normalize_axis(dim: isize, depth: usize) -> PyResult<usize> {
         d += ndims;
     }
     if d < 0 || d >= ndims {
-        return Err(PyValueError::new_err("dim out of range."));
+        return Err(dim_out_of_range(dim, depth + 1));
     }
     Ok(d as usize)
 }
@@ -570,7 +623,7 @@ fn reduce_list_chain_to_layout(
     // depth >= 2 here.
     let lo = match layout {
         Layout::ListOffset(lo) => lo,
-        _ => return Err(PyValueError::new_err("Internal error: expected ListOffset at top.")),
+        _ => return Err(internal("reduce", "expected ListOffset at top")),
     };
 
     if axis == 0 {
@@ -597,7 +650,7 @@ fn reduce_axis_gt0_listoffset(
         let reduced = if el_depth == 0 {
             // scalar leaf: only axis=0 is valid
             if axis - 1 != 0 {
-                return Err(PyValueError::new_err("dim out of range."));
+                return Err(dim_out_of_range(axis as isize, depth));
             }
             let s = reduce_leaf_to_scalar(py, &el, in_dt, op)?;
             scalar_py_to_leaf(out_dt, py, &s)?
@@ -607,7 +660,7 @@ fn reduce_axis_gt0_listoffset(
             match axis - 1 {
                 0 => reduce_2d_dim0_to_leaf(&arr.layout, in_dt, op)?.layout,
                 1 => reduce_2d_dim1_to_leaf(&arr.layout, in_dt, op)?.layout,
-                _ => return Err(PyValueError::new_err("dim out of range.")),
+                _ => return Err(dim_out_of_range(axis as isize, depth)),
             }
         } else {
             reduce_list_chain_to_layout(py, &el, in_dt, out_dt, el_depth, axis - 1, op)?
@@ -782,7 +835,7 @@ fn stack_elements_as_list(dt: DType, elems: &[Layout]) -> PyResult<Layout> {
                     (LeafBuffer::Bool(v), LeafBuffer::Bool(o)) => Arc::make_mut(o)[i] = v[0],
                     (LeafBuffer::Char(v), LeafBuffer::Char(o)) => Arc::make_mut(o)[i] = v[0],
                     (LeafBuffer::String(v), LeafBuffer::String(o)) => Arc::make_mut(o)[i] = v[0].clone(),
-                    _ => return Err(PyValueError::new_err("Internal error: scalar leaf buffer mismatch.")),
+                    _ => return Err(internal("reduce", "scalar leaf buffer mismatch")),
                 }
             }
             return Ok(Layout::Leaf(out));
@@ -795,7 +848,7 @@ fn stack_elements_as_list(dt: DType, elems: &[Layout]) -> PyResult<Layout> {
 
 fn build_stack_layout(elems: &[Layout]) -> PyResult<Layout> {
     if elems.is_empty() {
-        return Err(PyValueError::new_err("Internal error: cannot stack empty layouts."));
+        return Err(internal("reduce", "cannot stack empty layouts"));
     }
     let mut offsets: Vec<i64> = Vec::with_capacity(elems.len() + 1);
     offsets.push(0);
@@ -806,99 +859,6 @@ fn build_stack_layout(elems: &[Layout]) -> PyResult<Layout> {
     }
     let content = concat_axis0_layouts(elems)?;
     Ok(Layout::ListOffset(crate::layout::ListOffset { offsets: Arc::new(offsets), content: Box::new(content) }))
-}
-
-fn concat_axis0_layouts(layouts: &[Layout]) -> PyResult<Layout> {
-    if layouts.is_empty() {
-        return Err(PyValueError::new_err("Internal error: cannot concat empty layouts."));
-    }
-    match &layouts[0] {
-        Layout::Leaf(first) => {
-            let dt = first.dtype;
-            let total: usize = layouts.iter().map(|l| l.len()).sum();
-            let mut out = Leaf::new(dt);
-            out.len = total;
-            out.validity = Arc::new(bitvec![u8, Lsb0; 1; total]);
-            out.has_nulls = false;
-            out.buffer = match dt {
-                DType::Int8 => LeafBuffer::I8(Arc::new(Vec::with_capacity(total))),
-                DType::Int16 => LeafBuffer::I16(Arc::new(Vec::with_capacity(total))),
-                DType::Int32 => LeafBuffer::I32(Arc::new(Vec::with_capacity(total))),
-                DType::Int64 => LeafBuffer::I64(Arc::new(Vec::with_capacity(total))),
-                DType::UInt8 => LeafBuffer::U8(Arc::new(Vec::with_capacity(total))),
-                DType::UInt16 => LeafBuffer::U16(Arc::new(Vec::with_capacity(total))),
-                DType::UInt32 => LeafBuffer::U32(Arc::new(Vec::with_capacity(total))),
-                DType::UInt64 => LeafBuffer::U64(Arc::new(Vec::with_capacity(total))),
-                DType::Float16 => LeafBuffer::F16(Arc::new(Vec::with_capacity(total))),
-                DType::Float32 => LeafBuffer::F32(Arc::new(Vec::with_capacity(total))),
-                DType::Float64 => LeafBuffer::F64(Arc::new(Vec::with_capacity(total))),
-                DType::Bool => LeafBuffer::Bool(Arc::new(Vec::with_capacity(total))),
-                DType::Char => LeafBuffer::Char(Arc::new(Vec::with_capacity(total))),
-                DType::String => LeafBuffer::String(Arc::new(Vec::with_capacity(total))),
-            };
-            let mut pos = 0usize;
-            for l in layouts {
-                let leaf = match l {
-                    Layout::Leaf(x) => x,
-                    _ => return Err(PyValueError::new_err("Internal error: concat mixed layout kinds.")),
-                };
-                if leaf.dtype != dt {
-                    return Err(PyValueError::new_err("Internal error: concat leaf dtype mismatch."));
-                }
-                if leaf.has_nulls {
-                    out.has_nulls = true;
-                }
-                for i in 0..leaf.len {
-                    if !leaf.validity[i] {
-                        Arc::make_mut(&mut out.validity).set(pos + i, false);
-                    }
-                }
-                match (&leaf.buffer, &mut out.buffer) {
-                    (LeafBuffer::I8(v), LeafBuffer::I8(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::I16(v), LeafBuffer::I16(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::I32(v), LeafBuffer::I32(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::I64(v), LeafBuffer::I64(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::U8(v), LeafBuffer::U8(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::U16(v), LeafBuffer::U16(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::U32(v), LeafBuffer::U32(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::U64(v), LeafBuffer::U64(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::F16(v), LeafBuffer::F16(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::F32(v), LeafBuffer::F32(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::F64(v), LeafBuffer::F64(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::Bool(v), LeafBuffer::Bool(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::Char(v), LeafBuffer::Char(o)) => Arc::make_mut(o).extend_from_slice(&v[..]),
-                    (LeafBuffer::String(v), LeafBuffer::String(o)) => Arc::make_mut(o).extend(v.iter().cloned()),
-                    _ => return Err(PyValueError::new_err("Internal error: concat leaf buffer mismatch.")),
-                }
-                pos += leaf.len;
-            }
-            Ok(Layout::Leaf(out))
-        }
-        Layout::ListOffset(_) => {
-            let mut all_offsets: Vec<i64> = Vec::new();
-            all_offsets.push(0);
-            let mut content_segs: Vec<Layout> = Vec::with_capacity(layouts.len());
-            let mut acc: i64 = 0;
-            for l in layouts {
-                let lo = match l {
-                    Layout::ListOffset(lo) => lo,
-                    _ => return Err(PyValueError::new_err("Internal error: concat mixed layout kinds.")),
-                };
-                let offs = lo.offsets.as_slice();
-                if offs.is_empty() {
-                    return Err(PyValueError::new_err("Internal error: invalid offsets."));
-                }
-                for &o in &offs[1..] {
-                    all_offsets.push(acc + o);
-                }
-                acc += *offs.last().unwrap();
-                content_segs.push(lo.content.as_ref().clone());
-            }
-            let content = concat_axis0_layouts(&content_segs)?;
-            Ok(Layout::ListOffset(crate::layout::ListOffset { offsets: Arc::new(all_offsets), content: Box::new(content) }))
-        }
-        _ => Err(PyValueError::new_err("concat_axis0_layouts: unsupported layout kind.")),
-    }
 }
 
 fn listoffset2d_leaf_view(layout: &Layout) -> Option<(&[i64], &Leaf)> {
@@ -1794,6 +1754,89 @@ fn reduce_2d_dim0_to_leaf(layout: &Layout, dt: DType, op: ReduceOp) -> PyResult<
     Ok(GrumpyArray { dtype: out_dt, layout: Layout::Leaf(out) })
 }
 
+fn reduce_last_layout(
+    layout: &Layout,
+    in_dt: DType,
+    _out_dt: DType,
+    op: ReduceOp,
+) -> PyResult<Layout> {
+    map_last_axis(
+        layout,
+        LastAxisLeafMode::PromoteShortLeaf,
+        &|lo, leaf| {
+            let tmp = Layout::ListOffset(ListOffset {
+                offsets: lo.offsets.clone(),
+                content: Box::new(Layout::Leaf(leaf.clone())),
+            });
+            Ok(reduce_2d_dim1_to_leaf(&tmp, in_dt, op)?.layout)
+        },
+    )
+}
+
+fn reduce_union_last_axis(_py: Python<'_>, arr: &GrumpyArray, op: ReduceOp) -> PyResult<ReduceOutput> {
+    let out_dt = reduce_out_dtype(arr.dtype, op)?;
+    let layout = map_union_axis0(&arr.layout, out_dt, |sub| {
+        reduce_element_last_axis(&sub, arr.dtype, out_dt, op)
+    })?;
+    Ok(ReduceOutput::Array(GrumpyArray {
+        dtype: out_dt,
+        layout,
+    }))
+}
+
+fn reduce_element_last_axis(
+    sub: &Layout,
+    in_dt: DType,
+    out_dt: DType,
+    op: ReduceOp,
+) -> PyResult<Layout> {
+    if let Layout::Leaf(l) = sub {
+        if l.len <= 1 {
+            return Ok(sub.clone());
+        }
+        let val = reduce_leaf_to_scalar_value(sub, in_dt, op)?;
+        return scalar_to_leaf_layout(out_dt, val);
+    }
+    if crate::layout::list_chain_depth(sub) == Some(1) {
+        return Ok(reduce_2d_dim1_to_leaf(sub, in_dt, op)?.layout);
+    }
+    reduce_last_layout(sub, in_dt, out_dt, op)
+}
+
+fn reduce_union_axis0_nogil(arr: &GrumpyArray, op: ReduceOp) -> PyResult<GrumpyArray> {
+    let out_dt = reduce_out_dtype(arr.dtype, op)?;
+    let n = arr.len();
+    let mut tags = Vec::with_capacity(n);
+    let mut index = Vec::with_capacity(n);
+    let mut scalars = Leaf::new(out_dt);
+    scalars.len = n;
+    scalars.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    scalars.has_nulls = false;
+    scalars.buffer = LeafBuffer::new(out_dt);
+
+    for i in 0..n {
+        let sub = drop_axis0_select_element(&arr.layout, i)?;
+        let val = fold_layout_values(&sub, arr.dtype, op)?;
+        push_scalar_to_leaf(&mut scalars, out_dt, val)?;
+        tags.push(0);
+        index.push(i as i64);
+    }
+
+    let lists = ListOffset {
+        offsets: Arc::new(vec![0i64]),
+        content: Box::new(Layout::Leaf(Leaf::new(out_dt))),
+    };
+    Ok(GrumpyArray {
+        dtype: out_dt,
+        layout: Layout::UnionScalarList(UnionScalarList {
+            tags,
+            index,
+            scalars,
+            lists,
+        }),
+    })
+}
+
 fn reduce_union(py: Python<'_>, arr: &GrumpyArray, dim: Option<isize>, op: ReduceOp) -> PyResult<ReduceOutput> {
     match dim {
         None => match op {
@@ -1809,53 +1852,25 @@ fn reduce_union(py: Python<'_>, arr: &GrumpyArray, dim: Option<isize>, op: Reduc
                 axis += ndim as isize;
             }
             if axis < 0 || axis as usize >= ndim {
-                return Err(PyValueError::new_err("dim out of range."));
+                return Err(dim_out_of_range(d, ndim));
             }
-            if axis != 0 {
-                return Err(PyValueError::new_err(
-                    "Union reduce currently supports dim=0 only.",
-                ));
+            if axis == 0 {
+                return reduce_union_axis0(py, arr, op);
             }
-            match op {
-                ReduceOp::Sum | ReduceOp::Mean | ReduceOp::Min | ReduceOp::Max | ReduceOp::Ptp => {
-                    reduce_union_axis0(py, arr, op)
-                }
+            if axis as usize == ndim - 1 {
+                return reduce_union_last_axis(py, arr, op);
             }
+            return Err(union_op_dim_unsupported(
+                "reduce",
+                d,
+                "dim=0 and the innermost axis",
+            ));
         }
     }
 }
 
 fn reduce_union_axis0(_py: Python<'_>, arr: &GrumpyArray, op: ReduceOp) -> PyResult<ReduceOutput> {
-    let n = arr.len();
-    let mut tags = Vec::with_capacity(n);
-    let mut index = Vec::with_capacity(n);
-    let mut scalars = Leaf::new(arr.dtype);
-    scalars.len = n;
-    scalars.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
-    scalars.has_nulls = false;
-    scalars.buffer = LeafBuffer::new(arr.dtype);
-
-    for i in 0..n {
-        let sub = drop_axis0_select_element(&arr.layout, i)?;
-        let val = fold_layout_values(&sub, arr.dtype, op)?;
-        push_scalar_to_leaf(&mut scalars, arr.dtype, val)?;
-        tags.push(0);
-        index.push(i as i64);
-    }
-
-    let lists = crate::layout::ListOffset {
-        offsets: Arc::new(vec![0i64]),
-        content: Box::new(Layout::Leaf(Leaf::new(arr.dtype))),
-    };
-    Ok(ReduceOutput::Array(GrumpyArray {
-        dtype: arr.dtype,
-        layout: Layout::UnionScalarList(UnionScalarList {
-            tags,
-            index,
-            scalars,
-            lists,
-        }),
-    }))
+    Ok(ReduceOutput::Array(reduce_union_axis0_nogil(arr, op)?))
 }
 
 fn fold_layout_values(layout: &Layout, dt: DType, op: ReduceOp) -> PyResult<f64> {
@@ -1875,7 +1890,7 @@ fn fold_layout_values(layout: &Layout, dt: DType, op: ReduceOp) -> PyResult<f64>
         Ok(())
     })?;
     if count == 0 {
-        return Err(PyValueError::new_err(" reduction of empty array."));
+        return Err(reduction_empty(reduce_op_name(op)));
     }
     Ok(match op {
         ReduceOp::Sum => sum,
@@ -1923,65 +1938,6 @@ fn walk_layout_fold(
         Layout::UnionScalarList(u) => {
             for i in 0..u.len() {
                 walk_layout_fold(&drop_axis0_select_element(layout, i)?, dt, f)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn sum_layout_values(layout: &Layout, dt: DType) -> PyResult<f64> {
-    let (sum, _count) = sum_layout_values_with_count(layout, dt)?;
-    Ok(sum)
-}
-
-fn sum_layout_values_with_count(layout: &Layout, dt: DType) -> PyResult<(f64, usize)> {
-    let mut sum = 0.0f64;
-    let mut count = 0usize;
-    walk_layout_sum(layout, dt, &mut |v| {
-        sum += v;
-        count += 1;
-        Ok(())
-    })?;
-    Ok((sum, count))
-}
-
-fn walk_layout_sum(
-    layout: &Layout,
-    dt: DType,
-    f: &mut dyn FnMut(f64) -> PyResult<()>,
-) -> PyResult<()> {
-    match layout {
-        Layout::Leaf(l) => {
-            for i in 0..l.len {
-                if l.validity[i] {
-                    f(read_leaf_as_f64(dt, &l.buffer, i)?)?;
-                }
-            }
-        }
-        Layout::ListOffset(lo) => {
-            for i in 0..lo.len() {
-                let s = lo.offsets[i] as usize;
-                let e = lo.offsets[i + 1] as usize;
-                walk_layout_sum(
-                    &crate::layout::take_range(lo.content.as_ref(), s, e)?,
-                    dt,
-                    f,
-                )?;
-            }
-        }
-        Layout::OffsetView(v) => {
-            for i in 0..v.len() {
-                walk_layout_sum(&drop_axis0_select_element(layout, i)?, dt, f)?;
-            }
-        }
-        Layout::Indexed(ix) => {
-            for i in 0..ix.len() {
-                walk_layout_sum(&drop_axis0_select_element(layout, i)?, dt, f)?;
-            }
-        }
-        Layout::UnionScalarList(u) => {
-            for i in 0..u.len() {
-                walk_layout_sum(&drop_axis0_select_element(layout, i)?, dt, f)?;
             }
         }
     }

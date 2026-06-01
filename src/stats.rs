@@ -2,7 +2,7 @@ use crate::dtype::DType;
 use crate::layout::{drop_axis0_select_element, layout_ndim, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
+use crate::error::{arg_invalid, dim_out_of_range, dtype_unsupported, internal, layout_unsupported, reduction_empty, unsupported};
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -42,9 +42,9 @@ pub fn quantile(
 }
 
 fn out_dtype_for_var_std(in_dt: DType) -> PyResult<DType> {
-    Ok(match in_dt {
-        DType::Float32 => DType::Float32,
-        DType::Float64 => DType::Float64,
+    match in_dt {
+        DType::Float32 => Ok(DType::Float32),
+        DType::Float64 => Ok(DType::Float64),
         DType::Int8
         | DType::Int16
         | DType::Int32
@@ -52,9 +52,9 @@ fn out_dtype_for_var_std(in_dt: DType) -> PyResult<DType> {
         | DType::UInt8
         | DType::UInt16
         | DType::UInt32
-        | DType::UInt64 => DType::Float64,
-        _ => return Err(PyValueError::new_err("std/var only supported for numeric dtypes.")),
-    })
+        | DType::UInt64 => Ok(DType::Float64),
+        _ => Err(dtype_unsupported("std/var", in_dt)),
+    }
 }
 
 fn stat_reduce(_py: Python<'_>, a: &GrumpyArray, dim: Option<isize>, ddof: isize, nan: bool, op: StatOp) -> PyResult<GrumpyArray> {
@@ -62,11 +62,11 @@ fn stat_reduce(_py: Python<'_>, a: &GrumpyArray, dim: Option<isize>, ddof: isize
         return stat_reduce_union(a, dim, ddof, nan, op);
     }
     if ddof < 0 {
-        return Err(PyValueError::new_err("ddof must be >= 0."));
+        return Err(arg_invalid("ddof", "must be >= 0", "pass ddof=0 or a positive delta degrees of freedom."));
     }
-    let dim = dim.ok_or_else(|| PyValueError::new_err("std/var on this layout requires an explicit dim."))?;
+    let dim = dim.ok_or_else(|| arg_invalid("dim", "std/var on this layout requires an explicit dim", "pass dim=<axis> for reductions."))?;
     let out_dt = out_dtype_for_var_std(a.dtype)?;
-    let depth = crate::layout::list_chain_depth(&a.layout).ok_or_else(|| PyValueError::new_err("Not a pure list chain."))?;
+    let depth = crate::layout::list_chain_depth(&a.layout).ok_or_else(|| layout_unsupported("std/var", "requires a pure list-chain array"))?;
     if depth == 0 {
         // 1D leaf: produce scalar leaf length=1? For consistency with existing API, return a Python scalar is nicer,
         // but current plumbing uses GrumpyArray methods returning GrumpyArray. We'll return 1D leaf of len=1.
@@ -75,16 +75,16 @@ fn stat_reduce(_py: Python<'_>, a: &GrumpyArray, dim: Option<isize>, ddof: isize
         return scalar_leaf(out_dt, val);
     }
     if depth != 1 {
-        return Err(PyValueError::new_err("std/var currently only supports 1D and 2D arrays."));
+        return Err(unsupported("std/var", "currently only supports 1D and 2D arrays", "reduce dimensionality or use explicit loops."));
     }
     let dim_u = if dim < 0 { (1isize + dim + 1) as usize } else { dim as usize };
     let lo = match &a.layout {
         Layout::ListOffset(lo) => lo,
-        _ => return Err(PyValueError::new_err("Expected list layout.")),
+        _ => return Err(layout_unsupported("std/var", "expected list layout at outer axis")),
     };
     let leaf = match lo.content.as_ref() {
         Layout::Leaf(l) => l,
-        _ => return Err(PyValueError::new_err("Expected leaf content.")),
+        _ => return Err(layout_unsupported("std/var", "expected leaf content at inner axis")),
     };
 
     match dim_u {
@@ -96,7 +96,7 @@ fn stat_reduce(_py: Python<'_>, a: &GrumpyArray, dim: Option<isize>, ddof: isize
             }
         }
         0 => stat_dim0(lo, leaf, a.dtype, out_dt, ddof as usize, nan, op),
-        _ => Err(PyValueError::new_err("Invalid dim.")),
+        _ => Err(dim_out_of_range(dim, 2)),
     }
 }
 
@@ -145,7 +145,7 @@ fn stat_rect2d_dim1_fast(
         out.buffer = match out_dt {
             DType::Float32 => LeafBuffer::F32(Arc::new(vec![0f32; nrows])),
             DType::Float64 => LeafBuffer::F64(Arc::new(vec![0f64; nrows])),
-            _ => return Err(PyValueError::new_err("Internal error: out dtype.")),
+            _ => return Err(internal("std/var", "unexpected output dtype")),
         };
         return Ok(Some(GrumpyArray { dtype: out_dt, layout: Layout::Leaf(out) }));
     }
@@ -157,7 +157,7 @@ fn stat_rect2d_dim1_fast(
     out.buffer = match out_dt {
         DType::Float32 => LeafBuffer::F32(Arc::new(vec![0f32; nrows])),
         DType::Float64 => LeafBuffer::F64(Arc::new(vec![0f64; nrows])),
-        _ => return Err(PyValueError::new_err("Internal error: out dtype.")),
+        _ => return Err(internal("std/var", "unexpected output dtype")),
     };
     let out_valid = Arc::make_mut(&mut out.validity);
 
@@ -384,7 +384,7 @@ fn scalar_leaf(out_dt: DType, val: f64) -> PyResult<GrumpyArray> {
     leaf.buffer = match out_dt {
         DType::Float32 => LeafBuffer::F32(Arc::new(vec![val as f32])),
         DType::Float64 => LeafBuffer::F64(Arc::new(vec![val])),
-        _ => return Err(PyValueError::new_err("Internal error: scalar_leaf dtype.")),
+        _ => return Err(internal("std/var", "unexpected scalar_leaf dtype")),
     };
     Ok(GrumpyArray { dtype: out_dt, layout: Layout::Leaf(leaf) })
 }
@@ -406,7 +406,7 @@ fn stat_dim1(
     out.buffer = match out_dt {
         DType::Float32 => LeafBuffer::F32(Arc::new(vec![0f32; nrows])),
         DType::Float64 => LeafBuffer::F64(Arc::new(vec![0f64; nrows])),
-        _ => return Err(PyValueError::new_err("Internal error: out dtype.")),
+        _ => return Err(internal("std/var", "unexpected output dtype")),
     };
     let out_valid = Arc::make_mut(&mut out.validity);
 
@@ -451,7 +451,7 @@ fn stat_dim0(
     out.buffer = match out_dt {
         DType::Float32 => LeafBuffer::F32(Arc::new(vec![0f32; maxlen])),
         DType::Float64 => LeafBuffer::F64(Arc::new(vec![0f64; maxlen])),
-        _ => return Err(PyValueError::new_err("Internal error: out dtype.")),
+        _ => return Err(internal("std/var", "unexpected output dtype")),
     };
     let out_valid = Arc::make_mut(&mut out.validity);
 
@@ -510,14 +510,14 @@ fn scalar_as_f64(leaf: &Leaf, dt: DType, ix: usize) -> PyResult<f64> {
         (DType::Int8, LeafBuffer::I8(v)) => v[ix] as f64,
         (DType::UInt16, LeafBuffer::U16(v)) => v[ix] as f64,
         (DType::UInt8, LeafBuffer::U8(v)) => v[ix] as f64,
-        _ => return Err(PyValueError::new_err("Unsupported dtype for std/var.")),
+        _ => return Err(dtype_unsupported("std/var", dt)),
     })
 }
 
 fn var_std_slice(leaf: &Leaf, in_dt: DType, out_dt: DType, ddof: usize, nan: bool, op: StatOp) -> PyResult<f64> {
     let (ok, v) = var_std_range(leaf, in_dt, out_dt, 0, leaf.len, ddof, nan, op)?;
     if !ok {
-        return Err(PyValueError::new_err("std/var on empty slice."));
+        return Err(reduction_empty("std/var"));
     }
     Ok(v)
 }
@@ -575,7 +575,7 @@ fn quantile_impl(
     nan: bool,
 ) -> PyResult<GrumpyArray> {
     if a.layout.has_union() {
-        return Err(PyValueError::new_err("quantile on union layouts is not implemented yet."));
+        return Err(unsupported("quantile", "union layouts are not implemented yet", "convert to a list-chain layout first."));
     }
     // Only float/int for now, output float64 for ints (match NumPy default).
     let out_dt = match a.dtype {
@@ -589,7 +589,7 @@ fn quantile_impl(
         | DType::UInt16
         | DType::UInt32
         | DType::UInt64 => DType::Float64,
-        _ => return Err(PyValueError::new_err("quantile/percentile only supported for numeric dtypes.")),
+        _ => return Err(dtype_unsupported("quantile", a.dtype)),
     };
 
     // Normalize q to [0,1]
@@ -600,36 +600,36 @@ fn quantile_impl(
             QuantileMode::Percentile => x / 100.0,
         };
         if !(0.0..=1.0).contains(&qq) {
-            return Err(PyValueError::new_err("q out of range."));
+            return Err(arg_invalid("q", "out of range for the selected mode", "pass q in [0,1] for quantile or [0,100] for percentile."));
         }
         qs.push(qq);
     }
     // For now: require a single q; we can extend to multi-q by adding another outer axis.
     if qs.len() != 1 {
-        return Err(PyValueError::new_err("Only scalar q is supported for now."));
+        return Err(unsupported("quantile", "only scalar q is supported for now", "pass a single q value."));
     }
     let q0 = qs[0];
 
-    let depth = crate::layout::list_chain_depth(&a.layout).ok_or_else(|| PyValueError::new_err("Not a pure list chain."))?;
+    let depth = crate::layout::list_chain_depth(&a.layout).ok_or_else(|| layout_unsupported("std/var", "requires a pure list-chain array"))?;
     if depth == 0 {
         let leaf = match &a.layout { Layout::Leaf(l) => l, _ => unreachable!() };
         let (ok, v) = quantile_range(leaf, a.dtype, 0, leaf.len, q0, nan)?;
         if !ok {
-            return Err(PyValueError::new_err("quantile on empty slice."));
+            return Err(reduction_empty("quantile"));
         }
         return scalar_leaf_q(out_dt, v);
     }
     if depth != 1 {
-        return Err(PyValueError::new_err("quantile currently only supports 1D and 2D arrays."));
+        return Err(unsupported("quantile", "currently only supports 1D and 2D arrays", "reduce dimensionality first."));
     }
     let dim_u = if dim < 0 { (1isize + dim + 1) as usize } else { dim as usize };
     let lo = match &a.layout {
         Layout::ListOffset(lo) => lo,
-        _ => return Err(PyValueError::new_err("Expected list layout.")),
+        _ => return Err(layout_unsupported("std/var", "expected list layout at outer axis")),
     };
     let leaf = match lo.content.as_ref() {
         Layout::Leaf(l) => l,
-        _ => return Err(PyValueError::new_err("Expected leaf content.")),
+        _ => return Err(layout_unsupported("std/var", "expected leaf content at inner axis")),
     };
     match dim_u {
         1 => {
@@ -661,7 +661,7 @@ fn quantile_impl(
             }
             Ok(GrumpyArray { dtype: out_dt, layout: Layout::Leaf(out) })
         }
-        _ => Err(PyValueError::new_err("quantile dim=0 not implemented yet.")),
+        _ => Err(unsupported("quantile", "dim=0 is not implemented yet", "use dim=1 or flatten first.")),
     }
 }
 
@@ -673,7 +673,7 @@ fn scalar_leaf_q(out_dt: DType, val: f64) -> PyResult<GrumpyArray> {
     leaf.buffer = match out_dt {
         DType::Float32 => LeafBuffer::F32(Arc::new(vec![val as f32])),
         DType::Float64 => LeafBuffer::F64(Arc::new(vec![val])),
-        _ => return Err(PyValueError::new_err("Internal error.")),
+        _ => return Err(internal("quantile", "unexpected internal state")),
     };
     Ok(GrumpyArray { dtype: out_dt, layout: Layout::Leaf(leaf) })
 }
@@ -709,7 +709,7 @@ fn normalize_stat_dim(dim: isize, ndim: usize) -> PyResult<usize> {
         d += ndim as isize;
     }
     if d < 0 || d as usize >= ndim {
-        return Err(PyValueError::new_err("dim out of range."));
+        return Err(dim_out_of_range(dim, ndim));
     }
     Ok(d as usize)
 }
@@ -772,14 +772,14 @@ fn collect_layout_f64_rec(
 
 fn stat_reduce_union(a: &GrumpyArray, dim: Option<isize>, ddof: isize, nan: bool, op: StatOp) -> PyResult<GrumpyArray> {
     if ddof < 0 {
-        return Err(PyValueError::new_err("ddof must be >= 0."));
+        return Err(arg_invalid("ddof", "must be >= 0", "pass ddof=0 or a positive delta degrees of freedom."));
     }
     let out_dt = out_dtype_for_var_std(a.dtype)?;
     if dim.is_none() {
         let vals = collect_layout_f64(&a.layout, a.dtype, nan)?;
         let (ok, v) = var_std_values(&vals, ddof as usize, op)?;
         if !ok {
-            return Err(PyValueError::new_err("std/var on empty array."));
+            return Err(reduction_empty("std/var"));
         }
         return scalar_leaf(out_dt, v);
     }
@@ -790,15 +790,17 @@ fn stat_reduce_union(a: &GrumpyArray, dim: Option<isize>, ddof: isize, nan: bool
         let vals = collect_layout_f64(&a.layout, a.dtype, nan)?;
         let (ok, v) = var_std_values(&vals, ddof as usize, op)?;
         if !ok {
-            return Err(PyValueError::new_err("std/var on empty array."));
+            return Err(reduction_empty("std/var"));
         }
         return scalar_leaf(out_dt, v);
     }
     match dim_u {
         0 => stat_union_axis0(a, out_dt, ddof as usize, nan, op),
         x if x == ndim - 1 => stat_union_last_axis(a, out_dt, ddof as usize, nan, op),
-        _ => Err(PyValueError::new_err(
-            "std/var on union layouts currently supports dim=0 and innermost dim only.",
+        _ => Err(unsupported(
+            "stat_reduce_union",
+            "std/var on union layouts currently supports dim=0 and innermost dim only",
+            "use dim=0 or dim=-1 for union arrays.",
         )),
     }
 }

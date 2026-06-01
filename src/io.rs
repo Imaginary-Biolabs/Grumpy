@@ -1,9 +1,9 @@
 use crate::dataframe::{GrumpyDataFrame, Schema};
 use crate::dtype::DType;
+use crate::error::{arg_invalid, index_out_of_bounds, internal, internal_dtype_buffer_mismatch, invalid_slice_range, io_failed, io_wrong_type, schema_violation, unsupported};
 use crate::layout::{concat_layout_segments, remap_union_pick, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, OffsetView, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -68,16 +68,6 @@ impl DatasetHandle {
         }
     }
 
-    pub fn primary_layout_meta(&self) -> PyResult<&LayoutMeta> {
-        match &self.meta.root {
-            RootMeta::Array { layout, .. } => Ok(layout),
-            RootMeta::DataFrame { columns, .. } => columns
-                .first()
-                .map(|c| &c.layout)
-                .ok_or_else(|| PyValueError::new_err("Empty dataframe has no layout.")),
-        }
-    }
-
     pub fn schema(&self) -> Option<SchemaRef> {
         match &self.meta.root {
             RootMeta::DataFrame { schema, .. } => schema.as_ref().map(|levels| SchemaRef {
@@ -100,9 +90,11 @@ impl SchemaRef {
                 return Ok(lvl);
             }
         }
-        Err(PyValueError::new_err(format!(
-            "Unknown schema level '{name}'."
-        )))
+        Err(schema_violation(
+            format!("unknown schema level '{name}'"),
+            "batch_on/chunk_dim must name a declared schema level.",
+            "use a level from schema= or a numeric depth for arrays.",
+        ))
     }
 }
 
@@ -256,7 +248,7 @@ pub fn load_array(py: Python<'_>, path: &str) -> PyResult<GrumpyArray> {
             let layout = load_layout(&store, dt, &layout)?;
             Ok(GrumpyArray { dtype: dt, layout })
         }
-        _ => Err(PyValueError::new_err("Path does not contain a saved GrumpyArray.")),
+        _ => Err(io_wrong_type("array", path)),
     }
 }
 
@@ -327,7 +319,7 @@ pub fn load_dataframe(py: Python<'_>, path: &str) -> PyResult<GrumpyDataFrame> {
             };
             GrumpyDataFrame::new(names, cols, schema)
         }
-        _ => Err(PyValueError::new_err("Path does not contain a saved GrumpyDataFrame.")),
+        _ => Err(io_wrong_type("dataframe", path)),
     }
 }
 
@@ -456,7 +448,7 @@ fn save_leaf(
         }
         (LeafBuffer::Char(v), DType::Char) => write_vec_u32(store, ctx, "values", v.as_slice(), depth)?,
         (LeafBuffer::String(v), DType::String) => write_vec_string(store, ctx, "values", v.as_slice(), depth)?,
-        _ => return Err(PyValueError::new_err("Internal error: dtype mismatch in save_leaf.")),
+        _ => return Err(internal_dtype_buffer_mismatch("save_leaf", dt)),
     };
     Ok(LayoutMeta::Leaf { len, values, validity })
 }
@@ -466,7 +458,7 @@ fn load_layout(store: &ReadableWritableListableStorage, dt: DType, meta: &Layout
         LayoutMeta::Leaf { len, values, validity } => {
             let valid = read_vec_bool(store, validity)?;
             if valid.len() != *len {
-                return Err(PyValueError::new_err("Invalid validity length in file."));
+                return Err(internal("load_layout_take_range", "validity length mismatch in file"));
             }
             let mut leaf = Leaf::new(dt);
             leaf.len = *len;
@@ -513,12 +505,12 @@ fn load_layout(store: &ReadableWritableListableStorage, dt: DType, meta: &Layout
             let index = read_vec::<i64>(store, index)?;
             let scal = match load_layout(store, dt, scalars)? {
                 Layout::Leaf(l) => l,
-                _ => return Err(PyValueError::new_err("Invalid union scalars layout in file.")),
+                _ => return Err(internal("load_layout", "invalid union scalars layout in file")),
             };
             let lists_layout = load_layout(store, dt, lists)?;
             let lists = match lists_layout {
                 Layout::ListOffset(lo) => lo,
-                _ => return Err(PyValueError::new_err("Invalid union lists layout in file.")),
+                _ => return Err(internal("load_layout", "invalid union lists layout in file")),
             };
             Ok(Layout::UnionScalarList(UnionScalarList { tags, index, scalars: scal, lists }))
         }
@@ -526,46 +518,46 @@ fn load_layout(store: &ReadableWritableListableStorage, dt: DType, meta: &Layout
 }
 
 fn ensure_dir(path: &str) -> PyResult<()> {
-    fs::create_dir_all(path).map_err(|e| PyValueError::new_err(format!("Failed to create directory: {e}")))?;
+    fs::create_dir_all(path).map_err(|e| io_failed(format!("failed to create directory at {path}"), e.to_string(), "check path permissions and disk space."))?;
     Ok(())
 }
 
 fn store_fs(path: &str) -> PyResult<ReadableWritableListableStorage> {
-    let store: ReadableWritableListableStorage = Arc::new(zarrs::filesystem::FilesystemStore::new(path).map_err(|e| PyValueError::new_err(format!("{e}")))?);
+    let store: ReadableWritableListableStorage = Arc::new(zarrs::filesystem::FilesystemStore::new(path).map_err(|e| io_failed(format!("failed to open store at {path}"), e.to_string(), "verify the path exists and is readable/writable."))?);
     Ok(store)
 }
 
 fn init_root_group(store: &ReadableWritableListableStorage) -> PyResult<()> {
     zarrs::group::GroupBuilder::new()
         .build(store.clone(), "/")
-        .map_err(|e| PyValueError::new_err(format!("{e}")))?
+        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?
         .store_metadata()
-        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     Ok(())
 }
 
 fn init_group(store: &ReadableWritableListableStorage, path: &str) -> PyResult<()> {
     zarrs::group::GroupBuilder::new()
         .build(store.clone(), path)
-        .map_err(|e| PyValueError::new_err(format!("{e}")))?
+        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?
         .store_metadata()
-        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     Ok(())
 }
 
 fn write_meta(path: &str, meta: &FileMeta) -> PyResult<()> {
     let p = Path::new(path).join(META_FILE);
-    let s = serde_json::to_string_pretty(meta).map_err(|e| PyValueError::new_err(format!("{e}")))?;
-    fs::write(p, s).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    let s = serde_json::to_string_pretty(meta).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
+    fs::write(p, s).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     Ok(())
 }
 
 fn read_meta(path: &str) -> PyResult<FileMeta> {
     let p = Path::new(path).join(META_FILE);
-    let s = fs::read_to_string(p).map_err(|e| PyValueError::new_err(format!("{e}")))?;
-    let meta: FileMeta = serde_json::from_str(&s).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    let s = fs::read_to_string(p).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
+    let meta: FileMeta = serde_json::from_str(&s).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     if meta.version != FORMAT_VERSION {
-        return Err(PyValueError::new_err("Unsupported file version."));
+        return Err(io_failed("unsupported file version", "this grumpy.json version is newer or incompatible", "upgrade grumpy or re-save the dataset with the current version."));
     }
     Ok(meta)
 }
@@ -595,11 +587,11 @@ where
     let chunk_grid = ChunkGrid::from(vec![nz]);
     let arr = ArrayBuilder::new(vec![n as u64], dt, chunk_grid, fill)
         .build(store.clone(), &path)
-        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-    arr.store_metadata().map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
+    arr.store_metadata().map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     let subset = arr.subset_all();
     arr.store_array_subset_elements::<T>(&subset, &data.to_vec())
-        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     Ok(path)
 }
 
@@ -641,10 +633,10 @@ fn write_vec_string(store: &ReadableWritableListableStorage, ctx: &mut SaveCtx, 
 }
 
 fn read_vec<T: ElementOwned>(store: &ReadableWritableListableStorage, path: &str) -> PyResult<Vec<T>> {
-    let arr = Array::open(store.clone(), path).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    let arr = Array::open(store.clone(), path).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     let subset = arr.subset_all();
     arr.retrieve_array_subset_elements::<T>(&subset)
-        .map_err(|e| PyValueError::new_err(format!("{e}")))
+        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))
 }
 
 fn read_vec_bool(store: &ReadableWritableListableStorage, path: &str) -> PyResult<Vec<bool>> {
@@ -652,7 +644,7 @@ fn read_vec_bool(store: &ReadableWritableListableStorage, path: &str) -> PyResul
 }
 
 fn array_axis0_len(store: &ReadableWritableListableStorage, tags_path: &str) -> PyResult<usize> {
-    let arr = Array::open(store.clone(), tags_path).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    let arr = Array::open(store.clone(), tags_path).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     Ok(arr.shape()[0] as usize)
 }
 
@@ -665,11 +657,11 @@ fn read_vec_range<T: ElementOwned>(
     if start >= stop {
         return Ok(Vec::new());
     }
-    let arr = Array::open(store.clone(), path).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    let arr = Array::open(store.clone(), path).map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))?;
     let subset = ArraySubset::new_with_ranges(&[start as u64..stop as u64]);
     record_io_bytes((stop - start) * std::mem::size_of::<T>());
     arr.retrieve_array_subset_elements::<T>(&subset)
-        .map_err(|e| PyValueError::new_err(format!("{e}")))
+        .map_err(|e| io_failed("I/O operation failed", format!("{e}"), "verify the saved dataset path and file permissions."))
 }
 
 /// Load an array batch covering axis-0 ``[start, stop)`` without reading unrelated leaf data.
@@ -684,7 +676,7 @@ pub fn load_array_axis0_slice(
             let layout = load_layout_axis0_slice(&handle.store, dt, layout, start, stop)?;
             Ok(GrumpyArray { dtype: dt, layout })
         }
-        _ => Err(PyValueError::new_err("Path does not contain a saved GrumpyArray.")),
+        _ => Err(io_wrong_type("array", &handle.path)),
     }
 }
 
@@ -694,7 +686,7 @@ pub fn load_dataframe_axis0_slice(
     start: usize,
     stop: usize,
 ) -> PyResult<GrumpyDataFrame> {
-    match &handle.meta.root.clone() {
+    match &handle.meta.root {
         RootMeta::DataFrame { schema, columns } => {
             let mut names: Vec<String> = Vec::new();
             let mut cols: Vec<GrumpyArray> = Vec::new();
@@ -718,7 +710,7 @@ pub fn load_dataframe_axis0_slice(
             };
             GrumpyDataFrame::new(names, cols, schema)
         }
-        _ => Err(PyValueError::new_err("Path does not contain a saved GrumpyDataFrame.")),
+        _ => Err(io_wrong_type("dataframe", &handle.path)),
     }
 }
 
@@ -741,17 +733,17 @@ fn load_layout_take_range(
     end: usize,
 ) -> PyResult<Layout> {
     if start > end {
-        return Err(PyValueError::new_err("Invalid range."));
+        return Err(invalid_slice_range(start, end, start.max(end)));
     }
     match meta {
         LayoutMeta::Leaf { len, values, validity } => {
             if end > *len {
-                return Err(PyValueError::new_err("Leaf slice out of bounds."));
+                return Err(index_out_of_bounds(end, *len, "on leaf slice in file"));
             }
             let valid = read_vec_range::<bool>(store, validity, start, end)?;
             let new_len = end - start;
             if valid.len() != new_len {
-                return Err(PyValueError::new_err("Invalid validity length in file."));
+                return Err(internal("load_layout_take_range", "validity length mismatch in file"));
             }
             let mut leaf = Leaf::new(dt);
             leaf.len = new_len;
@@ -783,7 +775,7 @@ fn load_layout_take_range(
         LayoutMeta::ListOffset { offsets, content } => {
             let offs = read_vec::<i64>(store, offsets)?;
             if end > offs.len().saturating_sub(1) {
-                return Err(PyValueError::new_err("Slice out of bounds."));
+                return Err(index_out_of_bounds(end, offs.len().saturating_sub(1), "on list slice in file"));
             }
             let child_start = offs[start] as usize;
             let child_end = offs[end] as usize;
@@ -809,7 +801,7 @@ fn load_layout_take_range(
             let abs_start = base + start;
             let abs_end = base + end;
             if abs_end > *base_stop {
-                return Err(PyValueError::new_err("Slice out of bounds."));
+                return Err(index_out_of_bounds(end, *base_stop - base, "on list slice in file"));
             }
             let offs = read_vec::<i64>(store, offsets)?;
             let child_start = offs[abs_start] as usize;
@@ -822,8 +814,10 @@ fn load_layout_take_range(
                 content: Box::new(inner),
             }))
         }
-        LayoutMeta::Indexed { .. } => Err(PyValueError::new_err(
-            "Indexed layout streaming slice is not supported.",
+        LayoutMeta::Indexed { .. } => Err(unsupported(
+            "load_layout_take_range",
+            "Indexed layout streaming slice is not supported",
+            "materialize indexed views before saving.",
         )),
         LayoutMeta::UnionScalarList {
             tags,
@@ -855,7 +849,7 @@ fn load_union_scalar_list_take_range(
 ) -> PyResult<Layout> {
     let n = array_axis0_len(store, tags_path)?;
     if end > n {
-        return Err(PyValueError::new_err("Union slice out of bounds."));
+        return Err(index_out_of_bounds(end, n, "on union slice in file"));
     }
     let slice_tags = read_vec_range::<u8>(store, tags_path, start, end)?;
     let slice_index = read_vec_range::<i64>(store, index_path, start, end)?;
@@ -916,13 +910,16 @@ fn load_leaf_indices(
     let len = match meta {
         LayoutMeta::Leaf { len, .. } => *len,
         _ => {
-            return Err(PyValueError::new_err(
-                "Internal error: expected leaf metadata for union scalars.",
+            return Err(internal(
+                "load_union_scalar_list_take_range",
+                "expected leaf metadata for union scalars",
             ))
         }
     };
-    if indices.iter().any(|&i| i >= len) {
-        return Err(PyValueError::new_err("Union scalar index out of bounds."));
+    if let Some(&max_ix) = indices.iter().max() {
+        if max_ix >= len {
+            return Err(index_out_of_bounds(max_ix, len, "on union scalar index in file"));
+        }
     }
 
     let mut unique: Vec<usize> = indices.iter().copied().collect();
@@ -932,8 +929,9 @@ fn load_leaf_indices(
     let mut gathered: Vec<(usize, Leaf)> = Vec::with_capacity(unique.len());
     for (run_start, run_end) in coalesce_index_runs(&unique) {
         let Layout::Leaf(chunk) = load_layout_take_range(store, dt, meta, run_start, run_end)? else {
-            return Err(PyValueError::new_err(
-                "Internal error: partial leaf read did not return a leaf.",
+            return Err(internal(
+                "load_union_scalar_list_take_range",
+                "partial leaf read did not return a leaf",
             ));
         };
         for local in 0..(run_end - run_start) {
@@ -956,7 +954,7 @@ fn load_leaf_indices(
     for (out_i, &src) in indices.iter().enumerate() {
         let pos = gathered
             .binary_search_by_key(&src, |(ix, _)| *ix)
-            .map_err(|_| PyValueError::new_err("Internal error: missing gathered scalar."))?;
+            .map_err(|_| internal("load_union_scalar", "missing gathered scalar"))?;
         let elem = &gathered[pos].1;
         if !elem.validity[0] {
             out_valid.set(out_i, false);
@@ -976,8 +974,9 @@ fn load_union_lists_pick(
     let (offsets_path, content_meta) = match lists_meta {
         LayoutMeta::ListOffset { offsets, content } => (offsets.as_str(), content.as_ref()),
         _ => {
-            return Err(PyValueError::new_err(
-                "Invalid union lists metadata in file.",
+            return Err(internal(
+                "load_union_scalar_list_take_range",
+                "invalid union lists metadata in file",
             ))
         }
     };
@@ -987,7 +986,7 @@ fn load_union_lists_pick(
     let mut content_segs: Vec<Layout> = Vec::with_capacity(list_src.len());
     for &li in list_src {
         if li + 1 >= offs.len() {
-            return Err(PyValueError::new_err("Union list index out of bounds."));
+            return Err(index_out_of_bounds(li, offs.len().saturating_sub(1), "on union list index in file"));
         }
         let s = offs[li] as usize;
         let e = offs[li + 1] as usize;
@@ -1032,7 +1031,7 @@ fn count_entities_in_axis0_row(
         LayoutMeta::ListOffset { offsets, content } => {
             let offs = read_vec::<i64>(store, offsets)?;
             if row + 1 >= offs.len() {
-                return Err(PyValueError::new_err("Row index out of bounds."));
+                return Err(index_out_of_bounds(row, offs.len().saturating_sub(1), "on dataframe row in file"));
             }
             let leaf_lo = offs[row] as usize;
             let leaf_hi = offs[row + 1] as usize;
@@ -1054,7 +1053,7 @@ fn count_entities_in_axis0_row(
             let offs = read_vec::<i64>(store, offsets)?;
             let abs_row = start + row;
             if abs_row + 1 >= offs.len() {
-                return Err(PyValueError::new_err("Row index out of bounds."));
+                return Err(index_out_of_bounds(row, offs.len().saturating_sub(1), "on dataframe row in file"));
             }
             let leaf_lo = offs[abs_row] as usize;
             let leaf_hi = offs[abs_row + 1] as usize;
@@ -1086,8 +1085,10 @@ fn count_entities_in_axis0_row(
             target_depth,
             current_depth,
         ),
-        LayoutMeta::Indexed { .. } => Err(PyValueError::new_err(
-            "batch_on is not supported for Indexed layouts.",
+        LayoutMeta::Indexed { .. } => Err(unsupported(
+            "row_entity_counts_at_depth",
+            "batch_on is not supported for Indexed layouts",
+            "materialize indexed views before saving.",
         )),
     }
 }
@@ -1107,7 +1108,7 @@ fn count_entities_in_union_axis0_row(
     let all_tags = read_vec::<u8>(store, tags_path)?;
     let all_index = read_vec::<i64>(store, index_path)?;
     if row >= all_tags.len() {
-        return Err(PyValueError::new_err("Row index out of bounds."));
+        return Err(index_out_of_bounds(row, all_tags.len(), "on dataframe row in file"));
     }
     match all_tags[row] {
         0 => Ok(if target_depth == current_depth + 1 {
@@ -1134,12 +1135,13 @@ fn count_entities_in_union_axis0_row(
                         current_depth + 1,
                     )
                 }
-                _ => Err(PyValueError::new_err(
-                    "Invalid union lists metadata in file.",
+                _ => Err(internal(
+                    "load_union_scalar_list_take_range",
+                    "invalid union lists metadata in file",
                 )),
             }
         }
-        _ => Err(PyValueError::new_err("Invalid union tag in file.")),
+        _ => Err(internal("load_union_slice", "invalid union tag in file")),
     }
 }
 
@@ -1180,8 +1182,10 @@ fn entity_count_in_leaf_range(
             Ok(total)
         }
         LayoutMeta::Leaf { .. } => Ok(0),
-        LayoutMeta::OffsetView { .. } => Err(PyValueError::new_err(
-            "batch_on depth counting unsupported for OffsetView layouts.",
+        LayoutMeta::OffsetView { .. } => Err(unsupported(
+            "row_entity_counts_at_depth",
+            "batch_on depth counting unsupported for OffsetView layouts",
+            "materialize offset views before saving.",
         )),
         LayoutMeta::UnionScalarList {
             tags,
@@ -1198,8 +1202,10 @@ fn entity_count_in_leaf_range(
             target_depth,
             current_depth,
         ),
-        LayoutMeta::Indexed { .. } => Err(PyValueError::new_err(
-            "batch_on depth counting unsupported for Indexed layouts.",
+        LayoutMeta::Indexed { .. } => Err(unsupported(
+            "row_entity_counts_at_depth",
+            "batch_on depth counting unsupported for Indexed layouts",
+            "materialize indexed views before saving.",
         )),
     }
 }
@@ -1249,24 +1255,6 @@ fn entity_count_at_depth(
         LayoutMeta::Leaf { .. } => leaf_hi.saturating_sub(leaf_lo),
         _ => 0,
     }
-}
-
-fn count_entities_in_leaf_range(
-    store: &ReadableWritableListableStorage,
-    meta: &LayoutMeta,
-    leaf_lo: usize,
-    leaf_hi: usize,
-    target_depth: usize,
-    current_depth: usize,
-) -> PyResult<usize> {
-    entity_count_in_leaf_range(
-        store,
-        meta,
-        leaf_lo,
-        leaf_hi,
-        target_depth,
-        current_depth,
-    )
 }
 
 fn count_list_elements_in_leaf_range(
@@ -1334,7 +1322,5 @@ pub fn resolve_chunk_dim_depth(df_schema: Option<&Schema>, chunk_dim: &str) -> P
             }
         }
     }
-    Err(PyValueError::new_err(format!(
-        "Unknown chunk_dim '{chunk_dim}'."
-    )))
+    Err(arg_invalid("chunk_dim", format!("unknown chunk_dim '{chunk_dim}'"), "use a schema level name or numeric depth."))
 }

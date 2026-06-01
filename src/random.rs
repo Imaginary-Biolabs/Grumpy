@@ -8,6 +8,7 @@ use crate::layout::{
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use half::f16;
+use crate::error::{arg_invalid, shape_mismatch, dim_out_of_range, index_out_of_bounds, index_out_of_bounds_simple, internal, layout_unsupported, unsupported};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rand_distr::{Distribution, StandardNormal, Uniform};
@@ -76,7 +77,7 @@ fn normalize_axis(dim: isize, depth: usize) -> PyResult<usize> {
         d += ndims;
     }
     if d < 0 || d >= ndims {
-        return Err(PyValueError::new_err("dim out of range."));
+        return Err(dim_out_of_range(dim, depth + 1));
     }
     Ok(d as usize)
 }
@@ -86,9 +87,7 @@ fn resolve_count(spec: ChoiceCount, population: usize) -> PyResult<usize> {
         ChoiceCount::Count(k) => Ok(k),
         ChoiceCount::Fraction(f) => {
             if !(0.0..=1.0).contains(&f) {
-                return Err(PyValueError::new_err(
-                    "choice size fraction must be in [0.0, 1.0].",
-                ));
+                return Err(arg_invalid("size", "fraction must be in [0.0, 1.0]", "pass a fraction between 0 and 1 inclusive."));
             }
             Ok((f * population as f64).floor() as usize)
         }
@@ -102,15 +101,10 @@ fn sample_indices(
     replace: bool,
 ) -> PyResult<Vec<usize>> {
     if population == 0 && k > 0 {
-        return Err(PyValueError::new_err(
-            "Cannot take a sample from an empty population.",
-        ));
+        return Err(arg_invalid("population", "cannot sample from an empty population", "ensure the axis has at least one element."));
     }
     if !replace && k > population {
-        return Err(PyValueError::new_err(format!(
-            "Cannot take a sample larger than population when replace=False ({} > {}).",
-            k, population
-        )));
+        return Err(arg_invalid("size", format!("sample size {k} exceeds population {population} with replace=False"), "reduce k, enable replace=True, or enlarge the population."));
     }
     if k == 0 {
         return Ok(Vec::new());
@@ -130,9 +124,7 @@ fn sample_indices(
 
 fn ensure_pure_list_chain(layout: &Layout) -> PyResult<()> {
     if layout.has_union() {
-        return Err(PyValueError::new_err(
-            "random ops require a pure list-chain array (no UnionScalarList).",
-        ));
+        return Err(layout_unsupported("random ops", "require a pure list-chain array (no UnionScalarList)"));
     }
     Ok(())
 }
@@ -141,9 +133,7 @@ fn canonical_listoffset(layout: &Layout) -> PyResult<ListOffset> {
     match layout {
         Layout::ListOffset(lo) => Ok(lo.clone()),
         Layout::OffsetView(v) => offsetview_to_listoffset(v),
-        _ => Err(PyValueError::new_err(
-            "Internal error: expected ListOffset or OffsetView.",
-        )),
+        _ => Err(internal("canonical_listoffset", "expected ListOffset or OffsetView")),
     }
 }
 
@@ -157,9 +147,7 @@ fn float_out_dtype(in_dt: DType) -> DType {
 
 fn reject_string_char(dt: DType, op: &str) -> PyResult<()> {
     match dt {
-        DType::Char | DType::String => Err(PyValueError::new_err(format!(
-            "{op} is not supported for char/string dtypes."
-        ))),
+        DType::Char | DType::String => Err(unsupported(op, "char/string dtypes are not supported", "cast to a numeric dtype first.")),
         _ => Ok(()),
     }
 }
@@ -178,7 +166,7 @@ pub fn uniform_like(
     high: f64,
 ) -> PyResult<GrumpyArray> {
     if low >= high {
-        return Err(PyValueError::new_err("uniform_like requires low < high."));
+        return Err(arg_invalid("low/high", "uniform_like requires low < high", "pass low strictly less than high."));
     }
     ensure_pure_list_chain(&x.layout)?;
     reject_string_char(x.dtype, "uniform_like")?;
@@ -206,7 +194,7 @@ pub fn normal_like(
     scale: f64,
 ) -> PyResult<GrumpyArray> {
     if scale < 0.0 {
-        return Err(PyValueError::new_err("normal_like requires scale >= 0."));
+        return Err(arg_invalid("scale", "normal_like requires scale >= 0", "pass a non-negative scale."));
     }
     ensure_pure_list_chain(&x.layout)?;
     reject_string_char(x.dtype, "normal_like")?;
@@ -231,14 +219,12 @@ pub fn integers_like(
     out_dt: DType,
 ) -> PyResult<GrumpyArray> {
     if low >= high {
-        return Err(PyValueError::new_err("integers_like requires low < high."));
+        return Err(arg_invalid("low/high", "integers_like requires low < high", "pass low strictly less than high."));
     }
     ensure_pure_list_chain(&x.layout)?;
     reject_string_char(x.dtype, "integers_like")?;
     if !is_integer_dtype(out_dt) {
-        return Err(PyValueError::new_err(
-            "integers_like dtype must be an integer dtype.",
-        ));
+        return Err(arg_invalid("dtype", "integers_like dtype must be an integer dtype", "pass an integer dtype for integers_like."));
     }
     let layout = fill_random_layout(
         rng,
@@ -260,12 +246,10 @@ pub fn integers(
     out_dt: DType,
 ) -> PyResult<GrumpyArray> {
     if low >= high {
-        return Err(PyValueError::new_err("integers requires low < high."));
+        return Err(arg_invalid("low/high", "integers requires low < high", "pass low strictly less than high."));
     }
     if !is_integer_dtype(out_dt) {
-        return Err(PyValueError::new_err(
-            "integers dtype must be an integer dtype.",
-        ));
+        return Err(arg_invalid("dtype", "integers dtype must be an integer dtype", "pass an integer dtype for integers."));
     }
     let range = (high - low) as u64;
     let mut leaf = Leaf::new(out_dt);
@@ -293,7 +277,7 @@ pub fn choice(
 ) -> PyResult<GrumpyArray> {
     ensure_pure_list_chain(&x.layout)?;
     let depth = list_chain_depth(&x.layout)
-        .ok_or_else(|| PyValueError::new_err("choice requires a pure list-chain array."))?;
+        .ok_or_else(|| layout_unsupported("choice", "requires a pure list-chain array"))?;
     let axis = normalize_axis(dim, depth)?;
     let layout = choice_on_layout(rng, &x.layout, x.dtype, depth, axis, &size, replace)?;
     Ok(GrumpyArray {
@@ -305,7 +289,7 @@ pub fn choice(
 pub fn permutation(rng: &mut GrumpyRng, x: &GrumpyArray, dim: isize) -> PyResult<GrumpyArray> {
     ensure_pure_list_chain(&x.layout)?;
     let depth = list_chain_depth(&x.layout)
-        .ok_or_else(|| PyValueError::new_err("permutation requires a pure list-chain array."))?;
+        .ok_or_else(|| layout_unsupported("permutation", "requires a pure list-chain array"))?;
     let axis = normalize_axis(dim, depth)?;
     let layout = permute_axis_layout(rng, &x.layout, x.dtype, depth, axis)?;
     Ok(GrumpyArray {
@@ -319,9 +303,7 @@ pub fn shuffle(rng: &mut GrumpyRng, x: &mut GrumpyArray, dim: isize) -> PyResult
     if let Layout::UnionScalarList(u) = &mut x.layout {
         let axis = normalize_axis(dim, 0)?;
         if axis != 0 {
-            return Err(PyValueError::new_err(
-                "shuffle on union arrays supports dim=0 only for now.",
-            ));
+            return Err(unsupported("shuffle", "union arrays support dim=0 only for now", "shuffle along the outer union axis only."));
         }
         let n = u.len();
         let idx = sample_indices(rng.rng(), n, n, false)?;
@@ -347,7 +329,7 @@ fn choice_on_layout(
 ) -> PyResult<Layout> {
     if depth == 0 {
         if axis != 0 {
-            return Err(PyValueError::new_err("dim out of range."));
+            return Err(dim_out_of_range(axis as isize, depth + 1));
         }
         let leaf = match layout {
             Layout::Leaf(l) => l,
@@ -357,9 +339,7 @@ fn choice_on_layout(
             ChoiceSize::Uniform(c) => resolve_count(*c, leaf.len)?,
             ChoiceSize::PerSlice(v) => {
                 if v.len() != 1 {
-                    return Err(PyValueError::new_err(
-                        "choice size list length must match the number of slices along the orthogonal axis.",
-                    ));
+                    return Err(shape_mismatch("choice", "size list length must match orthogonal slice count", "pass one size per orthogonal slice."));
                 }
                 v[0]
             }
@@ -375,9 +355,7 @@ fn choice_on_layout(
             ChoiceSize::Uniform(c) => resolve_count(*c, n)?,
             ChoiceSize::PerSlice(v) => {
                 if v.len() != 1 {
-                    return Err(PyValueError::new_err(
-                        "choice size list is not supported with dim=0; use an int, float, or a single-element list.",
-                    ));
+                    return Err(arg_invalid("size", "size list is not supported with dim=0", "use an int, float fraction, or single-element list."));
                 }
                 v[0]
             }
@@ -400,12 +378,16 @@ fn choice_on_layout(
     let n = lo.len();
     if let ChoiceSize::PerSlice(v) = size {
         if v.len() != n {
-            return Err(PyValueError::new_err(format!(
-                "choice size list length ({}) must match outer length ({}) for dim={}.",
-                v.len(),
-                n,
-                axis
-            )));
+            return Err(shape_mismatch(
+                "choice",
+                format!(
+                    "size list length ({}) must match outer length ({}) for dim={}",
+                    v.len(),
+                    n,
+                    axis
+                ),
+                "pass one size per outer element.",
+            ));
         }
     }
     let mut out_elems: Vec<Layout> = Vec::with_capacity(n);
@@ -438,7 +420,7 @@ fn permute_axis_layout(
     let _ = dtype;
     if depth == 0 {
         if axis != 0 {
-            return Err(PyValueError::new_err("dim out of range."));
+            return Err(dim_out_of_range(axis as isize, depth + 1));
         }
         let leaf = match layout {
             Layout::Leaf(l) => l,
@@ -488,7 +470,7 @@ fn permute_layout_inner(
 ) -> PyResult<Layout> {
     if depth == 0 {
         if axis != 0 {
-            return Err(PyValueError::new_err("dim out of range."));
+            return Err(dim_out_of_range(axis as isize, depth + 1));
         }
         let leaf = match layout {
             Layout::Leaf(l) => l,
@@ -531,7 +513,7 @@ fn gather_leaf_segment(leaf: &Leaf, indices: &[usize]) -> PyResult<Layout> {
     let out_valid = Arc::make_mut(&mut out.validity);
     for (dst, &src) in indices.iter().enumerate() {
         if src >= leaf.len {
-            return Err(PyValueError::new_err("Index out of bounds."));
+            return Err(index_out_of_bounds_simple("during random sampling"));
         }
         if !leaf.validity[src] {
             out_valid.set(dst, false);
@@ -628,7 +610,7 @@ fn concat_scalar_leaves(elems: &[Layout]) -> PyResult<Layout> {
 fn concat_leaves(elems: &[Layout]) -> PyResult<Layout> {
     let dt = match &elems[0] {
         Layout::Leaf(l) => l.dtype,
-        _ => return Err(PyValueError::new_err("Internal error: expected leaves.")),
+        _ => return Err(internal("concat_len1_leaves", "expected leaf layouts")),
     };
     let total: usize = elems.iter().map(|e| e.len()).sum();
     let mut out = Leaf::new(dt);
@@ -660,7 +642,7 @@ fn concat_leaves(elems: &[Layout]) -> PyResult<Layout> {
 
 fn concat_axis0_layouts(layouts: &[Layout]) -> PyResult<Layout> {
     if layouts.is_empty() {
-        return Err(PyValueError::new_err("Internal error: cannot concat empty layouts."));
+        return Err(internal("concat_layouts_axis0", "cannot concat empty layouts"));
     }
     match &layouts[0] {
         Layout::Leaf(_) => concat_leaves(layouts),
@@ -734,7 +716,7 @@ fn fill_random_layout(
                 content: Box::new(content),
             }))
         }
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err(
+        Layout::UnionScalarList(_) => Err(layout_unsupported("shuffle", 
             "random ops require a pure list-chain array (no UnionScalarList).",
         )),
     }
@@ -839,9 +821,7 @@ where
             LeafBuffer::Bool(Arc::new(v))
         }
         _ => {
-            return Err(PyValueError::new_err(
-                "integers_like dtype must be an integer or bool dtype.",
-            ))
+            return Err(arg_invalid("dtype", "integers_like dtype must be an integer or bool dtype", "pass an integer or bool dtype."))
         }
     };
     Ok(())
@@ -854,7 +834,7 @@ pub fn parse_choice_size(py: Python<'_>, size: &Bound<'_, PyAny>) -> PyResult<Ch
     }
     if let Ok(v) = size.extract::<isize>() {
         if v < 0 {
-            return Err(PyValueError::new_err("choice size must be non-negative."));
+            return Err(arg_invalid("size", "choice size must be non-negative", "pass size >= 0."));
         }
         return Ok(ChoiceSize::Uniform(ChoiceCount::Count(v as usize)));
     }
@@ -868,17 +848,13 @@ pub fn parse_choice_size(py: Python<'_>, size: &Bound<'_, PyAny>) -> PyResult<Ch
             let item = seq.get_item(i)?;
             let v: isize = item.extract()?;
             if v < 0 {
-                return Err(PyValueError::new_err(
-                    "choice size list entries must be non-negative.",
-                ));
+                return Err(arg_invalid("size", "choice size list entries must be non-negative", "pass non-negative counts or fractions."));
             }
             out.push(v as usize);
         }
         return Ok(ChoiceSize::PerSlice(out));
     }
     let _ = py;
-    Err(PyValueError::new_err(
-        "choice size must be an int, float fraction, or list of ints.",
-    ))
+    Err(arg_invalid("size", "must be an int, float fraction, or list of ints", "pass size as count, fraction in [0,1], or per-slice list."))
 }
 

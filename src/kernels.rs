@@ -171,17 +171,6 @@ mod imp {
 
 pub use imp::*;
 
-pub fn sum_i32_rows_to_i64(values: &[i32], offsets: &[i64]) -> i64 {
-    let nrows = offsets.len().saturating_sub(1);
-    let mut total: i64 = 0;
-    for i in 0..nrows {
-        let s = offsets[i] as usize;
-        let e = offsets[i + 1] as usize;
-        total = total.wrapping_add(sum_i32_to_i64(&values[s..e]));
-    }
-    total
-}
-
 pub fn sum_i32_row_sums_to_i64(values: &[i32], offsets: &[i64], out: &mut [i64]) {
     let nrows = offsets.len().saturating_sub(1);
     debug_assert_eq!(out.len(), nrows);

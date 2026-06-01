@@ -28,6 +28,8 @@ from typing import Callable, Iterable, Iterator, Optional, Sequence, TypeVar, Un
 from concurrent.futures import ThreadPoolExecutor
 import warnings
 
+from .errors import arg_invalid, arg_one_of, index_out_of_range, raise_grumpy_error
+
 T = TypeVar("T")
 
 
@@ -85,15 +87,25 @@ class Stream:
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
+            arg_invalid("batch_size", f"got {self.batch_size}", fix="pass batch_size > 0 (number of axis-0 or batch_on entities per batch).")
         if self.workers < 0:
-            raise ValueError("workers must be >= 0")
+            arg_invalid("workers", f"got {self.workers}", fix="pass workers >= 0; use 0 for synchronous I/O.")
         if self.world_size <= 0:
-            raise ValueError("world_size must be > 0")
+            arg_invalid("world_size", f"got {self.world_size}", fix="pass world_size >= 1 (DDP process count).")
         if self.rank < 0 or self.rank >= self.world_size:
-            raise ValueError("rank must be in [0, world_size)")
+            raise_grumpy_error(
+                "ArgumentInvalid",
+                f"rank {self.rank} is invalid for world_size={self.world_size}",
+                cause="rank must satisfy 0 <= rank < world_size for DDP sharding.",
+                fix="set rank to your process index in [0, world_size).",
+            )
         if self.shuffle is not None and self.seed is None:
-            raise ValueError("seed is required when shuffle is set")
+            raise_grumpy_error(
+                "ArgumentInvalid",
+                "shuffle is set but seed is None",
+                cause="shuffled batch order requires a fixed seed for reproducible training.",
+                fix="pass seed=<int> when shuffle is True or a schema level name.",
+            )
 
     def _batch_indices_arg(self) -> Optional[list[int]]:
         if self.batch_indices is None:
@@ -107,7 +119,7 @@ class Stream:
             if index < 0:
                 index += n
             if index < 0 or index >= n:
-                raise IndexError(f"batch index {index} out of range for stream of length {n}")
+                index_out_of_range(index, n, at="in this stream's batch sequence")
             indices = (index,)
         elif isinstance(index, slice):
             indices = tuple(range(*index.indices(n)))
@@ -184,13 +196,18 @@ class Stream:
             Lazy iterable of transformed batches.
         """
         if cpu < 1:
-            raise ValueError("cpu must be >= 1")
+            arg_invalid("cpu", f"got {cpu}", fix="pass cpu >= 1 for parallel batch transforms.")
         if callable(fns):
             fns = [fns]
         else:
             fns = list(fns)
         if len(fns) == 0:
-            raise ValueError("apply requires at least one transform.")
+            raise_grumpy_error(
+                "ArgumentInvalid",
+                "apply requires at least one transform",
+                cause="an empty fn list would leave batches unchanged with no work to schedule.",
+                fix="pass a callable or non-empty sequence of callables, e.g. st.apply(lambda b: ...).",
+            )
         return StreamApply(self, fns, cpu=cpu, prefetch=prefetch, compile=compile, scheduler=scheduler)
 
 
@@ -212,11 +229,10 @@ class StreamApply(Iterable[T]):
         if compile_mode is False:
             compile_mode = "never"
         if compile_mode not in ("auto", "never", "force"):
-            raise ValueError("compile must be one of: True/False/'auto'/'never'/'force'")
-
+            arg_one_of("compile", compile_mode, ("True", "False", "'auto'", "'never'", "'force'"))
         scheduler = self.scheduler
         if scheduler not in ("auto", "python", "rust"):
-            raise ValueError("scheduler must be one of: 'auto'/'python'/'rust'")
+            arg_one_of("scheduler", scheduler, ("'auto'", "'python'", "'rust'"))
 
         run_all = None
         pipeline_info = None

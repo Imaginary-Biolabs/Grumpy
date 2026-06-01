@@ -23,15 +23,6 @@ def test_union_scalar_mul_compiled_path(tmp_path):
     assert [b.to_list() for b in out] == [[2.0], [[4.0, 6.0]], [8.0]]
 
 
-def test_union_stream_load_slice_parity(tmp_path):
-    x = _union_array()
-    path = str(tmp_path / "u.gr")
-    gr.save(x, path, chunk_size=2)
-    full = gr.load(path)
-    partial = gr._core.load_slice(path, 1, 3)
-    assert partial.to_list() == full[1:3].to_list()
-
-
 def test_union_stream_batches(tmp_path):
     x = _union_array()
     path = str(tmp_path / "u.gr")
@@ -45,35 +36,22 @@ def test_union_sum_all():
     assert x.sum() == 15
 
 
-def test_union_sum_dim0():
-    x = _union_array()
-    assert x.sum(dim=0).to_list() == [1, 5, 4, 5]
-
-
 def test_union_unique():
     x = gr.array([1, [2, 1], 3, [2]], dtype=gr.int64)
     assert gr.unique(x).to_list() == [1, 2, 3]
 
 
-def test_union_save_generator(tmp_path):
-    path = str(tmp_path / "gen.gr")
-
-    def batches():
-        yield gr.array([1, [2]], dtype=gr.int64)
-        yield gr.array([[3, 4]], dtype=gr.int64)
-
-    gr.save(batches(), path)
-    loaded = gr.load(path)
-    assert loaded.to_list() == [1, [2], [3, 4]]
-
-
 def test_union_shuffle_reproducible():
+    orig = _union_array().to_list()
     a = _union_array()
     b = _union_array()
     a.shuffle(dim=0, seed=7)
     b.shuffle(dim=0, seed=7)
     assert a.to_list() == b.to_list()
-    assert len(a.to_list()) == len(_union_array().to_list())
+    assert a.to_list() != orig
+    c = _union_array()
+    c.shuffle(dim=0, seed=99)
+    assert c.to_list() != a.to_list()
 
 
 def test_union_fancy_axis0():

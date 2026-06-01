@@ -9,6 +9,7 @@
 //! String/char never cast to/from numeric types. ``char`` → ``string`` is safe.
 
 use crate::dtype::DType;
+use crate::error::{cast_not_allowed, internal_dtype_buffer_mismatch};
 use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
 use half::f16;
 use pyo3::exceptions::PyValueError;
@@ -203,21 +204,12 @@ pub fn promote_types(a: DType, b: DType) -> PyResult<DType> {
     promote_binary(a, b)
 }
 
-pub fn cast_array(arr: &GrumpyArray, to: DType) -> PyResult<GrumpyArray> {
-    cast_array_with_mode(arr, to, CastMode::Safe)
-}
-
 pub fn cast_array_with_mode(arr: &GrumpyArray, to: DType, mode: CastMode) -> PyResult<GrumpyArray> {
     if arr.dtype == to {
         return Ok(arr.clone());
     }
     if !can_cast(arr.dtype, to, mode) {
-        return Err(PyValueError::new_err(format!(
-            "Cannot cast from {} to {} with casting='{}'.",
-            arr.dtype.name(),
-            to.name(),
-            mode_name(mode),
-        )));
+        return Err(cast_not_allowed(arr.dtype, to, mode_name(mode)));
     }
     let layout = cast_layout(&arr.layout, arr.dtype, to, mode)?;
     Ok(GrumpyArray { dtype: to, layout })
@@ -302,7 +294,7 @@ fn cast_leaf(leaf: &Leaf, from: DType, to: DType, mode: CastMode) -> PyResult<Le
     if from == DType::Char && to == DType::String {
         let src = match &leaf.buffer {
             LeafBuffer::Char(v) => v.as_slice(),
-            _ => return Err(PyValueError::new_err("Internal cast dtype mismatch.")),
+            _ => return Err(internal_dtype_buffer_mismatch("cast", from)),
         };
         let mut dst = Vec::with_capacity(n);
         for i in 0..n {
@@ -321,7 +313,7 @@ fn cast_leaf(leaf: &Leaf, from: DType, to: DType, mode: CastMode) -> PyResult<Le
     if from == DType::String && to == DType::Char {
         let src = match &leaf.buffer {
             LeafBuffer::String(v) => v.as_slice(),
-            _ => return Err(PyValueError::new_err("Internal cast dtype mismatch.")),
+            _ => return Err(internal_dtype_buffer_mismatch("cast", from)),
         };
         let mut dst = vec![0u32; n];
         for i in 0..n {
@@ -390,12 +382,7 @@ fn read_scalar(buf: &LeafBuffer, dt: DType, i: usize) -> PyResult<ScalarValue> {
         (LeafBuffer::F16(v), DType::Float16) => ScalarValue::F64(f16::from_bits(v[i]).to_f64()),
         (LeafBuffer::F32(v), DType::Float32) => ScalarValue::F64(v[i] as f64),
         (LeafBuffer::F64(v), DType::Float64) => ScalarValue::F64(v[i]),
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "Internal cast read mismatch for dtype={}.",
-                dt.name()
-            )))
-        }
+        _ => return Err(internal_dtype_buffer_mismatch("cast", dt)),
     })
 }
 
@@ -445,12 +432,7 @@ fn write_scalar(buf: &mut LeafBuffer, dt: DType, scalar: ScalarValue, mode: Cast
         (LeafBuffer::F64(vb), DType::Float64, s) => {
             Arc::make_mut(vb).push(scalar_to_f64(s, mode)?);
         }
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "Internal cast write mismatch for dtype={}.",
-                dt.name()
-            )))
-        }
+        _ => return Err(internal_dtype_buffer_mismatch("cast", dt)),
     }
     Ok(())
 }
