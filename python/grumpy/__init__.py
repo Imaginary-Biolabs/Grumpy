@@ -57,6 +57,8 @@ from ._core import (
     einsum as _einsum,
     tensordot as _tensordot,
     neighbors as _neighbors,
+    gpu_available as _gpu_available,
+    gpu_backend as _gpu_backend,
     dataframe as _dataframe,
     save as _save,
     append_batch as _append_batch,
@@ -67,7 +69,7 @@ from ._core import (
 )
 
 from . import compiler as _compiler_mod
-from .stream import Stream, StreamApply
+from .stream import Stream, StreamApply, current_stream_gpu
 
 compile = _compiler_mod.compile
 
@@ -290,9 +292,17 @@ def neighbors(
     dim: int = 0,
     loop: bool = True,
     return_distances: bool = False,
+    gpu: bool | str | None = None,
 ):
     """
     Compute neighbors and return an **edge index** (and optionally distances).
+
+    Parameters
+    ----------
+    gpu:
+        ``'auto'``, ``True``, ``False``/``'never'``, or ``'force'``. When ``None``,
+        uses the active :class:`~grumpy.stream.Stream` GPU mode if inside
+        :meth:`~grumpy.stream.Stream.apply`.
 
     Returns
     -------
@@ -301,7 +311,23 @@ def neighbors(
     distances (optional):
         If return_distances=True, also returns distances aligned with the neighbors axis.
     """
-    return _neighbors(query, data, k, radius, dim, loop_=loop, return_distances=return_distances)
+    if gpu is None:
+        gpu = current_stream_gpu()
+    elif gpu is True:
+        gpu = "auto"
+    elif gpu is False:
+        gpu = "never"
+    return _neighbors(query, data, k, radius, dim, loop_=loop, return_distances=return_distances, gpu=gpu)
+
+
+def gpu_available() -> bool:
+    """Return True when a GPU backend (Metal or CUDA) is available for kNN."""
+    return _gpu_available()
+
+
+def gpu_backend() -> str | None:
+    """Return ``'metal'``, ``'cuda'``, or ``None`` if no GPU backend is active."""
+    return _gpu_backend()
 
 def dataframe(mapping: dict, schema=None):
     return _dataframe(mapping, schema)
@@ -351,6 +377,7 @@ def stream(
     seed: Optional[int] = None,
     workers: int = 0,
     in_memory: bool = False,
+    gpu: bool | str = "auto",
     world_size: int = 1,
     rank: int = 0,
     batch_indices: Optional[tuple[int, ...]] = None,
@@ -364,6 +391,7 @@ def stream(
         seed=seed,
         workers=workers,
         in_memory=in_memory,
+        gpu=gpu,
         world_size=world_size,
         rank=rank,
         batch_indices=batch_indices,

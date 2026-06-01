@@ -327,7 +327,7 @@ impl PyCompiledPlan {
     }
 }
 
-fn run_plan_array_rust(ops_plan: &[PlanOp], mut cur: GrumpyArray) -> PyResult<GrumpyArray> {
+fn run_plan_array_rust(ops_plan: &[PlanOp], mut cur: GrumpyArray, gpu: crate::gpu::GpuPreference) -> PyResult<GrumpyArray> {
     for op in ops_plan {
         match op {
             PlanOp::AddScalar { value, is_int } => {
@@ -373,7 +373,7 @@ fn run_plan_array_rust(ops_plan: &[PlanOp], mut cur: GrumpyArray) -> PyResult<Gr
                 ));
             }
             PlanOp::NeighborsKnnSelf { k, dim, loop_ } => {
-                cur = neigh_ops::neighbors(&cur, &cur, Some(*k), None, *dim, *loop_)?;
+                cur = neigh_ops::neighbors_with_gpu(&cur, &cur, Some(*k), None, *dim, *loop_, gpu)?;
             }
             PlanOp::ReduceCur { op, dim } => {
                 match dim {
@@ -427,7 +427,7 @@ fn run_plan_df_rust(ops_plan: &[PlanOp], mut cur: df_ops::GrumpyDataFrame) -> Py
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, batch_size, drop_last, cpu, _prefetch, spec, batch_on=None, shuffle=None, seed=None, world_size=1, rank=0, batch_indices=None))]
+#[pyo3(signature = (path, batch_size, drop_last, cpu, _prefetch, spec, batch_on=None, shuffle=None, seed=None, world_size=1, rank=0, batch_indices=None, gpu="auto"))]
 pub fn compiled_stream_apply(
     _py: Python<'_>,
     path: String,
@@ -442,7 +442,9 @@ pub fn compiled_stream_apply(
     world_size: usize,
     rank: usize,
     batch_indices: Option<Vec<usize>>,
+    gpu: &str,
 ) -> PyResult<PyCompiledBatchesIter> {
+    let gpu_pref = crate::gpu::GpuPreference::parse(gpu)?;
     if cpu < 1 {
         return Err(arg_must_be_positive("cpu", cpu));
     }
@@ -498,7 +500,7 @@ pub fn compiled_stream_apply(
             .map(|batch| {
                 let payload = stream::load_batch(&handle, batch)?;
                 match payload {
-                    stream::BatchPayload::Array(arr) => run_plan_array_rust(&plan_ops.ops, arr),
+                    stream::BatchPayload::Array(arr) => run_plan_array_rust(&plan_ops.ops, arr, gpu_pref),
                     _ => Err(internal("compiled_stream_apply", "dataframe payload for array stream")),
                 }
             })

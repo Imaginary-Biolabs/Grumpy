@@ -2,6 +2,7 @@ pub mod array;
 pub mod binop;
 pub mod dataframe;
 pub mod einsum;
+pub mod gpu;
 pub mod hist;
 pub mod linalg;
 pub mod neighbors;

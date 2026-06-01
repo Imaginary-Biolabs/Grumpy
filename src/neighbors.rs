@@ -40,7 +40,19 @@ use std::sync::Arc;
 /// - dim=1 kNN: shape (n_groups, n_points, k, 2) with **local** point indices within each group
 /// - dim=1 radius: shape (n_groups, n_points, [*], 2)
 pub fn neighbors(query: &GrumpyArray, data: &GrumpyArray, k: Option<usize>, radius: Option<f64>, dim: isize, loop_: bool) -> PyResult<GrumpyArray> {
-    Ok(neighbors_edge_index_and_distances(query, data, k, radius, dim, loop_, false)?.0)
+    neighbors_with_gpu(query, data, k, radius, dim, loop_, crate::gpu::GpuPreference::Never)
+}
+
+pub fn neighbors_with_gpu(
+    query: &GrumpyArray,
+    data: &GrumpyArray,
+    k: Option<usize>,
+    radius: Option<f64>,
+    dim: isize,
+    loop_: bool,
+    gpu: crate::gpu::GpuPreference,
+) -> PyResult<GrumpyArray> {
+    Ok(neighbors_edge_index_and_distances(query, data, k, radius, dim, loop_, false, gpu)?.0)
 }
 
 /// Internal: compute edge_index and optionally distances, used by Python bindings.
@@ -52,6 +64,7 @@ pub fn neighbors_edge_index_and_distances(
     dim: isize,
     loop_: bool,
     return_distances: bool,
+    gpu: crate::gpu::GpuPreference,
 ) -> PyResult<(GrumpyArray, Option<GrumpyArray>)> {
     if k.is_some() == radius.is_some() {
         return Err(arg_invalid(
@@ -64,11 +77,11 @@ pub fn neighbors_edge_index_and_distances(
         return Err(dtype_mismatch(data.dtype, query.dtype, "in neighbors(query, data)"));
     }
     if query.layout.has_union() || data.layout.has_union() {
-        return neighbors_union(query, data, k, radius, dim, loop_, return_distances);
+        return neighbors_union(query, data, k, radius, dim, loop_, return_distances, gpu);
     }
     match dim {
-        0 | -2 => neighbors_dim0_edges(query, data, k, radius, loop_, return_distances),
-        1 | -3 => neighbors_dim1_edges(query, data, k, radius, loop_, return_distances),
+        0 | -2 => neighbors_dim0_edges(query, data, k, radius, loop_, return_distances, gpu),
+        1 | -3 => neighbors_dim1_edges(query, data, k, radius, loop_, return_distances, gpu),
         _ => Err(unsupported(
             "neighbors",
             "only dim=0 (single point cloud) or dim=1 (grouped point clouds) are supported",
@@ -85,6 +98,7 @@ fn neighbors_union(
     dim: isize,
     loop_: bool,
     return_distances: bool,
+    gpu: crate::gpu::GpuPreference,
 ) -> PyResult<(GrumpyArray, Option<GrumpyArray>)> {
     match dim {
         0 | -2 => {}
@@ -134,7 +148,7 @@ fn neighbors_union(
             ));
         }
         let (edge, dist) =
-            neighbors_dim0_edges(&q_arr, &d_arr, k, radius, loop_, return_distances)?;
+            neighbors_dim0_edges(&q_arr, &d_arr, k, radius, loop_, return_distances, gpu)?;
         edge_layouts.push(edge.layout);
         if return_distances {
             dist_layouts.push(dist.ok_or_else(|| {
@@ -164,6 +178,7 @@ fn neighbors_dim0_edges(
     radius: Option<f64>,
     loop_: bool,
     return_distances: bool,
+    gpu: crate::gpu::GpuPreference,
 ) -> PyResult<(GrumpyArray, Option<GrumpyArray>)> {
     let (qoff, qbase, qleaf, qn, d) = rect2d(&query.layout)?;
     let (doff, dbase, dleaf, dn, dd) = rect2d(&data.layout)?;
@@ -209,6 +224,34 @@ fn neighbors_dim0_edges(
         // - For small batches (common in training), brute-force is faster than building an index.
         // - For larger point clouds, use a kd-tree to avoid O(n^2).
         let use_kdtree = dn >= 2048 && d <= 32;
+        if !use_kdtree && query.dtype == DType::Float64 && data.dtype == DType::Float64 {
+            if let Some(gpu_res) = crate::gpu::knn_dim0_bruteforce(
+                &q,
+                &x,
+                qoff,
+                qbase,
+                doff,
+                dbase,
+                qn,
+                dn,
+                d,
+                k,
+                loop_,
+                same_inputs,
+                return_distances,
+                gpu,
+            )? {
+                let edge = build_knn_edge_index_dim0(qn, k, &gpu_res.nn_idx)?;
+                let dist = if return_distances {
+                    Some(build_knn_distances_dim0(qn, k, gpu_res.nn_dist.as_ref().ok_or_else(|| {
+                        internal("neighbors", "GPU kNN missing distances")
+                    })?)?)
+                } else {
+                    None
+                };
+                return Ok((edge, dist));
+            }
+        }
         if use_kdtree {
             let mut tree: KdTree<f64, usize, Vec<f64>> = KdTree::new(d);
             for j in 0..dn {
@@ -559,6 +602,7 @@ fn neighbors_dim1_edges(
     radius: Option<f64>,
     loop_: bool,
     return_distances: bool,
+    gpu: crate::gpu::GpuPreference,
 ) -> PyResult<(GrumpyArray, Option<GrumpyArray>)> {
     // Layout: groups -> points -> coords
     let (qg_off, qg_base, qp, qleaf, qg_n, qd) = grouped_points(&query.layout)?;
@@ -617,6 +661,24 @@ fn neighbors_dim1_edges(
                 None
             };
             return Ok((edge, dist));
+        }
+        if query.dtype == DType::Float64 && data.dtype == DType::Float64 {
+            if let Some(gpu_res) = crate::gpu::knn_dim1_bruteforce(
+                &qcoords,
+                &dcoords,
+                qg_off,
+                qg_base,
+                &qp.offsets,
+                qg_n,
+                qd,
+                k,
+                loop_,
+                same_inputs,
+                return_distances,
+                gpu,
+            )? {
+                return grouped_knn_from_gpu(gpu_res, qg_n, k, return_distances);
+            }
         }
         // We compute flat indices into data points within each group.
         // For group g: points are in [dp.offsets[g]..dp.offsets[g+1]) in the *points* listoffset space.
@@ -754,6 +816,47 @@ fn neighbors_dim1_edges(
 }
 
 // ---------- output builders ----------
+
+fn grouped_knn_from_gpu(
+    gpu: crate::gpu::knn::KnnDim1Result,
+    n_groups: usize,
+    k: usize,
+    return_distances: bool,
+) -> PyResult<(GrumpyArray, Option<GrumpyArray>)> {
+    let mut out_group_offsets: Vec<i64> = Vec::with_capacity(n_groups + 1);
+    out_group_offsets.push(0);
+    let mut out_point_offsets: Vec<i64> = Vec::new();
+    out_point_offsets.push(0);
+    let mut out_neighbor_offsets: Vec<i64> = Vec::new();
+    out_neighbor_offsets.push(0);
+    for &nqp in &gpu.group_point_counts {
+        for _ in 0..nqp {
+            for _ in 0..k {
+                out_neighbor_offsets.push(out_neighbor_offsets.last().unwrap() + 2);
+            }
+            out_point_offsets.push(out_point_offsets.last().unwrap() + k as i64);
+        }
+        out_group_offsets.push(out_group_offsets.last().unwrap() + nqp as i64);
+    }
+    let edge = build_grouped_edge_index(
+        n_groups,
+        out_group_offsets.clone(),
+        out_point_offsets.clone(),
+        out_neighbor_offsets,
+        gpu.edge_vals,
+    )?;
+    let dist = if return_distances {
+        Some(build_grouped_distances(
+            n_groups,
+            out_group_offsets,
+            out_point_offsets,
+            gpu.nn_dist.ok_or_else(|| internal("neighbors", "GPU kNN missing distances"))?,
+        )?)
+    } else {
+        None
+    };
+    Ok((edge, dist))
+}
 
 fn build_knn_edge_index_dim0(qn: usize, k: usize, nn_idx: &[usize]) -> PyResult<GrumpyArray> {
     // Layout: qn -> k -> 2

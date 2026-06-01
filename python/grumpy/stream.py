@@ -25,12 +25,31 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Optional, Sequence, TypeVar, Union
 
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import warnings
 
 from .errors import arg_invalid, arg_one_of, index_out_of_range, raise_grumpy_error
 
 T = TypeVar("T")
+
+# Default GPU mode for gr.neighbors when called inside Stream.apply (see Stream.gpu).
+_STREAM_GPU: contextvars.ContextVar[str] = contextvars.ContextVar("grumpy_stream_gpu", default="never")
+
+
+def _normalize_gpu(gpu: Union[bool, str]) -> str:
+    if gpu is True:
+        return "auto"
+    if gpu is False:
+        return "never"
+    if gpu not in ("auto", "never", "force"):
+        arg_one_of("gpu", gpu, ("True", "False", "'auto'", "'never'", "'force'"))
+    return gpu
+
+
+def current_stream_gpu() -> str:
+    """Return the active stream GPU mode for nested :func:`grumpy.neighbors` calls."""
+    return _STREAM_GPU.get()
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -84,6 +103,7 @@ class Stream:
     seed: Optional[int] = None
     workers: int = 0
     in_memory: bool = False
+    gpu: Union[bool, str] = "auto"
     world_size: int = 1
     rank: int = 0
     batch_indices: Optional[tuple[int, ...]] = None
@@ -213,7 +233,15 @@ class Stream:
                 cause="an empty fn list would leave batches unchanged with no work to schedule.",
                 fix="pass a callable or non-empty sequence of callables, e.g. st.apply(lambda b: ...).",
             )
-        return StreamApply(self, fns, cpu=cpu, prefetch=prefetch, compile=compile, scheduler=scheduler)
+        return StreamApply(
+            self,
+            fns,
+            cpu=cpu,
+            prefetch=prefetch,
+            compile=compile,
+            scheduler=scheduler,
+            gpu=self.gpu,
+        )
 
 
 @dataclass(frozen=True)
@@ -226,8 +254,17 @@ class StreamApply(Iterable[T]):
     prefetch: Optional[int] = None
     compile: Union[bool, str] = "auto"
     scheduler: str = "auto"
+    gpu: Union[bool, str] = "auto"
 
     def __iter__(self) -> Iterator[T]:
+        gpu_mode = _normalize_gpu(self.gpu)
+        token = _STREAM_GPU.set(gpu_mode)
+        try:
+            yield from self._iter_batches(gpu_mode)
+        finally:
+            _STREAM_GPU.reset(token)
+
+    def _iter_batches(self, gpu_mode: str) -> Iterator[T]:
         compile_mode = self.compile
         if compile_mode is True:
             compile_mode = "force"
@@ -310,6 +347,7 @@ class StreamApply(Iterable[T]):
                     self.base.world_size,
                     self.base.rank,
                     self.base._batch_indices_arg(),
+                    gpu_mode,
                 )
                 return
 

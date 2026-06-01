@@ -16,6 +16,7 @@ mod whereops;
 mod linalg;
 mod einsum;
 mod neighbors;
+mod gpu;
 mod dataframe;
 mod io;
 mod io_cache;
