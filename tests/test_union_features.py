@@ -69,3 +69,24 @@ def test_union_fancy_coordinates():
     assert x[1, 0] == 2
     assert x[[0, 1], [0, 0]].to_list() == [1, 2]
     assert x[[0, 1], 0].to_list() == [1, 2]
+
+
+def test_union_coordinate_assignment():
+    x = _union_array()
+    x[1, 0] = 99
+    assert x.to_list() == [1, [99, 3], 4, [5]]
+    x[0, 0] = 10
+    assert x[0, 0] == 10
+
+
+def test_union_quantile_dim0():
+    x = gr.array([1.0, [2.0, 3.0], 4.0], dtype=gr.float64)
+    out = x.quantile(0.5, dim=0)
+    # Per outer element: median of each row's leaves.
+    assert out.to_list() == [1.0, 2.5, 4.0]
+
+
+def test_union_quantile_last_axis():
+    x = gr.array([1.0, [2.0, 4.0], 3.0], dtype=gr.float64)
+    out = x.quantile(0.5, dim=-1)
+    assert out.to_list() == [1.0, 3.0, 3.0]

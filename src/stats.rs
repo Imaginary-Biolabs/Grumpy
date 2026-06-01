@@ -574,9 +574,6 @@ fn quantile_impl(
     mode: QuantileMode,
     nan: bool,
 ) -> PyResult<GrumpyArray> {
-    if a.layout.has_union() {
-        return Err(unsupported("quantile", "union layouts are not implemented yet", "convert to a list-chain layout first."));
-    }
     // Only float/int for now, output float64 for ints (match NumPy default).
     let out_dt = match a.dtype {
         DType::Float32 => DType::Float32,
@@ -610,7 +607,11 @@ fn quantile_impl(
     }
     let q0 = qs[0];
 
-    let depth = crate::layout::list_chain_depth(&a.layout).ok_or_else(|| layout_unsupported("std/var", "requires a pure list-chain array"))?;
+    if a.layout.has_union() {
+        return quantile_union(a, dim, q0, nan, out_dt);
+    }
+
+    let depth = crate::layout::list_chain_depth(&a.layout).ok_or_else(|| layout_unsupported("quantile", "requires a pure list-chain array"))?;
     if depth == 0 {
         let leaf = match &a.layout { Layout::Leaf(l) => l, _ => unreachable!() };
         let (ok, v) = quantile_range(leaf, a.dtype, 0, leaf.len, q0, nan)?;
@@ -663,6 +664,95 @@ fn quantile_impl(
         }
         _ => Err(unsupported("quantile", "dim=0 is not implemented yet", "use dim=1 or flatten first.")),
     }
+}
+
+fn quantile_from_values(vals: &[f64], q0: f64) -> Option<f64> {
+    if vals.is_empty() {
+        return None;
+    }
+    let mut sorted = vals.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let n = sorted.len();
+    let h = (n as f64 - 1.0) * q0;
+    let lo = h.floor() as usize;
+    let hi = h.ceil() as usize;
+    if lo == hi {
+        return Some(sorted[lo]);
+    }
+    let w = h - lo as f64;
+    Some(sorted[lo] * (1.0 - w) + sorted[hi] * w)
+}
+
+fn quantile_union(
+    a: &GrumpyArray,
+    dim: isize,
+    q0: f64,
+    nan: bool,
+    out_dt: DType,
+) -> PyResult<GrumpyArray> {
+    let ndim = layout_ndim(&a.layout)?;
+    if ndim == 1 {
+        let vals = collect_layout_f64(&a.layout, a.dtype, nan)?;
+        let v = quantile_from_values(&vals, q0).ok_or_else(|| reduction_empty("quantile"))?;
+        return scalar_leaf_q(out_dt, v);
+    }
+    let dim_u = normalize_stat_dim(dim, ndim)?;
+    match dim_u {
+        0 => quantile_union_per_element(a, out_dt, q0, nan),
+        x if x == ndim - 1 => quantile_union_per_element(a, out_dt, q0, nan),
+        _ => Err(unsupported(
+            "quantile",
+            "union quantile currently supports dim=0 and innermost dim only",
+            "use dim=0 or dim=-1 for union arrays.",
+        )),
+    }
+}
+
+fn quantile_union_per_element(
+    a: &GrumpyArray,
+    out_dt: DType,
+    q0: f64,
+    nan: bool,
+) -> PyResult<GrumpyArray> {
+    let n = a.len();
+    let mut scalars = Leaf::new(out_dt);
+    scalars.len = n;
+    scalars.validity = Arc::new(bitvec![u8, Lsb0; 1; n]);
+    scalars.has_nulls = false;
+    scalars.buffer = match out_dt {
+        DType::Float32 => LeafBuffer::F32(Arc::new(vec![0f32; n])),
+        DType::Float64 => LeafBuffer::F64(Arc::new(vec![0f64; n])),
+        _ => unreachable!(),
+    };
+    let out_valid = Arc::make_mut(&mut scalars.validity);
+    for i in 0..n {
+        let sub = drop_axis0_select_element(&a.layout, i)?;
+        let vals = collect_layout_f64(&sub, a.dtype, nan)?;
+        match quantile_from_values(&vals, q0) {
+            None => {
+                out_valid.set(i, false);
+                scalars.has_nulls = true;
+            }
+            Some(v) => match &mut scalars.buffer {
+                LeafBuffer::F32(buf) => Arc::make_mut(buf)[i] = v as f32,
+                LeafBuffer::F64(buf) => Arc::make_mut(buf)[i] = v,
+                _ => unreachable!(),
+            },
+        }
+    }
+    let lists = ListOffset {
+        offsets: Arc::new(vec![0i64]),
+        content: Box::new(Layout::Leaf(Leaf::new(out_dt))),
+    };
+    Ok(GrumpyArray {
+        dtype: out_dt,
+        layout: Layout::UnionScalarList(UnionScalarList {
+            tags: (0..n).map(|_| 0u8).collect(),
+            index: (0..n as i64).collect(),
+            scalars,
+            lists,
+        }),
+    })
 }
 
 fn scalar_leaf_q(out_dt: DType, val: f64) -> PyResult<GrumpyArray> {

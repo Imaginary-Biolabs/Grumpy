@@ -1,8 +1,11 @@
 use crate::dtype::DType;
+use crate::error::{
+    dtype_mismatch, dtype_unsupported, internal_dtype_buffer_mismatch, layout_unsupported,
+    shape_mismatch, unsupported,
+};
 use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -10,13 +13,21 @@ pub fn dot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<PyObjec
     let la = leaf_1d(&a.layout)?;
     let lb = leaf_1d(&b.layout)?;
     if a.dtype != b.dtype {
-        return Err(PyValueError::new_err("dot requires matching dtypes."));
+        return Err(dtype_mismatch(a.dtype, b.dtype, "in dot"));
     }
     if la.has_nulls || lb.has_nulls {
-        return Err(PyValueError::new_err("dot does not support nulls yet."));
+        return Err(unsupported(
+            "dot",
+            "null/missing values are not supported yet",
+            "fill or drop nulls before calling dot.",
+        ));
     }
     if la.len != lb.len {
-        return Err(PyValueError::new_err("dot requires equal-length 1D arrays."));
+        return Err(shape_mismatch(
+            "dot",
+            "requires equal-length 1D arrays",
+            "ensure both operands are 1D leaf arrays with the same length.",
+        ));
     }
     let n = la.len;
     match a.dtype {
@@ -74,7 +85,7 @@ pub fn dot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<PyObjec
             }
             Ok(acc.into_py(py))
         }
-        _ => Err(PyValueError::new_err("dot not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("dot", a.dtype)),
     }
 }
 
@@ -85,7 +96,11 @@ pub fn inner(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<PyObj
 pub fn norm(py: Python<'_>, a: &GrumpyArray) -> PyResult<PyObject> {
     let la = leaf_1d(&a.layout)?;
     if la.has_nulls {
-        return Err(PyValueError::new_err("norm does not support nulls yet."));
+        return Err(unsupported(
+            "norm",
+            "null/missing values are not supported yet",
+            "fill or drop nulls before calling norm.",
+        ));
     }
     let n = la.len;
     let mut acc: f64 = 0.0;
@@ -132,18 +147,22 @@ pub fn norm(py: Python<'_>, a: &GrumpyArray) -> PyResult<PyObject> {
                 acc += x * x;
             }
         }
-        _ => return Err(PyValueError::new_err("norm not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("norm", a.dtype)),
     }
     Ok(acc.sqrt().into_py(py))
 }
 
 pub fn trace(py: Python<'_>, a: &GrumpyArray) -> PyResult<PyObject> {
     if a.layout.has_union() {
-        return Err(PyValueError::new_err("trace on union layouts not implemented."));
+        return Err(layout_unsupported("trace", "UnionScalarList layout is not supported"));
     }
     let (lo, leaf, nrows, ncols) = rectangular_2d_list_leaf(&a.layout)?;
     if leaf.has_nulls {
-        return Err(PyValueError::new_err("trace does not support nulls yet."));
+        return Err(unsupported(
+            "trace",
+            "null/missing values are not supported yet",
+            "fill or drop nulls before calling trace.",
+        ));
     }
     let n = nrows.min(ncols);
     match a.dtype {
@@ -179,7 +198,7 @@ pub fn trace(py: Python<'_>, a: &GrumpyArray) -> PyResult<PyObject> {
             }
             Ok(acc.into_py(py))
         }
-        _ => Err(PyValueError::new_err("trace not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("trace", a.dtype)),
     }
 }
 
@@ -187,10 +206,14 @@ pub fn outer(_py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<Grum
     let la = leaf_1d(&a.layout)?;
     let lb = leaf_1d(&b.layout)?;
     if a.dtype != b.dtype {
-        return Err(PyValueError::new_err("outer requires matching dtypes."));
+        return Err(dtype_mismatch(a.dtype, b.dtype, "in outer"));
     }
     if la.has_nulls || lb.has_nulls {
-        return Err(PyValueError::new_err("outer does not support nulls yet."));
+        return Err(unsupported(
+            "outer",
+            "null/missing values are not supported yet",
+            "fill or drop nulls before calling outer.",
+        ));
     }
     let n = la.len;
     let m = lb.len;
@@ -264,7 +287,7 @@ pub fn outer(_py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<Grum
             }
             Layout::Leaf(new_leaf_f64(out))
         }
-        _ => return Err(PyValueError::new_err("outer not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("outer", a.dtype)),
     };
 
     Ok(GrumpyArray {
@@ -275,15 +298,23 @@ pub fn outer(_py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<Grum
 
 pub fn cross(_py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<GrumpyArray> {
     if a.dtype != b.dtype {
-        return Err(PyValueError::new_err("cross requires matching dtypes."));
+        return Err(dtype_mismatch(a.dtype, b.dtype, "in cross"));
     }
     // Support 1D length-3 vectors and 2D list->leaf with row length 3.
     if let (Ok(la), Ok(lb)) = (leaf_1d(&a.layout), leaf_1d(&b.layout)) {
         if la.has_nulls || lb.has_nulls {
-            return Err(PyValueError::new_err("cross does not support nulls yet."));
+            return Err(unsupported(
+                "cross",
+                "null/missing values are not supported yet",
+                "fill or drop nulls before calling cross.",
+            ));
         }
         if la.len != 3 || lb.len != 3 {
-            return Err(PyValueError::new_err("cross for 1D requires length 3."));
+            return Err(shape_mismatch(
+                "cross",
+                "1D cross product requires length-3 vectors",
+                "pass two 1D arrays of length 3.",
+            ));
         }
         return cross_vec3(a.dtype, la, lb);
     }
@@ -291,10 +322,18 @@ pub fn cross(_py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<Grum
     let (alo, aleaf, anrows, ancols) = rectangular_2d_list_leaf(&a.layout)?;
     let (blo, bleaf, bnrows, bncols) = rectangular_2d_list_leaf(&b.layout)?;
     if anrows != bnrows || ancols != bncols || ancols != 3 {
-        return Err(PyValueError::new_err("cross for 2D requires matching shapes and last dim=3."));
+        return Err(shape_mismatch(
+            "cross",
+            "2D cross requires matching shapes with last dimension 3",
+            "ensure both operands are 2D with the same shape and inner dimension 3.",
+        ));
     }
     if aleaf.has_nulls || bleaf.has_nulls {
-        return Err(PyValueError::new_err("cross does not support nulls yet."));
+        return Err(unsupported(
+            "cross",
+            "null/missing values are not supported yet",
+            "fill or drop nulls before calling cross.",
+        ));
     }
     let nrows = anrows;
 
@@ -337,7 +376,7 @@ pub fn cross(_py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<Grum
             }
             Layout::ListOffset(ListOffset { offsets: alo.offsets.clone(), content: Box::new(Layout::Leaf(new_leaf_f32(out))) })
         }
-        _ => return Err(PyValueError::new_err("cross not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("cross", a.dtype)),
     };
 
     Ok(GrumpyArray { dtype: a.dtype, layout: out_layout })
@@ -345,17 +384,25 @@ pub fn cross(_py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<Grum
 
 pub fn det(py: Python<'_>, a: &GrumpyArray) -> PyResult<PyObject> {
     if a.dtype != DType::Float64 {
-        return Err(PyValueError::new_err("det currently only supports float64."));
+        return Err(dtype_unsupported("det", a.dtype));
     }
     if a.layout.has_union() {
-        return Err(PyValueError::new_err("det on union layouts not implemented."));
+        return Err(layout_unsupported("det", "UnionScalarList layout is not supported"));
     }
     let (lo, leaf, nrows, ncols) = rectangular_2d_list_leaf(&a.layout)?;
     if nrows != ncols {
-        return Err(PyValueError::new_err("det requires a square 2D matrix."));
+        return Err(shape_mismatch(
+            "det",
+            "requires a square 2D matrix",
+            "pass a square list->leaf matrix (nrows == ncols).",
+        ));
     }
     if leaf.has_nulls {
-        return Err(PyValueError::new_err("det does not support nulls yet."));
+        return Err(unsupported(
+            "det",
+            "null/missing values are not supported yet",
+            "fill or drop nulls before calling det.",
+        ));
     }
     let n = nrows;
     let v = as_f64(leaf)?;
@@ -372,17 +419,25 @@ pub fn det(py: Python<'_>, a: &GrumpyArray) -> PyResult<PyObject> {
 
 pub fn inv(_py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
     if a.dtype != DType::Float64 {
-        return Err(PyValueError::new_err("inv currently only supports float64."));
+        return Err(dtype_unsupported("inv", a.dtype));
     }
     if a.layout.has_union() {
-        return Err(PyValueError::new_err("inv on union layouts not implemented."));
+        return Err(layout_unsupported("inv", "UnionScalarList layout is not supported"));
     }
     let (lo, leaf, nrows, ncols) = rectangular_2d_list_leaf(&a.layout)?;
     if nrows != ncols {
-        return Err(PyValueError::new_err("inv requires a square 2D matrix."));
+        return Err(shape_mismatch(
+            "inv",
+            "requires a square 2D matrix",
+            "pass a square list->leaf matrix (nrows == ncols).",
+        ));
     }
     if leaf.has_nulls {
-        return Err(PyValueError::new_err("inv does not support nulls yet."));
+        return Err(unsupported(
+            "inv",
+            "null/missing values are not supported yet",
+            "fill or drop nulls before calling inv.",
+        ));
     }
     let n = nrows;
     let v = as_f64(leaf)?;
@@ -417,7 +472,11 @@ pub fn inv(_py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
             }
             let pivv = lu[i * n + i];
             if pivv == 0.0 {
-                return Err(PyValueError::new_err("Singular matrix."));
+                return Err(unsupported(
+                    "inv",
+                    "matrix is singular and cannot be inverted",
+                    "ensure the matrix is full rank.",
+                ));
             }
             xvec[i] = sum / pivv;
         }
@@ -443,8 +502,8 @@ fn leaf_1d<'a>(layout: &'a Layout) -> PyResult<&'a Leaf> {
         Layout::Leaf(l) => Ok(l),
         Layout::OffsetView(v) => leaf_1d(v.content.as_ref()),
         Layout::Indexed(ix) => leaf_1d(ix.content.as_ref()),
-        Layout::ListOffset(_) => Err(PyValueError::new_err("Expected 1D leaf array.")),
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err("Union not supported.")),
+        Layout::ListOffset(_) => Err(layout_unsupported("linalg", "expected a 1D leaf array")),
+        Layout::UnionScalarList(_) => Err(layout_unsupported("linalg", "UnionScalarList layout is not supported")),
     }
 }
 
@@ -452,11 +511,11 @@ fn rectangular_2d_list_leaf<'a>(layout: &'a Layout) -> PyResult<(&'a ListOffset,
     let (lo, leaf) = match layout {
         Layout::ListOffset(lo) => match lo.content.as_ref() {
             Layout::Leaf(l) => (lo, l),
-            _ => return Err(PyValueError::new_err("Expected 2D list->leaf array.")),
+            _ => return Err(layout_unsupported("linalg", "expected a 2D list->leaf array")),
         },
         Layout::OffsetView(v) => return rectangular_2d_list_leaf(v.content.as_ref()),
         Layout::Indexed(ix) => return rectangular_2d_list_leaf(ix.content.as_ref()),
-        _ => return Err(PyValueError::new_err("Expected 2D list->leaf array.")),
+        _ => return Err(layout_unsupported("linalg", "expected a 2D list->leaf array")),
     };
     let nrows = lo.len();
     if nrows == 0 {
@@ -466,7 +525,11 @@ fn rectangular_2d_list_leaf<'a>(layout: &'a Layout) -> PyResult<(&'a ListOffset,
     for r in 0..nrows {
         let len = (lo.offsets[r + 1] - lo.offsets[r]) as usize;
         if len != row0 {
-            return Err(PyValueError::new_err("Expected rectangular 2D array (constant row length)."));
+            return Err(shape_mismatch(
+                "linalg",
+                "expected a rectangular 2D array with constant row length",
+                "ensure every row has the same number of columns.",
+            ));
         }
     }
     Ok((lo, leaf, nrows, row0))
@@ -475,37 +538,37 @@ fn rectangular_2d_list_leaf<'a>(layout: &'a Layout) -> PyResult<(&'a ListOffset,
 fn as_i32<'a>(leaf: &'a Leaf) -> PyResult<&'a [i32]> {
     match &leaf.buffer {
         LeafBuffer::I32(v) => Ok(v.as_slice()),
-        _ => Err(PyValueError::new_err("dtype mismatch.")),
+        _ => Err(internal_dtype_buffer_mismatch("linalg", leaf.dtype)),
     }
 }
 fn as_i64<'a>(leaf: &'a Leaf) -> PyResult<&'a [i64]> {
     match &leaf.buffer {
         LeafBuffer::I64(v) => Ok(v.as_slice()),
-        _ => Err(PyValueError::new_err("dtype mismatch.")),
+        _ => Err(internal_dtype_buffer_mismatch("linalg", leaf.dtype)),
     }
 }
 fn as_u32<'a>(leaf: &'a Leaf) -> PyResult<&'a [u32]> {
     match &leaf.buffer {
         LeafBuffer::U32(v) => Ok(v.as_slice()),
-        _ => Err(PyValueError::new_err("dtype mismatch.")),
+        _ => Err(internal_dtype_buffer_mismatch("linalg", leaf.dtype)),
     }
 }
 fn as_u64<'a>(leaf: &'a Leaf) -> PyResult<&'a [u64]> {
     match &leaf.buffer {
         LeafBuffer::U64(v) => Ok(v.as_slice()),
-        _ => Err(PyValueError::new_err("dtype mismatch.")),
+        _ => Err(internal_dtype_buffer_mismatch("linalg", leaf.dtype)),
     }
 }
 fn as_f32<'a>(leaf: &'a Leaf) -> PyResult<&'a [f32]> {
     match &leaf.buffer {
         LeafBuffer::F32(v) => Ok(v.as_slice()),
-        _ => Err(PyValueError::new_err("dtype mismatch.")),
+        _ => Err(internal_dtype_buffer_mismatch("linalg", leaf.dtype)),
     }
 }
 fn as_f64<'a>(leaf: &'a Leaf) -> PyResult<&'a [f64]> {
     match &leaf.buffer {
         LeafBuffer::F64(v) => Ok(v.as_slice()),
-        _ => Err(PyValueError::new_err("dtype mismatch.")),
+        _ => Err(internal_dtype_buffer_mismatch("linalg", leaf.dtype)),
     }
 }
 
@@ -586,7 +649,7 @@ fn cross_vec3(dtype: DType, a: &Leaf, b: &Leaf) -> PyResult<GrumpyArray> {
             ];
             Ok(GrumpyArray { dtype, layout: Layout::Leaf(new_leaf_f32(out)) })
         }
-        _ => Err(PyValueError::new_err("cross not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("cross", dtype)),
     }
 }
 
@@ -605,7 +668,11 @@ fn lu_decompose_inplace(a: &mut [f64], n: usize) -> PyResult<Vec<usize>> {
             }
         }
         if piv_val == 0.0 {
-            return Err(PyValueError::new_err("Singular matrix."));
+            return Err(unsupported(
+                "inv",
+                "matrix is singular and cannot be inverted",
+                "ensure the matrix is full rank.",
+            ));
         }
         if piv_row != k {
             // swap rows in a

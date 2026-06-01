@@ -4,6 +4,26 @@ All notable changes to Grumpy are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.2] - Unreleased
+
+### Added
+
+- Union `quantile` / `median` for `dim=0` and innermost axis on `UnionScalarList` layouts (per-row leaf quantile).
+- Union coordinate assignment (`x[i, j] = value`) via layout-native `leaf_mut_at_coord`.
+- Benchmark smoke test (`benchmarks/ci_smoke.py`) in CI to catch large performance regressions.
+- Structured error reporting across einsum, linalg, neighbors, histogram, compare, unary, setops, and whereops.
+
+### Changed
+
+- CI coverage job runs all tests (including `@pytest.mark.coverage`) so the 95% gate is meaningful.
+- `gr.cat(..., dim>0)` with unions still uses Python list merge; layout-native path remains future work.
+- Deep list-chain reductions share the no-GIL engine (`reduce_list_chain_to_layout_nogil`).
+- Clippy `correctness` and `suspicious` lints enabled at warn level.
+
+### Fixed
+
+- Coverage CI would fail at ~74% because compiler coverage tests were excluded by default pytest markers.
+
 ## [0.1.1] - 2026-05-29
 
 ### Added

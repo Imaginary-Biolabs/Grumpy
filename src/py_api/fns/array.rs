@@ -55,6 +55,8 @@ pub fn cat(py: Python<'_>, arrays: Vec<PyRef<'_, PyGrumpyArray>>, dim: isize) ->
     }
     let rust_arrays: Vec<GrumpyArray> = arrays.into_iter().map(|a| a.inner.clone()).collect();
     let merged = if dim_u > 0 && rust_arrays.iter().any(|a| a.layout.has_union()) {
+        // Union inner concat at dim>0 still uses Python list merge until layout-native
+        // pairwise concat handles all union row shapes.
         let merged_list = concat_to_py_list(py, &rust_arrays, dim_u)?;
         build_array(py, &merged_list.bind(py), dtype)?
     } else {

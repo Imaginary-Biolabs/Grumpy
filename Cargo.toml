@@ -29,3 +29,7 @@ rand_distr = "0.4"
 lto = true
 codegen-units = 1
 
+[lints.clippy]
+correctness = "warn"
+suspicious = "warn"
+

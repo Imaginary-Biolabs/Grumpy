@@ -1,8 +1,11 @@
 use crate::dtype::DType;
+use crate::error::{
+    arg_invalid, dtype_mismatch, dtype_unsupported, internal_dtype_buffer_mismatch,
+    layout_unsupported, shape_mismatch, unsupported,
+};
 use crate::layout::{leaf_view, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -27,10 +30,18 @@ pub enum TensorOut {
 /// - "i,j->ij" outer
 pub fn einsum(py: Python<'_>, subscripts: &str, operands: &[GrumpyArray]) -> PyResult<TensorOut> {
     if subscripts.contains("...") {
-        return Err(PyValueError::new_err("einsum: ellipsis not supported yet."));
+        return Err(unsupported(
+            "einsum",
+            "ellipsis (...) is not supported yet",
+            "rewrite subscripts without ... or use the numpy fallback.",
+        ));
     }
     if operands.is_empty() || operands.len() > 2 {
-        return Err(PyValueError::new_err("einsum: only 1 or 2 operands supported."));
+        return Err(arg_invalid(
+            "operands",
+            "only 1 or 2 operands are supported",
+            "pass one or two arrays to einsum.",
+        ));
     }
     let (lhs, rhs_opt) = match subscripts.split_once("->") {
         Some((l, r)) => (l.trim(), Some(r.trim())),
@@ -38,11 +49,19 @@ pub fn einsum(py: Python<'_>, subscripts: &str, operands: &[GrumpyArray]) -> PyR
     };
     let in_terms: Vec<&str> = lhs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if in_terms.len() != operands.len() {
-        return Err(PyValueError::new_err("einsum: number of subscripts does not match operands."));
+        return Err(arg_invalid(
+            "subscripts",
+            "number of subscript terms does not match number of operands",
+            "ensure one subscript string per operand, separated by commas.",
+        ));
     }
     for t in &in_terms {
         if t.is_empty() {
-            return Err(PyValueError::new_err("einsum: empty subscript term."));
+            return Err(arg_invalid(
+                "subscripts",
+                "empty subscript term",
+                "remove empty comma-separated terms from subscripts.",
+            ));
         }
     }
     let rhs = rhs_opt.unwrap_or("");
@@ -61,7 +80,7 @@ pub fn tensordot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, axes: usize) 
     // - axes=1: dot (1D×1D -> scalar) or matmul (2D×2D -> 2D) or matvec/vecmat
     // - axes=2: 2D×2D Frobenius inner product -> scalar
     if a.dtype != b.dtype {
-        return Err(PyValueError::new_err("tensordot requires matching dtypes (for now)."));
+        return Err(dtype_mismatch(a.dtype, b.dtype, "in tensordot"));
     }
     match axes {
         0 => {
@@ -69,7 +88,11 @@ pub fn tensordot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, axes: usize) 
             let la = array_as_leaf_1d(a)?;
             let lb = array_as_leaf_1d(b)?;
             if la.has_nulls || lb.has_nulls {
-                return Err(PyValueError::new_err("tensordot: nulls not supported yet."));
+                return Err(unsupported(
+                    "tensordot",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling tensordot.",
+                ));
             }
             let out = outer_vec_vec(a.dtype, &la, &lb)?;
             Ok(TensorOut::Array(out))
@@ -78,10 +101,18 @@ pub fn tensordot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, axes: usize) 
             // dot / matmul / matvec / vecmat
             if let (Ok(la), Ok(lb)) = (leaf_1d(&a.layout), leaf_1d(&b.layout)) {
                 if la.has_nulls || lb.has_nulls {
-                    return Err(PyValueError::new_err("tensordot: nulls not supported yet."));
+                    return Err(unsupported(
+                    "tensordot",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling tensordot.",
+                ));
                 }
                 if la.len != lb.len {
-                    return Err(PyValueError::new_err("tensordot axes=1: vector lengths must match."));
+                    return Err(shape_mismatch(
+                        "tensordot",
+                        "axes=1 requires matching vector lengths",
+                        "ensure both vectors have the same length along the contracted axis.",
+                    ));
                 }
                 let s = dot_vec_vec(py, a.dtype, la, lb)?;
                 return Ok(TensorOut::Scalar(s));
@@ -90,10 +121,18 @@ pub fn tensordot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, axes: usize) 
                 let la = array_as_leaf_1d(a)?;
                 let lb = array_as_leaf_1d(b)?;
                 if la.has_nulls || lb.has_nulls {
-                    return Err(PyValueError::new_err("tensordot: nulls not supported yet."));
+                    return Err(unsupported(
+                    "tensordot",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling tensordot.",
+                ));
                 }
                 if la.len != lb.len {
-                    return Err(PyValueError::new_err("tensordot axes=1: vector lengths must match."));
+                    return Err(shape_mismatch(
+                        "tensordot",
+                        "axes=1 requires matching vector lengths",
+                        "ensure both vectors have the same length along the contracted axis.",
+                    ));
                 }
                 let s = dot_vec_vec(py, a.dtype, &la, &lb)?;
                 return Ok(TensorOut::Scalar(s));
@@ -103,10 +142,18 @@ pub fn tensordot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, axes: usize) 
                 (rect2d(&a.layout), rect2d(&b.layout))
             {
                 if aleaf.has_nulls || bleaf.has_nulls {
-                    return Err(PyValueError::new_err("tensordot: nulls not supported yet."));
+                    return Err(unsupported(
+                    "tensordot",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling tensordot.",
+                ));
                 }
                 if ac != br {
-                    return Err(PyValueError::new_err("tensordot axes=1: inner dimensions must match."));
+                    return Err(shape_mismatch(
+                        "tensordot",
+                        "axes=1 requires matching inner dimensions",
+                        "align contracted axis lengths (e.g. columns of A with rows of B).",
+                    ));
                 }
                 let out = matmul(a.dtype, alo, aleaf, ar, ac, blo, bleaf, br, bc)?;
                 return Ok(TensorOut::Array(out));
@@ -114,35 +161,62 @@ pub fn tensordot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, axes: usize) 
             // matvec / vecmat
             if let (Ok((alo, aleaf, ar, ac)), Ok(lb)) = (rect2d(&a.layout), leaf_1d(&b.layout)) {
                 if aleaf.has_nulls || lb.has_nulls {
-                    return Err(PyValueError::new_err("tensordot: nulls not supported yet."));
+                    return Err(unsupported(
+                    "tensordot",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling tensordot.",
+                ));
                 }
                 if ac != lb.len {
-                    return Err(PyValueError::new_err("tensordot axes=1: inner dimensions must match."));
+                    return Err(shape_mismatch(
+                        "tensordot",
+                        "axes=1 requires matching inner dimensions",
+                        "align contracted axis lengths (e.g. columns of A with rows of B).",
+                    ));
                 }
                 let out = matvec(a.dtype, alo, aleaf, ar, ac, lb)?;
                 return Ok(TensorOut::Array(out));
             }
             if let (Ok(la), Ok((blo, bleaf, br, bc))) = (leaf_1d(&a.layout), rect2d(&b.layout)) {
                 if la.has_nulls || bleaf.has_nulls {
-                    return Err(PyValueError::new_err("tensordot: nulls not supported yet."));
+                    return Err(unsupported(
+                    "tensordot",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling tensordot.",
+                ));
                 }
                 if la.len != br {
-                    return Err(PyValueError::new_err("tensordot axes=1: inner dimensions must match."));
+                    return Err(shape_mismatch(
+                        "tensordot",
+                        "axes=1 requires matching inner dimensions",
+                        "align contracted axis lengths (e.g. columns of A with rows of B).",
+                    ));
                 }
                 let out = vecmat(a.dtype, la, blo, bleaf, br, bc)?;
                 return Ok(TensorOut::Array(out));
             }
-            Err(PyValueError::new_err("tensordot axes=1: unsupported shapes/layouts."))
+            Err(layout_unsupported(
+                "tensordot",
+                "axes=1 requires 1D leaf vectors or 2D rectangular list->leaf matrices",
+            ))
         }
         2 => {
             // 2D×2D Frobenius inner product
             let (alo, aleaf, ar, ac) = rect2d(&a.layout)?;
             let (blo, bleaf, br, bc) = rect2d(&b.layout)?;
             if ar != br || ac != bc {
-                return Err(PyValueError::new_err("tensordot axes=2: shapes must match."));
+                return Err(shape_mismatch(
+                    "tensordot",
+                    "axes=2 requires identical 2D shapes",
+                    "ensure both operands have the same number of rows and columns.",
+                ));
             }
             if aleaf.has_nulls || bleaf.has_nulls {
-                return Err(PyValueError::new_err("tensordot: nulls not supported yet."));
+                return Err(unsupported(
+                    "tensordot",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling tensordot.",
+                ));
             }
             let av = as_f64_or_i32(a.dtype, aleaf)?;
             let bv = as_f64_or_i32(a.dtype, bleaf)?;
@@ -164,10 +238,14 @@ pub fn tensordot(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, axes: usize) 
                     }
                     Ok(TensorOut::Scalar(acc.into_py(py)))
                 }
-                _ => Err(PyValueError::new_err("tensordot: dtype not supported.")),
+                _ => Err(dtype_unsupported("tensordot", a.dtype)),
             }
         }
-        _ => Err(PyValueError::new_err("tensordot: only axes=0/1/2 supported.")),
+        _ => Err(arg_invalid(
+            "axes",
+            "only axes=0, axes=1, and axes=2 are supported",
+            "pass axes as 0, 1, or 2.",
+        )),
     }
 }
 
@@ -178,18 +256,34 @@ fn einsum1(py: Python<'_>, term: &str, rhs: &str, a: &GrumpyArray) -> PyResult<T
         if rhs.is_empty() {
             let leaf = array_as_leaf_1d(a)?;
             if leaf.has_nulls {
-                return Err(PyValueError::new_err("einsum: nulls not supported yet."));
+                    return Err(unsupported(
+                    "einsum",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling einsum.",
+                ));
             }
             return Ok(TensorOut::Scalar(sum_vec(py, a.dtype, &leaf)?));
         }
-        return Err(PyValueError::new_err("einsum: unsupported 1D unary pattern."));
+        return Err(unsupported(
+            "einsum",
+            "unsupported 1D unary subscript pattern",
+            "supported 1D unary pattern is i-> (sum).",
+        ));
     }
     if term.len() != 2 {
-        return Err(PyValueError::new_err("einsum: only 1D or 2D unary patterns supported."));
+        return Err(unsupported(
+            "einsum",
+            "unary einsum only supports 1D and 2D patterns",
+            "use a 1D (i) or 2D (ij) subscript for the operand.",
+        ));
     }
     let (lo, leaf, nrows, ncols) = rect2d(&a.layout)?;
     if leaf.has_nulls {
-        return Err(PyValueError::new_err("einsum: nulls not supported yet."));
+        return Err(unsupported(
+            "einsum",
+            "null/missing values are not supported yet",
+            "fill or drop nulls before calling einsum.",
+        ));
     }
     let chars: Vec<char> = term.chars().collect();
     let i = chars[0];
@@ -221,22 +315,34 @@ fn einsum1(py: Python<'_>, term: &str, rhs: &str, a: &GrumpyArray) -> PyResult<T
     if i == j && rhs.is_empty() {
         return Ok(TensorOut::Scalar(trace_mat(py, lo, leaf, nrows, ncols)?));
     }
-    Err(PyValueError::new_err("einsum: unary pattern not implemented."))
+    Err(unsupported(
+        "einsum",
+        "unary subscript pattern is not implemented",
+        "see supported patterns: i,i-> ; ij,jk->ik ; ij->ji ; ii-> ; ij->i/j ; ij,ij-> ; i,j->ij.",
+    ))
 }
 
 fn einsum2(py: Python<'_>, ta: &str, tb: &str, rhs: &str, a: &GrumpyArray, b: &GrumpyArray) -> PyResult<TensorOut> {
     if a.dtype != b.dtype {
-        return Err(PyValueError::new_err("einsum: operand dtypes must match (for now)."));
+        return Err(dtype_mismatch(a.dtype, b.dtype, "in einsum"));
     }
     if ta.len() == 1 && tb.len() == 1 && rhs.is_empty() && ta == tb {
         // dot
         let la = array_as_leaf_1d(a)?;
         let lb = array_as_leaf_1d(b)?;
         if la.has_nulls || lb.has_nulls {
-            return Err(PyValueError::new_err("einsum: nulls not supported yet."));
+                return Err(unsupported(
+                    "einsum",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling einsum.",
+                ));
         }
         if la.len != lb.len {
-            return Err(PyValueError::new_err("einsum: vector lengths must match."));
+            return Err(shape_mismatch(
+                "einsum",
+                "dot product requires matching vector lengths",
+                "ensure both vectors have the same length.",
+            ));
         }
         return Ok(TensorOut::Scalar(dot_vec_vec(py, a.dtype, &la, &lb)?));
     }
@@ -245,7 +351,11 @@ fn einsum2(py: Python<'_>, ta: &str, tb: &str, rhs: &str, a: &GrumpyArray, b: &G
         let la = array_as_leaf_1d(a)?;
         let lb = array_as_leaf_1d(b)?;
         if la.has_nulls || lb.has_nulls {
-            return Err(PyValueError::new_err("einsum: nulls not supported yet."));
+                return Err(unsupported(
+                    "einsum",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling einsum.",
+                ));
         }
         let out = outer_vec_vec(a.dtype, &la, &lb)?;
         return Ok(TensorOut::Array(out));
@@ -255,10 +365,18 @@ fn einsum2(py: Python<'_>, ta: &str, tb: &str, rhs: &str, a: &GrumpyArray, b: &G
         let (_, aleaf, ar, ac) = rect2d(&a.layout)?;
         let (_, bleaf, br, bc) = rect2d(&b.layout)?;
         if ar != br || ac != bc {
-            return Err(PyValueError::new_err("einsum: shapes must match for ij,ij->."));
+            return Err(shape_mismatch(
+                "einsum",
+                "ij,ij-> requires identical matrix shapes",
+                "ensure both operands have the same number of rows and columns.",
+            ));
         }
         if aleaf.has_nulls || bleaf.has_nulls {
-            return Err(PyValueError::new_err("einsum: nulls not supported yet."));
+                return Err(unsupported(
+                    "einsum",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling einsum.",
+                ));
         }
         return Ok(TensorOut::Scalar(frob_inner(py, a.dtype, aleaf, bleaf, ar * ac)?));
     }
@@ -271,10 +389,18 @@ fn einsum2(py: Python<'_>, ta: &str, tb: &str, rhs: &str, a: &GrumpyArray, b: &G
             let (alo, aleaf, ar, ac) = rect2d(&a.layout)?;
             let (blo, bleaf, br, bc) = rect2d(&b.layout)?;
             if ac != br {
-                return Err(PyValueError::new_err("einsum: inner dimensions must match for ij,jk->ik."));
+                return Err(shape_mismatch(
+                    "einsum",
+                    "ij,jk->ik requires matching inner dimensions",
+                    "align the shared axis (columns of A with rows of B).",
+                ));
             }
             if aleaf.has_nulls || bleaf.has_nulls {
-                return Err(PyValueError::new_err("einsum: nulls not supported yet."));
+                    return Err(unsupported(
+                    "einsum",
+                    "null/missing values are not supported yet",
+                    "fill or drop nulls before calling einsum.",
+                ));
             }
             let out = matmul(a.dtype, alo, aleaf, ar, ac, blo, bleaf, br, bc)?;
             return Ok(TensorOut::Array(out));
@@ -284,7 +410,11 @@ fn einsum2(py: Python<'_>, ta: &str, tb: &str, rhs: &str, a: &GrumpyArray, b: &G
     // fall back to error (no general contraction engine yet)
     // Provide helpful hint about what *is* supported.
     let supported = "Supported einsum patterns include: i,i-> ; ij,jk->ik ; ij->ji ; ii-> ; ij->i/j ; ij,ij-> ; i,j->ij";
-    Err(PyValueError::new_err(format!("einsum: pattern not implemented. {supported}")))
+    Err(unsupported(
+        "einsum",
+        format!("pattern not implemented. {supported}"),
+        "rewrite subscripts to a supported pattern or use the numpy fallback.",
+    ))
 }
 
 /// NumPy fallback for patterns not implemented in Rust (parity / escape hatch).
@@ -314,9 +444,11 @@ pub fn einsum_numpy_fallback(
     } else if dtype_name == "int32" {
         DType::Int32
     } else {
-        return Err(PyValueError::new_err(format!(
-            "einsum numpy fallback: unsupported result dtype {dtype_name}."
-        )));
+        return Err(unsupported(
+            "einsum",
+            format!("numpy fallback returned unsupported result dtype '{dtype_name}'"),
+            "cast the numpy result to float64 or int32 before converting to a Grumpy array.",
+        ));
     };
     let arr = crate::layout::build_array(py, &flat, dtype)?;
     Ok(TensorOut::Array(arr))
@@ -344,7 +476,7 @@ fn dot_vec_vec(py: Python<'_>, dtype: DType, a: &Leaf, b: &Leaf) -> PyResult<PyO
             }
             Ok(acc.into_py(py))
         }
-        _ => Err(PyValueError::new_err("einsum/tensordot: dtype not supported (use float64 or int32).")),
+        _ => Err(dtype_unsupported("einsum", dtype)),
     }
 }
 
@@ -376,7 +508,7 @@ fn outer_vec_vec(dtype: DType, a: &Leaf, b: &Leaf) -> PyResult<GrumpyArray> {
             }
             Layout::Leaf(new_leaf_i32(out))
         }
-        _ => return Err(PyValueError::new_err("outer: dtype not supported.")),
+        _ => return Err(dtype_unsupported("outer", dtype)),
     };
     Ok(GrumpyArray { dtype, layout: Layout::ListOffset(ListOffset { offsets: Arc::new(offsets), content: Box::new(content) }) })
 }
@@ -428,7 +560,7 @@ fn matmul(
             }
             Layout::ListOffset(ListOffset { offsets: Arc::new(offsets), content: Box::new(Layout::Leaf(new_leaf_i32(out))) })
         }
-        _ => return Err(PyValueError::new_err("matmul: dtype not supported.")),
+        _ => return Err(dtype_unsupported("matmul", dtype)),
     };
     Ok(GrumpyArray { dtype, layout: out_layout })
 }
@@ -461,7 +593,7 @@ fn matvec(dtype: DType, _alo: &ListOffset, aleaf: &Leaf, ar: usize, ac: usize, b
             }
             Ok(GrumpyArray { dtype, layout: Layout::Leaf(new_leaf_i32(out)) })
         }
-        _ => Err(PyValueError::new_err("matvec: dtype not supported.")),
+        _ => Err(dtype_unsupported("matvec", dtype)),
     }
 }
 
@@ -491,7 +623,7 @@ fn vecmat(dtype: DType, a: &Leaf, _blo: &ListOffset, bleaf: &Leaf, br: usize, bc
             }
             Ok(GrumpyArray { dtype, layout: Layout::Leaf(new_leaf_i32(out)) })
         }
-        _ => Err(PyValueError::new_err("vecmat: dtype not supported.")),
+        _ => Err(dtype_unsupported("vecmat", dtype)),
     }
 }
 
@@ -515,7 +647,7 @@ fn frob_inner(py: Python<'_>, dtype: DType, a: &Leaf, b: &Leaf, n: usize) -> PyR
             }
             Ok(acc.into_py(py))
         }
-        _ => Err(PyValueError::new_err("einsum: dtype not supported.")),
+        _ => Err(dtype_unsupported("einsum", dtype)),
     }
 }
 
@@ -537,7 +669,7 @@ fn sum_vec(py: Python<'_>, dtype: DType, a: &Leaf) -> PyResult<PyObject> {
             }
             Ok(acc.into_py(py))
         }
-        _ => Err(PyValueError::new_err("einsum: dtype not supported.")),
+        _ => Err(dtype_unsupported("einsum", dtype)),
     }
 }
 
@@ -560,7 +692,7 @@ fn sum_mat(py: Python<'_>, dtype: DType, a: &Leaf, nrows: usize, ncols: usize) -
             }
             Ok(acc.into_py(py))
         }
-        _ => Err(PyValueError::new_err("einsum: dtype not supported.")),
+        _ => Err(dtype_unsupported("einsum", dtype)),
     }
 }
 
@@ -594,7 +726,7 @@ fn sum_rows(dtype: DType, lo: &ListOffset, a: &Leaf, nrows: usize, ncols: usize)
             }
             Ok(GrumpyArray { dtype, layout: Layout::Leaf(new_leaf_i32(out)) })
         }
-        _ => Err(PyValueError::new_err("einsum: dtype not supported.")),
+        _ => Err(dtype_unsupported("einsum", dtype)),
     }
 }
 
@@ -622,7 +754,7 @@ fn sum_cols(dtype: DType, _lo: &ListOffset, a: &Leaf, nrows: usize, ncols: usize
             }
             Ok(GrumpyArray { dtype, layout: Layout::Leaf(new_leaf_i32(out)) })
         }
-        _ => Err(PyValueError::new_err("einsum: dtype not supported.")),
+        _ => Err(dtype_unsupported("einsum", dtype)),
     }
 }
 
@@ -645,7 +777,7 @@ fn trace_mat(py: Python<'_>, lo: &ListOffset, a: &Leaf, nrows: usize, ncols: usi
             }
             Ok(acc.into_py(py))
         }
-        _ => Err(PyValueError::new_err("einsum trace: dtype not supported.")),
+        _ => Err(dtype_unsupported("einsum trace", a.dtype)),
     }
 }
 
@@ -674,7 +806,7 @@ fn transpose(dtype: DType, _lo: &ListOffset, a: &Leaf, nrows: usize, ncols: usiz
             }
             Ok(GrumpyArray { dtype, layout: Layout::ListOffset(ListOffset { offsets: Arc::new(offsets), content: Box::new(Layout::Leaf(new_leaf_i32(out))) }) })
         }
-        _ => Err(PyValueError::new_err("transpose: dtype not supported.")),
+        _ => Err(dtype_unsupported("transpose", dtype)),
     }
 }
 
@@ -693,8 +825,8 @@ fn leaf_1d<'a>(layout: &'a Layout) -> PyResult<&'a Leaf> {
         Layout::Leaf(l) => Ok(l),
         Layout::OffsetView(v) => leaf_1d(v.content.as_ref()),
         Layout::Indexed(ix) => leaf_1d(ix.content.as_ref()),
-        Layout::ListOffset(_) => Err(PyValueError::new_err("Expected 1D leaf array.")),
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err("Union not supported.")),
+        Layout::ListOffset(_) => Err(layout_unsupported("einsum", "expected a 1D leaf array")),
+        Layout::UnionScalarList(_) => Err(layout_unsupported("einsum", "UnionScalarList layout is not supported")),
     }
 }
 
@@ -702,11 +834,11 @@ fn rect2d<'a>(layout: &'a Layout) -> PyResult<(&'a ListOffset, &'a Leaf, usize, 
     let (lo, leaf) = match layout {
         Layout::ListOffset(lo) => match lo.content.as_ref() {
             Layout::Leaf(l) => (lo, l),
-            _ => return Err(PyValueError::new_err("Expected 2D list->leaf array.")),
+            _ => return Err(layout_unsupported("einsum", "expected a 2D list->leaf array")),
         },
         Layout::OffsetView(v) => return rect2d(v.content.as_ref()),
         Layout::Indexed(ix) => return rect2d(ix.content.as_ref()),
-        _ => return Err(PyValueError::new_err("Expected 2D list->leaf array.")),
+        _ => return Err(layout_unsupported("einsum", "expected a 2D list->leaf array")),
     };
     let nrows = lo.len();
     if nrows == 0 {
@@ -716,7 +848,11 @@ fn rect2d<'a>(layout: &'a Layout) -> PyResult<(&'a ListOffset, &'a Leaf, usize, 
     for r in 0..nrows {
         let len = (lo.offsets[r + 1] - lo.offsets[r]) as usize;
         if len != row0 {
-            return Err(PyValueError::new_err("Expected rectangular 2D array (constant row length)."));
+            return Err(shape_mismatch(
+                "einsum",
+                "expected a rectangular 2D array with constant row length",
+                "ensure every row has the same number of columns.",
+            ));
         }
     }
     Ok((lo, leaf, nrows, row0))
@@ -725,13 +861,13 @@ fn rect2d<'a>(layout: &'a Layout) -> PyResult<(&'a ListOffset, &'a Leaf, usize, 
 fn as_f64<'a>(leaf: &'a Leaf) -> PyResult<&'a [f64]> {
     match &leaf.buffer {
         LeafBuffer::F64(v) => Ok(v.as_slice()),
-        _ => Err(PyValueError::new_err("dtype mismatch (expected float64).")),
+        _ => Err(internal_dtype_buffer_mismatch("einsum", leaf.dtype)),
     }
 }
 fn as_i32<'a>(leaf: &'a Leaf) -> PyResult<&'a [i32]> {
     match &leaf.buffer {
         LeafBuffer::I32(v) => Ok(v.as_slice()),
-        _ => Err(PyValueError::new_err("dtype mismatch (expected int32).")),
+        _ => Err(internal_dtype_buffer_mismatch("einsum", leaf.dtype)),
     }
 }
 
@@ -743,7 +879,7 @@ fn as_f64_or_i32<'a>(_dtype: DType, leaf: &'a Leaf) -> PyResult<NumSlice<'a>> {
     match &leaf.buffer {
         LeafBuffer::F64(v) => Ok(NumSlice::F64(v.as_slice())),
         LeafBuffer::I32(v) => Ok(NumSlice::I32(v.as_slice())),
-        _ => Err(PyValueError::new_err("dtype not supported (use float64 or int32).")),
+        _ => Err(dtype_unsupported("einsum", leaf.dtype)),
     }
 }
 

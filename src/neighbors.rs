@@ -14,13 +14,15 @@
 //! - Supports `OffsetView` batches produced by streaming
 
 use crate::dtype::DType;
-use crate::error::{arg_invalid, dtype_mismatch, internal, layout_unsupported, unsupported};
+use crate::error::{
+    arg_invalid, broadcast_union_outer_mismatch, dtype_mismatch, dtype_unsupported,
+    index_out_of_bounds_simple, internal, layout_unsupported, shape_mismatch, unsupported,
+};
 use crate::layout::{drop_axis0_select_element, stack_axis0_broadcast, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
 use kdtree::distance::squared_euclidean;
 use kdtree::KdTree;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -87,8 +89,10 @@ fn neighbors_union(
     match dim {
         0 | -2 => {}
         _ => {
-            return Err(PyValueError::new_err(
-                "neighbors on union layouts currently supports dim=0 only.",
+            return Err(unsupported(
+                "neighbors",
+                "on union layouts currently supports dim=0 only",
+                "pass dim=0 for union point clouds.",
             ));
         }
     }
@@ -102,9 +106,7 @@ fn neighbors_union(
         unreachable!()
     };
     if q_union && d_union && query.len() != data.len() {
-        return Err(PyValueError::new_err(
-            "neighbors: union query and data must have the same outer length.",
-        ));
+        return Err(broadcast_union_outer_mismatch(query.len(), data.len()));
     }
     let mut edge_layouts: Vec<Layout> = Vec::with_capacity(n);
     let mut dist_layouts: Vec<Layout> = Vec::with_capacity(n);
@@ -126,8 +128,9 @@ fn neighbors_union(
             data.clone()
         };
         if rect2d(&q_arr.layout).is_err() || rect2d(&d_arr.layout).is_err() {
-            return Err(PyValueError::new_err(
-                "neighbors on union layouts requires each outer element to be a rectangular 2D point cloud.",
+            return Err(layout_unsupported(
+                "neighbors",
+                "each outer union element must be a rectangular 2D point cloud",
             ));
         }
         let (edge, dist) =
@@ -135,7 +138,7 @@ fn neighbors_union(
         edge_layouts.push(edge.layout);
         if return_distances {
             dist_layouts.push(dist.ok_or_else(|| {
-                PyValueError::new_err("Internal error: missing distance output.")
+                internal("neighbors", "missing distance output")
             })?.layout);
         }
     }
@@ -165,10 +168,18 @@ fn neighbors_dim0_edges(
     let (qoff, qbase, qleaf, qn, d) = rect2d(&query.layout)?;
     let (doff, dbase, dleaf, dn, dd) = rect2d(&data.layout)?;
     if d != dd {
-        return Err(PyValueError::new_err("neighbors: point dimension mismatch between query and data."));
+        return Err(shape_mismatch(
+            "neighbors",
+            format!("point dimension mismatch between query and data ({d} vs {dd})"),
+            "ensure query and data share the same coordinate dimension.",
+        ));
     }
     if qleaf.has_nulls || dleaf.has_nulls {
-        return Err(PyValueError::new_err("neighbors does not support nulls yet."));
+        return Err(unsupported(
+            "neighbors",
+            "does not support null values yet",
+            "filter nulls or use all-valid point clouds.",
+        ));
     }
     let q = coords_as_f64(query.dtype, qleaf)?;
     let x = coords_as_f64(data.dtype, dleaf)?;
@@ -187,10 +198,11 @@ fn neighbors_dim0_edges(
         }
         let max_k = if !loop_ && same_inputs { dn.saturating_sub(1) } else { dn };
         if k > max_k {
-            return Err(PyValueError::new_err(format!(
-                "neighbors(kNN): k={} is larger than available points ({}).",
-                k, max_k
-            )));
+            return Err(arg_invalid(
+                "k",
+                format!("k={k} is larger than available points ({max_k})"),
+                "reduce k or set loop=True when query and data differ.",
+            ));
         }
 
         // Adaptive strategy:
@@ -202,7 +214,7 @@ fn neighbors_dim0_edges(
             for j in 0..dn {
                 let jstart = doff[dbase + j] as usize;
                 tree.add(x[jstart..jstart + d].to_vec(), j)
-                    .map_err(|e| PyValueError::new_err(format!("kd-tree add failed ({e}).")))?;
+                    .map_err(|e| internal("neighbors", format!("kd-tree add failed ({e})")))?;
             }
             // Note: kd-tree build is done; query in parallel if large enough.
             let extra = if !loop_ && same_inputs { 1 } else { 0 };
@@ -222,7 +234,7 @@ fn neighbors_dim0_edges(
                             let qpt = &q[qstart..qstart + d];
                             let res = tree
                                 .nearest(qpt, kk, &squared_euclidean)
-                                .map_err(|e| PyValueError::new_err(format!("kd-tree query failed ({e}).")))?;
+                                .map_err(|e| internal("neighbors", format!("kd-tree query failed ({e})")))?;
                             let mut cand: Vec<(f64, usize)> = Vec::with_capacity(res.len());
                             for (dist, &j) in res.iter() {
                                 if !loop_ && same_inputs && qi == j {
@@ -248,7 +260,7 @@ fn neighbors_dim0_edges(
                         let qpt = &q[qstart..qstart + d];
                         let res = tree
                             .nearest(qpt, kk, &squared_euclidean)
-                            .map_err(|e| PyValueError::new_err(format!("kd-tree query failed ({e}).")))?;
+                            .map_err(|e| internal("neighbors", format!("kd-tree query failed ({e})")))?;
                         // Convert to (dist, idx) and enforce stable ordering.
                         let mut cand: Vec<(f64, usize)> = Vec::with_capacity(res.len());
                         for (dist, &j) in res.iter() {
@@ -270,7 +282,7 @@ fn neighbors_dim0_edges(
                     let qpt = &q[qstart..qstart + d];
                     let res = tree
                         .nearest(qpt, kk, &squared_euclidean)
-                        .map_err(|e| PyValueError::new_err(format!("kd-tree query failed ({e}).")))?;
+                        .map_err(|e| internal("neighbors", format!("kd-tree query failed ({e})")))?;
                     let mut cand: Vec<(f64, usize)> = Vec::with_capacity(res.len());
                     for (dist, &j) in res.iter() {
                         if !loop_ && same_inputs && qi == j {
@@ -438,7 +450,7 @@ fn neighbors_dim0_edges(
 
     let r = radius.unwrap();
     if r < 0.0 {
-        return Err(PyValueError::new_err("neighbors: radius must be non-negative."));
+        return Err(arg_invalid("radius", "must be non-negative", "pass radius >= 0."));
     }
     let r2 = r * r;
     let use_kdtree = dn >= 2048 && d <= 32;
@@ -451,7 +463,7 @@ fn neighbors_dim0_edges(
         for j in 0..dn {
             let jstart = doff[dbase + j] as usize;
             tree.add(x[jstart..jstart + d].to_vec(), j)
-                .map_err(|e| PyValueError::new_err(format!("kd-tree add failed ({e}).")))?;
+                .map_err(|e| internal("neighbors", format!("kd-tree add failed ({e})")))?;
         }
         let per_lists: Vec<Vec<(usize, f64)>> = (0..qn)
             .into_par_iter()
@@ -460,7 +472,7 @@ fn neighbors_dim0_edges(
                 let qpt = &q[qstart..qstart + d];
                 let res = tree
                     .within(qpt, r2, &squared_euclidean)
-                    .map_err(|e| PyValueError::new_err(format!("kd-tree query failed ({e}).")))?;
+                    .map_err(|e| internal("neighbors", format!("kd-tree query failed ({e})")))?;
                 let mut cand: Vec<(f64, usize)> = Vec::with_capacity(res.len());
                 for (dist, &j) in res.iter() {
                     if !loop_ && same_inputs && qi == j {
@@ -552,14 +564,26 @@ fn neighbors_dim1_edges(
     let (qg_off, qg_base, qp, qleaf, qg_n, qd) = grouped_points(&query.layout)?;
     let (dg_off, dg_base, dp, dleaf, dg_n, dd) = grouped_points(&data.layout)?;
     if qd != dd {
-        return Err(PyValueError::new_err("neighbors(dim=1): point dimension mismatch."));
+        return Err(shape_mismatch(
+            "neighbors(dim=1)",
+            format!("point dimension mismatch ({qd} vs {dd})"),
+            "ensure query and data share the same coordinate dimension.",
+        ));
     }
     if qg_n != dg_n {
-        return Err(PyValueError::new_err("neighbors(dim=1): number of groups must match between query and data (for now)."));
+        return Err(shape_mismatch(
+            "neighbors(dim=1)",
+            "number of groups must match between query and data",
+            "ensure both arrays have the same number of groups.",
+        ));
     }
 
     if qleaf.has_nulls || dleaf.has_nulls {
-        return Err(PyValueError::new_err("neighbors does not support nulls yet."));
+        return Err(unsupported(
+            "neighbors",
+            "does not support null values yet",
+            "filter nulls or use all-valid point clouds.",
+        ));
     }
     let qcoords = coords_as_f64(query.dtype, qleaf)?;
     let dcoords = coords_as_f64(data.dtype, dleaf)?;
@@ -670,7 +694,7 @@ fn neighbors_dim1_edges(
 
     let r = radius.unwrap();
     if r < 0.0 {
-        return Err(PyValueError::new_err("neighbors: radius must be non-negative."));
+        return Err(arg_invalid("radius", "must be non-negative", "pass radius >= 0."));
     }
     let r2 = r * r;
     let mut out_group_offsets: Vec<i64> = Vec::with_capacity(qg_n + 1);
@@ -949,7 +973,7 @@ fn rect2d<'a>(layout: &'a Layout) -> PyResult<(&'a Arc<Vec<i64>>, usize, &'a Lea
         Layout::ListOffset(lo) => {
             let leaf = match lo.content.as_ref() {
                 Layout::Leaf(l) => l,
-                _ => return Err(PyValueError::new_err("Expected 2D list->leaf array.")),
+                _ => return Err(layout_unsupported("neighbors", "expected 2D list->leaf array")),
             };
             let n = lo.len();
             if n == 0 {
@@ -959,7 +983,11 @@ fn rect2d<'a>(layout: &'a Layout) -> PyResult<(&'a Arc<Vec<i64>>, usize, &'a Lea
             for i in 0..n {
                 let len = (lo.offsets[i + 1] - lo.offsets[i]) as usize;
                 if len != d {
-                    return Err(PyValueError::new_err("Expected rectangular 2D array (constant row length)."));
+                    return Err(shape_mismatch(
+                        "neighbors",
+                        "expected rectangular 2D array (constant row length)",
+                        "ensure every row has the same length.",
+                    ));
                 }
             }
             Ok((&lo.offsets, 0, leaf, n, d))
@@ -967,27 +995,31 @@ fn rect2d<'a>(layout: &'a Layout) -> PyResult<(&'a Arc<Vec<i64>>, usize, &'a Lea
         Layout::OffsetView(v) => {
             let leaf = match v.content.as_ref() {
                 Layout::Leaf(l) => l,
-                _ => return Err(PyValueError::new_err("Expected 2D list->leaf array.")),
+                _ => return Err(layout_unsupported("neighbors", "expected 2D list->leaf array")),
             };
             let n = v.len();
             if n == 0 {
                 return Ok((&v.offsets, v.start, leaf, 0, 0));
             }
             if v.start + n >= v.offsets.len() {
-                return Err(PyValueError::new_err("OffsetView out of bounds."));
+                return Err(index_out_of_bounds_simple("on OffsetView in neighbors"));
             }
             let d = (v.offsets[v.start + 1] - v.offsets[v.start]) as usize;
             for i in 0..n {
                 let abs = v.start + i;
                 let len = (v.offsets[abs + 1] - v.offsets[abs]) as usize;
                 if len != d {
-                    return Err(PyValueError::new_err("Expected rectangular 2D array (constant row length)."));
+                    return Err(shape_mismatch(
+                        "neighbors",
+                        "expected rectangular 2D array (constant row length)",
+                        "ensure every row has the same length.",
+                    ));
                 }
             }
             Ok((&v.offsets, v.start, leaf, n, d))
         }
         Layout::Indexed(ix) => rect2d(ix.content.as_ref()),
-        _ => Err(PyValueError::new_err("Expected 2D list->leaf array.")),
+        _ => Err(layout_unsupported("neighbors", "expected 2D list->leaf array")),
     }
 }
 
@@ -999,15 +1031,24 @@ fn grouped_points<'a>(
         Layout::ListOffset(g) => (&g.offsets, 0usize, g.content.as_ref(), g.len()),
         Layout::OffsetView(v) => (&v.offsets, v.start, v.content.as_ref(), v.len()),
         Layout::Indexed(ix) => return grouped_points(ix.content.as_ref()),
-        _ => return Err(PyValueError::new_err("Expected grouped point cloud: groups->points->coords.")),
+        _ => return Err(layout_unsupported(
+            "neighbors",
+            "expected grouped point cloud: groups->points->coords",
+        )),
     };
     let p = match g_content {
         Layout::ListOffset(p) => p,
-        _ => return Err(PyValueError::new_err("Expected grouped point cloud: groups->points->coords.")),
+        _ => return Err(layout_unsupported(
+            "neighbors",
+            "expected grouped point cloud: groups->points->coords",
+        )),
     };
     let leaf = match p.content.as_ref() {
         Layout::Leaf(l) => l,
-        _ => return Err(PyValueError::new_err("Expected grouped point cloud: points->leaf coords.")),
+        _ => return Err(layout_unsupported(
+            "neighbors",
+            "expected grouped point cloud: points->leaf coords",
+        )),
     };
     // Determine point dimension from first point (requires at least one point)
     if p.len() == 0 {
@@ -1018,7 +1059,11 @@ fn grouped_points<'a>(
     for i in 0..p.len() {
         let len = (p.offsets[i + 1] - p.offsets[i]) as usize;
         if len != d {
-            return Err(PyValueError::new_err("Expected fixed coordinate dimension for each point (rectangular points)."));
+            return Err(shape_mismatch(
+                "neighbors",
+                "expected fixed coordinate dimension for each point (rectangular points)",
+                "ensure every point has the same number of coordinates.",
+            ));
         }
     }
     Ok((g_off, g_base, p, leaf, ng, d))
@@ -1034,7 +1079,7 @@ fn coords_as_f64(dtype: DType, leaf: &Leaf) -> PyResult<Vec<f64>> {
         (LeafBuffer::F32(v), _) => v.iter().map(|&x| x as f64).collect(),
         (LeafBuffer::I32(v), _) => v.iter().map(|&x| x as f64).collect(),
         (LeafBuffer::I64(v), _) => v.iter().map(|&x| x as f64).collect(),
-        _ => return Err(PyValueError::new_err("neighbors supports float32/float64/int32/int64 coords for now.")),
+        _ => return Err(dtype_unsupported("neighbors coords", dtype)),
     })
 }
 

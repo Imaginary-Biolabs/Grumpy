@@ -1,6 +1,6 @@
+use crate::error::arg_invalid;
 use crate::whereops as where_ops;
 use crate::py_api::types::PyGrumpyArray;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 #[pyfunction]
@@ -20,7 +20,11 @@ pub fn where_(
             let out = where_ops::where_select(py, &cond.inner, &xx.inner, &yy.inner)?;
             Ok(Py::new(py, PyGrumpyArray { inner: out })?.into_py(py))
         }
-        _ => Err(PyValueError::new_err("where(cond, x, y) requires both x and y.")),
+        _ => Err(arg_invalid(
+            "x/y",
+            "where(cond, x, y) requires both x and y",
+            "pass both branches: gr.where(cond, x, y).",
+        )),
     }
 }
 

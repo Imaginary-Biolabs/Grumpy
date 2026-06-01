@@ -1,15 +1,15 @@
 use crate::dtype::DType;
+use crate::error::{dtype_mismatch, dtype_unsupported, layout_unsupported, shape_mismatch};
 use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
 pub fn where_indices(_py: Python<'_>, cond: &GrumpyArray) -> PyResult<GrumpyArray> {
     let leaf = leaf_1d(&cond.layout)?;
     if cond.dtype != DType::Bool {
-        return Err(PyValueError::new_err("where(cond) requires bool cond."));
+        return Err(dtype_mismatch(DType::Bool, cond.dtype, "in where(cond)"));
     }
     let v = match &leaf.buffer {
         LeafBuffer::Bool(v) => v.as_slice(),
@@ -48,13 +48,17 @@ pub fn where_select(_py: Python<'_>, cond: &GrumpyArray, x: &GrumpyArray, y: &Gr
     let xl = leaf_1d(&x.layout)?;
     let yl = leaf_1d(&y.layout)?;
     if cond.dtype != DType::Bool {
-        return Err(PyValueError::new_err("where(cond,x,y) requires bool cond."));
+        return Err(dtype_mismatch(DType::Bool, cond.dtype, "in where(cond,x,y)"));
     }
     if x.dtype != y.dtype {
-        return Err(PyValueError::new_err("where(cond,x,y) requires x and y to have matching dtype."));
+        return Err(dtype_mismatch(x.dtype, y.dtype, "in where(cond,x,y)"));
     }
     if cl.len != xl.len || cl.len != yl.len {
-        return Err(PyValueError::new_err("where(cond,x,y) requires all inputs to have same length."));
+        return Err(shape_mismatch(
+            "where(cond,x,y)",
+            "cond, x, and y must have the same length",
+            "ensure all three arrays have equal length.",
+        ));
     }
     let n = cl.len;
     let mut out = Leaf::new(x.dtype);
@@ -70,7 +74,7 @@ pub fn where_select(_py: Python<'_>, cond: &GrumpyArray, x: &GrumpyArray, y: &Gr
         DType::Float64 => LeafBuffer::F64(Arc::new(vec![0f64; n])),
         DType::Bool => LeafBuffer::Bool(Arc::new(vec![0u8; n])),
         DType::Char => LeafBuffer::Char(Arc::new(vec![0u32; n])),
-        _ => return Err(PyValueError::new_err("where(cond,x,y) not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("where(cond,x,y)", x.dtype)),
     };
     let out_valid = Arc::make_mut(&mut out.validity);
 
@@ -124,8 +128,8 @@ fn leaf_1d<'a>(layout: &'a Layout) -> PyResult<&'a Leaf> {
         Layout::Leaf(l) => Ok(l),
         Layout::OffsetView(v) => leaf_1d(v.content.as_ref()),
         Layout::Indexed(ix) => leaf_1d(ix.content.as_ref()),
-        Layout::ListOffset(_) => Err(PyValueError::new_err("Expected 1D leaf array.")),
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err("Union not supported.")),
+        Layout::ListOffset(_) => Err(layout_unsupported("where", "expected a 1D leaf array")),
+        Layout::UnionScalarList(_) => Err(layout_unsupported("where", "union arrays are not supported here")),
     }
 }
 

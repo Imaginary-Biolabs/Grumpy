@@ -1,8 +1,8 @@
 use crate::dtype::DType;
+use crate::error::{dtype_unsupported, internal, internal_dtype_buffer_mismatch, unsupported};
 use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
@@ -23,7 +23,7 @@ pub fn unique(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
         DType::String => unique_string(py, leaf),
         DType::Float32 => unique_f32(py, leaf),
         DType::Float64 => unique_f64(py, leaf),
-        _ => Err(PyValueError::new_err("unique() not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("unique", a.dtype)),
     }
 }
 
@@ -167,8 +167,10 @@ fn unique_union(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
             let vals = collect_union_f64(&a.layout);
             unique_f64_from_values(py, a.dtype, &vals)
         }
-        _ => Err(PyValueError::new_err(
-            "unique() on union arrays supports int32/int64/float64 for now.",
+        _ => Err(unsupported(
+            "unique on union arrays",
+            "only int32, int64, and float64 are supported for union layouts",
+            "cast to a supported dtype or use a non-union array.",
         )),
     }
 }
@@ -597,7 +599,7 @@ fn collect_scalar_bits(dt: DType, leaf: &Leaf) -> PyResult<Vec<u64>> {
         (DType::Char, LeafBuffer::Char(v)) => {
             for i in 0..leaf.len { if leaf.validity[i] { out.push(v[i] as u64); } }
         }
-        _ => return Err(PyValueError::new_err("Unsupported dtype for scalar_bits.")),
+        _ => return Err(internal_dtype_buffer_mismatch("scalar_bits", dt)),
     }
     Ok(out)
 }
@@ -613,7 +615,7 @@ fn unique_from_scalar_bits(_py: Python<'_>, dt: DType, bits: &[u64]) -> PyResult
         DType::UInt64 => new_leaf_u64(v),
         DType::Bool => new_leaf_bool(v.into_iter().map(|x| (x != 0) as u8).collect()),
         DType::Char => new_leaf_char(v.into_iter().map(|x| x as u32).collect()),
-        _ => Err(PyValueError::new_err("Unsupported dtype for unique_from_scalar_bits.")),
+        _ => Err(dtype_unsupported("unique", dt)),
     }
 }
 
@@ -910,7 +912,7 @@ fn build_membership_set(dt: DType, leaf: &Leaf) -> PyResult<MembershipSet> {
             }
             Ok(MembershipSet::F64(s))
         }
-        _ => Err(PyValueError::new_err("isin() not implemented for this dtype.")),
+        _ => Err(dtype_unsupported("isin", dt)),
     }
 }
 
@@ -1018,7 +1020,7 @@ fn isin_leaf(leaf: &Leaf, dt: DType, set: &MembershipSet) -> PyResult<Leaf> {
                 oo[i] = s.contains(&bits) as u8;
             }
         }
-        _ => return Err(PyValueError::new_err("Internal error: dtype mismatch in isin.")),
+        _ => return Err(internal("isin", "dtype, membership set, and leaf buffer variant do not match")),
     }
     Ok(out)
 }

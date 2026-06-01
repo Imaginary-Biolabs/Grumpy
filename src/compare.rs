@@ -1,8 +1,10 @@
 use crate::dtype::DType;
+use crate::error::{
+    dtype_unsupported, internal_dtype_buffer_mismatch, layout_unsupported, shape_mismatch, unsupported,
+};
 use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -47,7 +49,11 @@ pub fn predicate(py: Python<'_>, a: &GrumpyArray, op: PredOp) -> PyResult<Grumpy
 
 pub fn logical_bin(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, op: LogicOp) -> PyResult<GrumpyArray> {
     if a.dtype != DType::Bool || b.dtype != DType::Bool {
-        return Err(PyValueError::new_err("logical_* requires bool arrays."));
+        return Err(unsupported(
+            "logical_*",
+            "requires bool arrays for both operands",
+            "cast inputs with .astype(gr.bool_) or use comparison ops.",
+        ));
     }
     let layout = logical_layout(py, &a.layout, &b.layout, op)?;
     Ok(GrumpyArray { dtype: DType::Bool, layout })
@@ -55,7 +61,11 @@ pub fn logical_bin(py: Python<'_>, a: &GrumpyArray, b: &GrumpyArray, op: LogicOp
 
 pub fn logical_not(py: Python<'_>, a: &GrumpyArray) -> PyResult<GrumpyArray> {
     if a.dtype != DType::Bool {
-        return Err(PyValueError::new_err("logical_not requires bool array."));
+        return Err(unsupported(
+            "logical_not",
+            "requires a bool array",
+            "cast the input with .astype(gr.bool_) or use comparison ops.",
+        ));
     }
     let layout = logical_not_layout(py, &a.layout)?;
     Ok(GrumpyArray { dtype: DType::Bool, layout })
@@ -75,14 +85,22 @@ fn logical_layout(py: Python<'_>, a: &Layout, b: &Layout, op: LogicOp) -> PyResu
         (Layout::Leaf(la), Layout::Leaf(lb)) => Ok(Layout::Leaf(logical_leaf(py, la, lb, op)?)),
         (Layout::ListOffset(oa), Layout::ListOffset(ob)) => {
             if oa.offsets != ob.offsets || oa.len() != ob.len() {
-                return Err(PyValueError::new_err("Logical op requires identical ragged structure for now."));
+                return Err(shape_mismatch(
+                    "logical op",
+                    "requires identical ragged structure",
+                    "ensure both operands share the same list offsets.",
+                ));
             }
             let content = logical_layout(py, oa.content.as_ref(), ob.content.as_ref(), op)?;
             Ok(Layout::ListOffset(ListOffset { offsets: oa.offsets.clone(), content: Box::new(content) }))
         }
         (Layout::UnionScalarList(ua), Layout::UnionScalarList(ub)) => {
             if ua.tags != ub.tags || ua.index != ub.index || ua.lists.offsets != ub.lists.offsets {
-                return Err(PyValueError::new_err("Logical op requires identical union structure."));
+                return Err(shape_mismatch(
+                    "logical op",
+                    "requires identical union structure",
+                    "ensure both operands share the same union tags, index, and list offsets.",
+                ));
             }
             let scalars = logical_leaf(py, &ua.scalars, &ub.scalars, op)?;
             let list_content = logical_layout(py, ua.lists.content.as_ref(), ub.lists.content.as_ref(), op)?;
@@ -93,13 +111,17 @@ fn logical_layout(py: Python<'_>, a: &Layout, b: &Layout, op: LogicOp) -> PyResu
                 lists: ListOffset { offsets: ua.lists.offsets.clone(), content: Box::new(list_content) },
             }))
         }
-        _ => Err(PyValueError::new_err("Logical op requires matching layouts for now.")),
+        _ => Err(layout_unsupported("logical op", "requires matching layouts")),
     }
 }
 
 fn logical_leaf(_py: Python<'_>, a: &Leaf, b: &Leaf, op: LogicOp) -> PyResult<Leaf> {
     if a.len != b.len {
-        return Err(PyValueError::new_err("Leaf lengths differ."));
+        return Err(shape_mismatch(
+            "logical op",
+            format!("leaf length mismatch: {} vs {}", a.len, b.len),
+            "ensure both operands have the same number of elements.",
+        ));
     }
     let n = a.len;
     let mut out = new_bool_leaf(n);
@@ -108,8 +130,8 @@ fn logical_leaf(_py: Python<'_>, a: &Leaf, b: &Leaf, op: LogicOp) -> PyResult<Le
     for i in 0..n {
         out_valid.set(i, a.validity[i] && b.validity[i]);
     }
-    let aa = match &a.buffer { LeafBuffer::Bool(v) => v.as_slice(), _ => return Err(PyValueError::new_err("Expected bool leaf.")) };
-    let bb = match &b.buffer { LeafBuffer::Bool(v) => v.as_slice(), _ => return Err(PyValueError::new_err("Expected bool leaf.")) };
+    let aa = match &a.buffer { LeafBuffer::Bool(v) => v.as_slice(), _ => return Err(internal_dtype_buffer_mismatch("logical op", DType::Bool)) };
+    let bb = match &b.buffer { LeafBuffer::Bool(v) => v.as_slice(), _ => return Err(internal_dtype_buffer_mismatch("logical op", DType::Bool)) };
     let oo = match &mut out.buffer { LeafBuffer::Bool(v) => Arc::make_mut(v), _ => unreachable!() };
     for i in 0..n {
         if !out_valid[i] { continue; }
@@ -162,7 +184,7 @@ fn logical_not_leaf(_py: Python<'_>, a: &Leaf) -> PyResult<Leaf> {
     let mut out = new_bool_leaf(n);
     out.has_nulls = a.has_nulls;
     out.validity = a.validity.clone();
-    let aa = match &a.buffer { LeafBuffer::Bool(v) => v.as_slice(), _ => return Err(PyValueError::new_err("Expected bool leaf.")) };
+    let aa = match &a.buffer { LeafBuffer::Bool(v) => v.as_slice(), _ => return Err(internal_dtype_buffer_mismatch("logical_not", DType::Bool)) };
     let oo = match &mut out.buffer { LeafBuffer::Bool(v) => Arc::make_mut(v), _ => unreachable!() };
     for i in 0..n {
         if !a.validity[i] { continue; }
@@ -176,14 +198,22 @@ fn compare_layout(py: Python<'_>, a: &Layout, b: &Layout, dt: DType, op: CmpOp) 
         (Layout::Leaf(la), Layout::Leaf(lb)) => Ok(Layout::Leaf(compare_leaf(py, la, lb, dt, op)?)),
         (Layout::ListOffset(oa), Layout::ListOffset(ob)) => {
             if oa.offsets != ob.offsets || oa.len() != ob.len() {
-                return Err(PyValueError::new_err("Comparison requires identical ragged structure for now."));
+                return Err(shape_mismatch(
+                    "comparison",
+                    "requires identical ragged structure",
+                    "ensure both operands share the same list offsets.",
+                ));
             }
             let content = compare_layout(py, oa.content.as_ref(), ob.content.as_ref(), dt, op)?;
             Ok(Layout::ListOffset(ListOffset { offsets: oa.offsets.clone(), content: Box::new(content) }))
         }
         (Layout::UnionScalarList(ua), Layout::UnionScalarList(ub)) => {
             if ua.tags != ub.tags || ua.index != ub.index || ua.lists.offsets != ub.lists.offsets {
-                return Err(PyValueError::new_err("Comparison requires identical union structure."));
+                return Err(shape_mismatch(
+                    "comparison",
+                    "requires identical union structure",
+                    "ensure both operands share the same union tags, index, and list offsets.",
+                ));
             }
             let scalars = compare_leaf(py, &ua.scalars, &ub.scalars, dt, op)?;
             let list_content = compare_layout(py, ua.lists.content.as_ref(), ub.lists.content.as_ref(), dt, op)?;
@@ -196,7 +226,11 @@ fn compare_layout(py: Python<'_>, a: &Layout, b: &Layout, dt: DType, op: CmpOp) 
         }
         (Layout::OffsetView(va), Layout::OffsetView(vb)) => {
             if va.start != vb.start || va.stop != vb.stop || va.offsets != vb.offsets {
-                return Err(PyValueError::new_err("Comparison requires identical offset views."));
+                return Err(shape_mismatch(
+                    "comparison",
+                    "requires identical offset views",
+                    "ensure both operands use the same offset view bounds.",
+                ));
             }
             let content = compare_layout(py, va.content.as_ref(), vb.content.as_ref(), dt, op)?;
             Ok(Layout::OffsetView(crate::layout::OffsetView {
@@ -208,7 +242,11 @@ fn compare_layout(py: Python<'_>, a: &Layout, b: &Layout, dt: DType, op: CmpOp) 
         }
         (Layout::Indexed(ia), Layout::Indexed(ib)) => {
             if ia.index != ib.index {
-                return Err(PyValueError::new_err("Comparison requires identical index vectors."));
+                return Err(shape_mismatch(
+                    "comparison",
+                    "requires identical index vectors",
+                    "ensure both operands use the same fancy index.",
+                ));
             }
             let content = compare_layout(py, ia.content.as_ref(), ib.content.as_ref(), dt, op)?;
             Ok(Layout::Indexed(crate::layout::Indexed {
@@ -216,13 +254,17 @@ fn compare_layout(py: Python<'_>, a: &Layout, b: &Layout, dt: DType, op: CmpOp) 
                 content: Box::new(content),
             }))
         }
-        _ => Err(PyValueError::new_err("Comparison requires matching layouts for now.")),
+        _ => Err(layout_unsupported("comparison", "requires matching layouts")),
     }
 }
 
 fn compare_leaf(_py: Python<'_>, a: &Leaf, b: &Leaf, dt: DType, op: CmpOp) -> PyResult<Leaf> {
     if a.len != b.len {
-        return Err(PyValueError::new_err("Leaf lengths differ."));
+        return Err(shape_mismatch(
+            "comparison",
+            format!("leaf length mismatch: {} vs {}", a.len, b.len),
+            "ensure both operands have the same number of elements.",
+        ));
     }
     let n = a.len;
     let mut out = new_bool_leaf(n);
@@ -295,7 +337,7 @@ fn compare_leaf(_py: Python<'_>, a: &Leaf, b: &Leaf, dt: DType, op: CmpOp) -> Py
                 };
             }
         }
-        _ => return Err(PyValueError::new_err("Comparison not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("comparison", dt)),
     }
     Ok(out)
 }
@@ -370,7 +412,7 @@ fn pred_leaf(_py: Python<'_>, a: &Leaf, dt: DType, op: PredOp) -> PyResult<Leaf>
             let aa = match &a.buffer { LeafBuffer::F64(v) => v.as_slice(), _ => unreachable!() };
             for i in 0..n { if a.validity[i] { o[i] = aa[i].is_finite() as u8; } }
         }
-        _ => return Err(PyValueError::new_err("Predicate not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("predicate", dt)),
     }
     Ok(out)
 }

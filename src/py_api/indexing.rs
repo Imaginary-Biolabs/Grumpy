@@ -1,8 +1,8 @@
 use crate::dtype::DType;
 use crate::layout::{
     build_array, coord_to_leaf_index, drop_axis0_select_element, gather_2d_fancy_leaf,
-    gather_axis0_fancy, gather_coordinate_fancy_2d, index_by_coordinates, scatter_2d_fancy_i32,
-    scatter_2d_fancy_numeric, take_range, GrumpyArray, Layout, LeafBuffer,
+    gather_axis0_fancy, gather_coordinate_fancy_2d, index_by_coordinates, set_encoded_at_coord,
+    scatter_2d_fancy_i32, scatter_2d_fancy_numeric, take_range, GrumpyArray, Layout, LeafBuffer,
 };
 use crate::py_api::convert::{wrap_index_layout_result, wrap_result};
 use crate::py_api::types::PyGrumpyArray;
@@ -335,7 +335,10 @@ pub(crate) fn find_leaf_fast<'a>(layout: &'a Layout) -> PyResult<&'a crate::layo
         Layout::ListOffset(lo) => find_leaf_fast(lo.content.as_ref()),
         Layout::Indexed(ix) => find_leaf_fast(ix.content.as_ref()),
         Layout::OffsetView(v) => find_leaf_fast(v.content.as_ref()),
-        Layout::UnionScalarList(_) => Err(layout_unsupported("indexing", "UnionScalarList layouts are not supported yet")),
+        Layout::UnionScalarList(_) => Err(layout_unsupported(
+            "indexing",
+            "UnionScalarList leaf lookup without coordinates is not supported",
+        )),
     }
 }
 
@@ -345,6 +348,10 @@ pub(crate) fn fast_setitem(
     index: &Bound<'_, PyAny>,
     value: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
+    if arr.layout.has_union() {
+        return union_fast_setitem(py, arr, index, value);
+    }
+
     if !arr.is_pure_list_chain() {
         return Ok(false);
     }
@@ -498,13 +505,42 @@ pub(crate) fn fast_setitem(
     Ok(false)
 }
 
+fn union_fast_setitem(
+    py: Python<'_>,
+    arr: &mut GrumpyArray,
+    index: &Bound<'_, PyAny>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    if let Ok(tup) = index.downcast::<PyTuple>() {
+        if tup.is_empty() {
+            return Ok(false);
+        }
+        for i in 0..tup.len() {
+            let p = tup.get_item(i)?;
+            if p.downcast::<PySlice>().is_ok() || is_index_vec_like(py, &p)? {
+                return Ok(false);
+            }
+        }
+        let coords: Vec<i64> = (0..tup.len())
+            .map(|i| tup.get_item(i).unwrap().extract::<i64>())
+            .collect::<PyResult<_>>()?;
+        let (valid, bytes) = crate::layout::Leaf::encode_scalar(py, value, arr.dtype)?;
+        set_encoded_at_coord(&mut arr.layout, &coords, valid, &bytes)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn find_leaf_mut_fast<'a>(layout: &'a mut Layout) -> PyResult<&'a mut crate::layout::Leaf> {
     match layout {
         Layout::Leaf(l) => Ok(l),
         Layout::ListOffset(lo) => find_leaf_mut_fast(lo.content.as_mut()),
         Layout::Indexed(ix) => find_leaf_mut_fast(ix.content.as_mut()),
         Layout::OffsetView(v) => find_leaf_mut_fast(v.content.as_mut()),
-        Layout::UnionScalarList(_) => Err(layout_unsupported("indexing", "UnionScalarList layouts are not supported yet")),
+        Layout::UnionScalarList(_) => Err(layout_unsupported(
+            "indexing",
+            "UnionScalarList leaf lookup without coordinates is not supported",
+        )),
     }
 }
 

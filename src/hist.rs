@@ -1,8 +1,11 @@
 use crate::dtype::DType;
+use crate::error::{
+    arg_invalid, arg_must_be_positive, dtype_unsupported, internal, layout_unsupported, shape_mismatch,
+    unsupported,
+};
 use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -14,18 +17,34 @@ pub fn bincount(
 ) -> PyResult<GrumpyArray> {
     let leaf = leaf_1d(&x.layout)?;
     if leaf.has_nulls {
-        return Err(PyValueError::new_err("bincount does not support nulls."));
+        return Err(unsupported(
+            "bincount",
+            "does not support null values yet",
+            "filter nulls or use an all-valid array.",
+        ));
     }
     let wleaf = if let Some(w) = weights {
         if w.dtype != DType::Float64 && w.dtype != DType::Float32 {
-            return Err(PyValueError::new_err("bincount weights must be float32/float64."));
+            return Err(unsupported(
+                "bincount",
+                "weights must be float32 or float64",
+                "cast weights with .astype(gr.float64).",
+            ));
         }
         let wl = leaf_1d(&w.layout)?;
         if wl.has_nulls {
-            return Err(PyValueError::new_err("bincount weights must not contain nulls."));
+            return Err(unsupported(
+                "bincount",
+                "weights must not contain null values",
+                "filter nulls from weights or use an all-valid array.",
+            ));
         }
         if wl.len != leaf.len {
-            return Err(PyValueError::new_err("bincount weights length mismatch."));
+            return Err(shape_mismatch(
+                "bincount",
+                "weights length must match input length",
+                "pass weights with len(x).",
+            ));
         }
         Some((w.dtype, wl))
     } else {
@@ -38,7 +57,11 @@ pub fn bincount(
         (DType::Int32, LeafBuffer::I32(v)) => {
             for &a in v.as_slice().iter().take(leaf.len) {
                 if a < 0 {
-                    return Err(PyValueError::new_err("bincount input must be non-negative."));
+                    return Err(arg_invalid(
+                        "input",
+                        "values must be non-negative",
+                        "pass non-negative integer indices.",
+                    ));
                 }
                 maxv = maxv.max(a as i64);
             }
@@ -46,7 +69,11 @@ pub fn bincount(
         (DType::Int64, LeafBuffer::I64(v)) => {
             for &a in v.as_slice().iter().take(leaf.len) {
                 if a < 0 {
-                    return Err(PyValueError::new_err("bincount input must be non-negative."));
+                    return Err(arg_invalid(
+                        "input",
+                        "values must be non-negative",
+                        "pass non-negative integer indices.",
+                    ));
                 }
                 maxv = maxv.max(a);
             }
@@ -59,12 +86,16 @@ pub fn bincount(
         (DType::UInt64, LeafBuffer::U64(v)) => {
             for &a in v.as_slice().iter().take(leaf.len) {
                 if a > i64::MAX as u64 {
-                    return Err(PyValueError::new_err("bincount value too large."));
+                    return Err(arg_invalid(
+                        "input",
+                        "value exceeds the maximum supported bin index",
+                        "reduce input values or use a smaller dtype.",
+                    ));
                 }
                 maxv = maxv.max(a as i64);
             }
         }
-        _ => return Err(PyValueError::new_err("bincount only supports integer inputs.")),
+        _ => return Err(dtype_unsupported("bincount", x.dtype)),
     }
 
     let n = std::cmp::max(minlength, (maxv + 1).max(0) as usize);
@@ -119,11 +150,19 @@ pub fn digitize(_py: Python<'_>, x: &GrumpyArray, bins: &GrumpyArray, right: boo
     let xl = leaf_1d(&x.layout)?;
     let bl = leaf_1d(&bins.layout)?;
     if xl.has_nulls || bl.has_nulls {
-        return Err(PyValueError::new_err("digitize does not support nulls."));
+        return Err(unsupported(
+            "digitize",
+            "does not support null values yet",
+            "filter nulls or use all-valid arrays.",
+        ));
     }
     // Support float64 only for now (covers common stats usage).
     if x.dtype != DType::Float64 || bins.dtype != DType::Float64 {
-        return Err(PyValueError::new_err("digitize currently only supports float64 inputs."));
+        return Err(unsupported(
+            "digitize",
+            "currently only supports float64 inputs",
+            "cast x and bins with .astype(gr.float64).",
+        ));
     }
     let xv = match &xl.buffer { LeafBuffer::F64(v) => v.as_slice(), _ => unreachable!() };
     let bv = match &bl.buffer { LeafBuffer::F64(v) => v.as_slice(), _ => unreachable!() };
@@ -131,7 +170,11 @@ pub fn digitize(_py: Python<'_>, x: &GrumpyArray, bins: &GrumpyArray, right: boo
     // Verify monotonic increasing (like NumPy requirement).
     for i in 1..nb {
         if !(bv[i - 1] <= bv[i]) {
-            return Err(PyValueError::new_err("bins must be monotonically increasing."));
+            return Err(arg_invalid(
+                "bins",
+                "must be monotonically increasing",
+                "sort bin edges in ascending order.",
+            ));
         }
     }
     let mut out = new_leaf_i64(xl.len);
@@ -163,24 +206,36 @@ pub fn histogram(
 ) -> PyResult<(GrumpyArray, GrumpyArray)> {
     let xl = leaf_1d(&x.layout)?;
     if xl.has_nulls {
-        return Err(PyValueError::new_err("histogram does not support nulls."));
+        return Err(unsupported(
+            "histogram",
+            "does not support null values yet",
+            "filter nulls or use an all-valid array.",
+        ));
     }
     if bins == 0 {
-        return Err(PyValueError::new_err("bins must be > 0."));
+        return Err(arg_must_be_positive("bins", bins));
     }
     // float64 only for now.
     if x.dtype != DType::Float64 {
-        return Err(PyValueError::new_err("histogram currently only supports float64 inputs."));
+        return Err(dtype_unsupported("histogram", x.dtype));
     }
     let xv = match &xl.buffer { LeafBuffer::F64(v) => v.as_slice(), _ => unreachable!() };
 
     let w = if let Some(w) = weights {
         if w.dtype != DType::Float64 {
-            return Err(PyValueError::new_err("histogram weights must be float64 for now."));
+            return Err(unsupported(
+                "histogram",
+                "weights must be float64 for now",
+                "cast weights with .astype(gr.float64).",
+            ));
         }
         let wl = leaf_1d(&w.layout)?;
         if wl.has_nulls || wl.len != xl.len {
-            return Err(PyValueError::new_err("histogram weights must be same length and all-valid."));
+            return Err(shape_mismatch(
+                "histogram",
+                "weights must be same length and all-valid",
+                "pass weights with len(x) and no nulls.",
+            ));
         }
         Some(match &wl.buffer { LeafBuffer::F64(v) => v.as_slice(), _ => unreachable!() })
     } else {
@@ -206,12 +261,20 @@ pub fn histogram(
             }
         }
         if !mn.is_finite() || !mx.is_finite() {
-            return Err(PyValueError::new_err("histogram: could not infer range."));
+            return Err(arg_invalid(
+                "range",
+                "could not infer from all-NaN or empty data",
+                "pass range=(lo, hi) explicitly.",
+            ));
         }
         (mn, mx)
     };
     if !(lo < hi) {
-        return Err(PyValueError::new_err("histogram range must satisfy lo < hi."));
+        return Err(arg_invalid(
+            "range",
+            "must satisfy lo < hi",
+            "pass range with lo strictly less than hi.",
+        ));
     }
     let width = (hi - lo) / (bins as f64);
 
@@ -270,8 +333,8 @@ fn leaf_1d<'a>(layout: &'a Layout) -> PyResult<&'a Leaf> {
         Layout::Leaf(l) => Ok(l),
         Layout::OffsetView(v) => leaf_1d(v.content.as_ref()),
         Layout::Indexed(ix) => leaf_1d(ix.content.as_ref()),
-        Layout::ListOffset(_) => Err(PyValueError::new_err("Expected 1D leaf array.")),
-        Layout::UnionScalarList(_) => Err(PyValueError::new_err("Union not supported.")),
+        Layout::ListOffset(_) => Err(layout_unsupported("hist", "expected a 1D leaf array")),
+        Layout::UnionScalarList(_) => Err(layout_unsupported("hist", "union arrays are not supported here")),
     }
 }
 
@@ -346,7 +409,7 @@ fn add_weights(v: &[i32], n: usize, w: (DType, &Leaf), out: &mut [f64]) -> PyRes
                 out[v[i] as usize] += wv[i] as f64;
             }
         }
-        _ => return Err(PyValueError::new_err("Invalid weights dtype.")),
+        _ => return Err(internal("bincount", "invalid weights dtype in weighted accumulation")),
     }
     Ok(())
 }
@@ -363,7 +426,7 @@ fn add_weights_i64(v: &[i64], n: usize, w: (DType, &Leaf), out: &mut [f64]) -> P
                 out[v[i] as usize] += wv[i] as f64;
             }
         }
-        _ => return Err(PyValueError::new_err("Invalid weights dtype.")),
+        _ => return Err(internal("bincount", "invalid weights dtype in weighted accumulation")),
     }
     Ok(())
 }
@@ -380,7 +443,7 @@ fn add_weights_u32(v: &[u32], n: usize, w: (DType, &Leaf), out: &mut [f64]) -> P
                 out[v[i] as usize] += wv[i] as f64;
             }
         }
-        _ => return Err(PyValueError::new_err("Invalid weights dtype.")),
+        _ => return Err(internal("bincount", "invalid weights dtype in weighted accumulation")),
     }
     Ok(())
 }
@@ -397,7 +460,7 @@ fn add_weights_u64(v: &[u64], n: usize, w: (DType, &Leaf), out: &mut [f64]) -> P
                 out[v[i] as usize] += wv[i] as f64;
             }
         }
-        _ => return Err(PyValueError::new_err("Invalid weights dtype.")),
+        _ => return Err(internal("bincount", "invalid weights dtype in weighted accumulation")),
     }
     Ok(())
 }

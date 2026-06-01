@@ -1,8 +1,8 @@
 use crate::dtype::DType;
+use crate::error::dtype_unsupported;
 use crate::layout::{GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -37,12 +37,12 @@ fn unary_out_dtype(dt: DType, op: UnaryOp) -> PyResult<DType> {
         UnaryOp::Angle => match dt {
             DType::Float32 | DType::Float64 => Ok(dt),
             DType::Int32 | DType::Int64 => Ok(DType::Float64),
-            _ => Err(PyValueError::new_err("angle only supported for numeric dtypes.")),
+            _ => Err(dtype_unsupported("angle", dt)),
         },
         _ => match dt {
             DType::Float32 | DType::Float64 => Ok(dt),
             DType::Int32 | DType::Int64 => Ok(DType::Float64),
-            _ => Err(PyValueError::new_err("Unary op only supported for numeric dtypes.")),
+            _ => Err(dtype_unsupported("unary", dt)),
         },
     }
 }
@@ -95,7 +95,7 @@ fn new_out_leaf(n: usize, out_dt: DType) -> PyResult<Leaf> {
         DType::Int64 => LeafBuffer::I64(Arc::new(vec![0i64; n])),
         DType::Float32 => LeafBuffer::F32(Arc::new(vec![0f32; n])),
         DType::Float64 => LeafBuffer::F64(Arc::new(vec![0f64; n])),
-        _ => return Err(PyValueError::new_err("Unsupported dtype for unary op.")),
+        _ => return Err(dtype_unsupported("unary", out_dt)),
     };
     Ok(out)
 }
@@ -329,7 +329,7 @@ fn unary_leaf(_py: Python<'_>, leaf: &Leaf, in_dt: DType, out_dt: DType, op: Una
                 let o = Arc::make_mut(o);
                 for i in 0..n { o[i] = if a[i] < 0 { std::f64::consts::PI } else { 0.0 }; }
             }
-            _ => return Err(PyValueError::new_err("Unary op not implemented for this dtype.")),
+            _ => return Err(dtype_unsupported("unary", in_dt)),
         }
         return Ok(out);
     }
@@ -371,7 +371,7 @@ fn unary_leaf(_py: Python<'_>, leaf: &Leaf, in_dt: DType, out_dt: DType, op: Una
             let o = Arc::make_mut(o);
             for i in 0..n { o[i] = if leaf.validity[i] { a[i].wrapping_abs() } else { 0 }; }
         }
-        _ => return Err(PyValueError::new_err("Null-aware unary op not implemented for this dtype.")),
+        _ => return Err(dtype_unsupported("null-aware unary", in_dt)),
     }
     Ok(out)
 }

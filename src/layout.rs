@@ -1563,6 +1563,68 @@ fn coord_to_leaf_index_union(u: &UnionScalarList, coords: &[i64]) -> PyResult<us
     }
 }
 
+/// Set a scalar value at coordinate indices (mutable coordinate assignment).
+pub fn set_encoded_at_coord(
+    layout: &mut Layout,
+    coords: &[i64],
+    valid: bool,
+    bytes: &[u8],
+) -> PyResult<()> {
+    let ix = coord_to_leaf_index(layout, coords)?;
+    let leaf = match layout {
+        Layout::UnionScalarList(u) => {
+            if coords.is_empty() {
+                return Err(shape_mismatch(
+                    "coordinate assignment",
+                    "coordinate length does not match array depth",
+                    "pass one coordinate per nesting axis plus the leaf axis.",
+                ));
+            }
+            let outer = normalize_index(coords[0], u.len() as i64)?;
+            match u.tags[outer] {
+                0 => &mut u.scalars,
+                1 => match u.lists.content.as_mut() {
+                    Layout::Leaf(l) => l,
+                    Layout::ListOffset(lo) => match lo.content.as_mut() {
+                        Layout::Leaf(l) => l,
+                        _ => {
+                            return Err(layout_unsupported(
+                                "assignment",
+                                "coordinate assignment into nested union lists beyond list->leaf is not supported",
+                            ));
+                        }
+                    },
+                    _ => {
+                        return Err(layout_unsupported(
+                            "assignment",
+                            "union list branch has unsupported content layout",
+                        ));
+                    }
+                },
+                _ => return Err(internal("union element", "invalid union tag")),
+            }
+        }
+        Layout::ListOffset(lo) => match lo.content.as_mut() {
+            Layout::Leaf(l) => l,
+            _ => {
+                return Err(layout_unsupported(
+                    "assignment",
+                    "coordinate assignment on nested list chains beyond list->leaf is not supported",
+                ));
+            }
+        },
+        Layout::Leaf(l) => l,
+        _ => {
+            return Err(layout_unsupported(
+                "assignment",
+                "mutable coordinate indexing is not supported on this layout/view",
+            ));
+        }
+    };
+    leaf.set_encoded(ix, valid, bytes)?;
+    Ok(())
+}
+
 fn normalize_index(i: i64, len: i64) -> PyResult<usize> {
     if len < 0 {
         return Err(internal("normalize_index", "negative length"));

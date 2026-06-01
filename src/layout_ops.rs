@@ -2,8 +2,8 @@
 
 use crate::dtype::DType;
 use crate::error::{
-    concat_incompatible, dtype_mismatch, internal, internal_dtype_buffer_mismatch, layout_unsupported,
-    shape_mismatch,
+    arg_invalid, concat_incompatible, dtype_mismatch, internal, internal_dtype_buffer_mismatch,
+    layout_unsupported, shape_mismatch,
 };
 use crate::layout::{
     drop_axis0_select_element, leaf_view, stack_axis0_broadcast, GrumpyArray, Indexed, Layout,
@@ -11,7 +11,6 @@ use crate::layout::{
 };
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -262,7 +261,7 @@ fn concat_union_scalar_lists_axis0(layouts: &[Layout]) -> PyResult<Layout> {
             all_index.push(match u.tags[i] {
                 0 => scalar_base + u.index[i],
                 1 => list_base + u.index[i],
-                _ => return Err(PyValueError::new_err("Invalid union tag.")),
+                _ => return Err(internal("concat_axis0", "invalid union tag")),
             });
         }
         scalar_base += u.scalars.len as i64;
@@ -421,7 +420,11 @@ pub fn concat_axis0_layouts(layouts: &[Layout]) -> PyResult<Layout> {
 /// Concatenate arrays along the given axis (layout-native, no Python round-trip).
 pub fn concat_arrays(arrays: &[GrumpyArray], dim: usize) -> PyResult<GrumpyArray> {
     if arrays.is_empty() {
-        return Err(PyValueError::new_err("cat() requires at least one array."));
+        return Err(arg_invalid(
+            "arrays",
+            "cat() requires at least one array",
+            "pass one or more Grumpy arrays to concatenate.",
+        ));
     }
     let dtype = arrays[0].dtype;
     for a in &arrays[1..] {

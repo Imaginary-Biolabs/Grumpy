@@ -598,13 +598,17 @@ fn reduce_out_dtype(in_dt: DType, op: ReduceOp) -> PyResult<DType> {
             | DType::UInt32
             | DType::UInt64
             | DType::Bool => Ok(DType::Int64),
-            DType::Char | DType::String => Err(PyValueError::new_err(
-                "sum/mean are only supported for numeric dtypes.",
+            DType::Char | DType::String => Err(unsupported(
+                "reduce",
+                "sum/mean are only supported for numeric dtypes",
+                "cast to a numeric dtype before reducing.",
             )),
         },
         ReduceOp::Min | ReduceOp::Max | ReduceOp::Ptp => match in_dt {
-            DType::Char | DType::String => Err(PyValueError::new_err(
-                "min/max/ptp are only supported for numeric dtypes.",
+            DType::Char | DType::String => Err(unsupported(
+                "reduce",
+                "min/max/ptp are only supported for numeric dtypes",
+                "cast to a numeric dtype before reducing.",
             )),
             _ => Ok(in_dt),
         },
@@ -612,7 +616,7 @@ fn reduce_out_dtype(in_dt: DType, op: ReduceOp) -> PyResult<DType> {
 }
 
 fn reduce_list_chain_to_layout(
-    py: Python<'_>,
+    _py: Python<'_>,
     layout: &Layout,
     in_dt: DType,
     out_dt: DType,
@@ -620,115 +624,8 @@ fn reduce_list_chain_to_layout(
     axis: usize,
     op: ReduceOp,
 ) -> PyResult<Layout> {
-    // depth >= 2 here.
-    let lo = match layout {
-        Layout::ListOffset(lo) => lo,
-        _ => return Err(internal("reduce", "expected ListOffset at top")),
-    };
-
-    if axis == 0 {
-        return reduce_axis0_listoffset(py, lo, in_dt, out_dt, depth, op);
-    }
-    reduce_axis_gt0_listoffset(py, lo, in_dt, out_dt, depth, axis, op)
-}
-
-fn reduce_axis_gt0_listoffset(
-    py: Python<'_>,
-    lo: &crate::layout::ListOffset,
-    in_dt: DType,
-    out_dt: DType,
-    depth: usize,
-    axis: usize,
-    op: ReduceOp,
-) -> PyResult<Layout> {
-    // Reduce inside each element independently (axis-1 on the element).
-    let n = lo.len();
-    let mut elems: Vec<Layout> = Vec::with_capacity(n);
-    for i in 0..n {
-        let el = crate::layout::drop_axis0_select_element(&Layout::ListOffset(lo.clone()), i)?;
-        let el_depth = depth - 1;
-        let reduced = if el_depth == 0 {
-            // scalar leaf: only axis=0 is valid
-            if axis - 1 != 0 {
-                return Err(dim_out_of_range(axis as isize, depth));
-            }
-            let s = reduce_leaf_to_scalar(py, &el, in_dt, op)?;
-            scalar_py_to_leaf(out_dt, py, &s)?
-        } else if el_depth == 1 {
-            // 2D inside element
-            let arr = GrumpyArray { dtype: in_dt, layout: el };
-            match axis - 1 {
-                0 => reduce_2d_dim0_to_leaf(&arr.layout, in_dt, op)?.layout,
-                1 => reduce_2d_dim1_to_leaf(&arr.layout, in_dt, op)?.layout,
-                _ => return Err(dim_out_of_range(axis as isize, depth)),
-            }
-        } else {
-            reduce_list_chain_to_layout(py, &el, in_dt, out_dt, el_depth, axis - 1, op)?
-        };
-        elems.push(reduced);
-    }
-    stack_elements_as_list(out_dt, &elems)
-}
-
-fn reduce_axis0_listoffset(
-    py: Python<'_>,
-    lo: &crate::layout::ListOffset,
-    in_dt: DType,
-    out_dt: DType,
-    depth: usize,
-    op: ReduceOp,
-) -> PyResult<Layout> {
-    // Reduce across axis0 by positional alignment (Awkward-like): missing positions are skipped.
-    // For depth==2, use existing 2D dim0 kernel (already Awkward-like after our semantic tweak below).
-    if depth == 1 {
-        return Ok(reduce_2d_dim0_to_leaf(&Layout::ListOffset(lo.clone()), in_dt, op)?.layout);
-    }
-
-    let nrows = lo.len();
-    let mut maxlen: usize = 0;
-    for i in 0..nrows {
-        let len_i = (lo.offsets[i + 1] - lo.offsets[i]) as usize;
-        if len_i > maxlen {
-            maxlen = len_i;
-        }
-    }
-
-    let mut reduced_cols: Vec<Layout> = Vec::with_capacity(maxlen);
-    for j in 0..maxlen {
-        // Collect the j-th child from each row that has it.
-        let mut children: Vec<Layout> = Vec::new();
-        for i in 0..nrows {
-            let start = lo.offsets[i] as usize;
-            let end = lo.offsets[i + 1] as usize;
-            if start + j < end {
-                let idx = start + j;
-                let child = crate::layout::drop_axis0_select_element(lo.content.as_ref(), idx)?;
-                children.push(child);
-            }
-        }
-        if children.is_empty() {
-            // No values in this column: represent as null scalar.
-            reduced_cols.push(scalar_null_leaf(out_dt));
-            continue;
-        }
-
-        // Stack children as a list and reduce its axis0.
-        let stacked = build_stack_layout(&children)?;
-        let stacked_depth = depth - 1;
-        let reduced_j = if stacked_depth == 0 {
-            let s = reduce_leaf_to_scalar(py, &stacked, in_dt, op)?;
-            scalar_py_to_leaf(out_dt, py, &s)?
-        } else if stacked_depth == 1 {
-            // 2D case within recursion
-            let arr = GrumpyArray { dtype: in_dt, layout: stacked };
-            reduce_2d_dim0_to_leaf(&arr.layout, in_dt, op)?.layout
-        } else {
-            reduce_list_chain_to_layout(py, &stacked, in_dt, out_dt, stacked_depth, 0, op)?
-        };
-        reduced_cols.push(reduced_j);
-    }
-
-    stack_elements_as_list(out_dt, &reduced_cols)
+    // Deep reductions share the no-GIL engine (numeric leaf stacking via ScalarValue).
+    reduce_list_chain_to_layout_nogil(layout, in_dt, out_dt, depth, axis, op)
 }
 
 fn scalar_null_leaf(dt: DType) -> Layout {
@@ -753,32 +650,6 @@ fn scalar_null_leaf(dt: DType) -> Layout {
         DType::String => LeafBuffer::String(Arc::new(vec![String::new()])),
     };
     Layout::Leaf(leaf)
-}
-
-fn scalar_py_to_leaf(dt: DType, py: Python<'_>, obj: &PyObject) -> PyResult<Layout> {
-    // Convert a Python scalar/None into a single-element leaf layout with dtype=dt.
-    let mut leaf = Leaf::new(dt);
-    leaf.len = 0;
-    if obj.bind(py).is_none() {
-        leaf.push_null();
-        return Ok(Layout::Leaf(leaf));
-    }
-    // Reuse encode_scalar for numeric types (string/char handled by push_scalar on build path, but not here).
-    match dt {
-        DType::String | DType::Char => {
-            // Slow but correct: build via python list.
-            let out = crate::layout::build_array(py, &pyo3::types::PyList::new_bound(py, [obj.clone_ref(py)]).into_any(), dt)?;
-            return Ok(out.layout);
-        }
-        _ => {
-            let (valid, bytes) = Leaf::encode_scalar(py, &obj.bind(py), dt)?;
-            leaf.push_value(&bytes)?;
-            if !valid {
-                leaf.has_nulls = true;
-            }
-            Ok(Layout::Leaf(leaf))
-        }
-    }
 }
 
 fn stack_elements_as_list(dt: DType, elems: &[Layout]) -> PyResult<Layout> {
