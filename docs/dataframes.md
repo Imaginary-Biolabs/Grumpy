@@ -94,6 +94,63 @@ edges = gr.neighbors(coords, coords, k=2, dim=1, loop=False)
 
 Compiled pipelines can fuse dataframe dot-assignments such as `batch.residue.center = batch.residue.coords.mean(dim=1)` — see [Compilation](compilation.md).
 
+## Schema indexing
+
+When a dataframe is constructed with `schema=`, indexing **subsets one schema level at a time** and preserves the original nested column structure. Drill down by chaining accessors or repeated `[]` on the dataframe.
+
+### Single-level subset (`df[...]`)
+
+At each step, pass one index at the **current** schema level: int, slice, fancy list, or boolean mask.
+
+```python
+df = gr.dataframe(
+    {
+        "scene_id": ["S0", "S1"],
+        "molecule_id": [["M0", "M1"], ["M2"]],
+        "residue_name": [[["A", "B"], ["C"]], [["D", "E"]]],
+        "atom_number": [[[[1, 2], [3]], [[4, 5, 6]]], [[[7, 8], [9]]]],
+    },
+    schema=["scene", "molecule", "residue", "atom"],
+)
+
+# Subset scenes 0 and 1 (fancy at the outermost level)
+sub = df[[0, 1]]
+# or: sub = df.scene[[0, 1]]
+
+# Drill down: scene 0, then molecule 1
+sub = df.scene[0].molecule[1]
+```
+
+Multi-level tuples (`df[i, j]`), nested lists, `:` / `...` skip-level indexing, and coordinate-fancy zip across levels are **not** supported. To combine two coordinate selections, index twice and work with two separate dataframes.
+
+Column selection by string is unchanged: `df["col"]`, `df["a", "b"]`.
+
+Without `schema=`, a single int/slice/bool index still selects **axis-0 rows** as before (`df[:2]`, `df[[True, False]]`).
+
+### Drill-down accessors (`df.level[i].level[j]`)
+
+Attribute access on schema level names composes with single-level indexing:
+
+```python
+sub = df.scene[0].molecule[1]
+fancy = df.scene[[0, 1]]   # same as df[[0, 1]] on the root dataframe
+```
+
+Shallow columns (e.g. `scene_id` at scene depth only) broadcast as length-1 scalars once outer levels are narrowed. Deeper columns keep their nested structure; fancy/slice/bool subsetting uses `Indexed`/`OffsetView` wrappers rather than materializing new layout stacks.
+
+`len(df)` after drill-down reflects the logical row count at the current schema depth (the minimum outer axis length across columns). Use drill-down accessors (`df.scene`, `df.molecule`, …) when you need the per-column view at a specific nesting level.
+
+### Semantics summary
+
+| Form | Meaning |
+|------|---------|
+| `df[i]` | Subset entity `i` at the current schema level |
+| `df[[i, j]]` | Fancy subset at the current schema level |
+| `df.scene[i].molecule[j]` | Drill-down: subset scene, then molecule |
+| `df[i, j]` | Not supported (use chained indexing) |
+| `df[:1]` (with schema) | Slice at the current schema level |
+| `df[:1]` (no schema) | Axis-0 row slice (unchanged) |
+
 ## Schema
 
 An optional **schema** lists nesting level names. It enforces that columns sharing a prefix have compatible outer list offsets (for list-chain columns) and consistent **outer length** (including union columns).

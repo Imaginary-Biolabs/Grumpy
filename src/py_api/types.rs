@@ -28,6 +28,7 @@ pub struct PyDataFrameAccessor {
     pub(crate) parent: Py<PyGrumpyDataFrame>,
     // Schema levels path, e.g. ["residue"] or ["molecule","residue"].
     pub(crate) path: Vec<String>,
+    pub(crate) index_level: usize,
 }
 
 #[derive(Clone, Debug)]

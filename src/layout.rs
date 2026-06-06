@@ -358,6 +358,10 @@ impl LeafBuffer {
             (LeafBuffer::F64(o), LeafBuffer::F64(s)) => { Arc::make_mut(o).push(s[idx]); Ok(()) }
             (LeafBuffer::Bool(o), LeafBuffer::Bool(s)) => { Arc::make_mut(o).push(s[idx]); Ok(()) }
             (LeafBuffer::Char(o), LeafBuffer::Char(s)) => { Arc::make_mut(o).push(s[idx]); Ok(()) }
+            (LeafBuffer::String(o), LeafBuffer::String(s)) => {
+                Arc::make_mut(o).push(s[idx].clone());
+                Ok(())
+            }
             _ => Err(internal("push_from_index", "dtype mismatch in leaf buffer")),
         }
     }

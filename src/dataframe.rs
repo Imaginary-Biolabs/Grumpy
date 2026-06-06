@@ -108,6 +108,8 @@ pub struct GrumpyDataFrame {
     pub cols: Vec<GrumpyArray>,
     pub schema: Option<Schema>,
     pub canon: CanonShape,
+    /// Schema nesting depth corresponding to the current axis-0 (0 = outermost schema level).
+    pub index_depth: usize,
 }
 
 impl GrumpyDataFrame {
@@ -115,8 +117,38 @@ impl GrumpyDataFrame {
         if names.len() != cols.len() {
             return Err(internal("GrumpyDataFrame::new", "names/cols length mismatch"));
         }
-        let mut df = Self { names, cols, schema, canon: CanonShape::default() };
+        let mut df = Self {
+            names,
+            cols,
+            schema,
+            canon: CanonShape::default(),
+            index_depth: 0,
+        };
         df.recompute_canon()?;
+        Ok(df)
+    }
+
+    /// Intermediate schema-index step; shallow and deep columns may differ in outer length until final alignment.
+    pub fn from_schema_index_step(
+        names: Vec<String>,
+        cols: Vec<GrumpyArray>,
+        schema: Option<Schema>,
+        index_depth: usize,
+    ) -> PyResult<Self> {
+        if names.len() != cols.len() {
+            return Err(internal(
+                "GrumpyDataFrame::from_schema_index_step",
+                "names/cols length mismatch",
+            ));
+        }
+        let mut df = Self {
+            names,
+            cols,
+            schema,
+            canon: CanonShape::default(),
+            index_depth,
+        };
+        df.recompute_canon_permissive()?;
         Ok(df)
     }
 
@@ -362,6 +394,37 @@ impl GrumpyDataFrame {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn recompute_canon_permissive(&mut self) -> PyResult<()> {
+        if self.cols.is_empty() {
+            self.canon = CanonShape::default();
+            return Ok(());
+        }
+        // After schema drill-down, shallow columns may be length-1 broadcasts while deeper
+        // columns retain inner lists; use min outer length as the logical row count.
+        let nrows = if self.index_depth > 0 {
+            self.cols.iter().map(|c| c.len()).min().unwrap_or(0)
+        } else {
+            self.cols.iter().map(|c| c.len()).max().unwrap_or(0)
+        };
+        self.canon.nrows = Some(nrows);
+        if let Some(schema) = &self.schema {
+            let nlev = schema.levels.len();
+            let mut offsets: Vec<Option<Vec<i64>>> = vec![None; nlev];
+            for c in &self.cols {
+                let ndim = crate::layout::layout_ndim(&c.layout)?;
+                for lev in 1..std::cmp::min(nlev, ndim) {
+                    if offsets[lev].is_none() {
+                        offsets[lev] = offsets_at_level(&c.layout, lev)?;
+                    }
+                }
+            }
+            self.canon.offsets = offsets;
+        } else {
+            self.canon.offsets.clear();
         }
         Ok(())
     }

@@ -19,6 +19,7 @@ mod neighbors;
 mod geometry;
 mod gpu;
 mod dataframe;
+mod dataframe_indexing;
 mod io;
 mod io_cache;
 mod random;
