@@ -261,7 +261,7 @@ fn select_axis0_indexed(layout: &Layout, indices: &[i64]) -> PyResult<Layout> {
     }))
 }
 
-fn selector_indices(sel: &LevelSelector) -> PyResult<Vec<i64>> {
+pub fn selector_indices(sel: &LevelSelector) -> PyResult<Vec<i64>> {
     match sel {
         LevelSelector::Fancy(idxs) => Ok(idxs.clone()),
         LevelSelector::BoolMask(mask) => {
@@ -307,13 +307,8 @@ pub fn select_axis0_relative(df: &GrumpyDataFrame, sel: LevelSelector) -> PyResu
             .and_then(|s| s.level_for_column(name).ok());
         let layout = match &sel {
             LevelSelector::One(i) => {
-                if col.layout.len() == 1 {
-                    if is_scalar_terminal(&col.layout) {
-                        col.layout.clone()
-                    } else {
-                        normalize_index(*i, 1)?;
-                        col.layout.clone()
-                    }
+                if col.layout.len() == 1 && is_scalar_terminal(&col.layout) {
+                    col.layout.clone()
                 } else {
                     let elem = select_one(&col.layout, *i)?;
                     if should_wrap_deep_leaf_segment(

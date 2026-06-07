@@ -340,11 +340,19 @@ pub fn io_failed(summary: impl Into<String>, cause: impl Into<String>, fix: impl
         .value_err()
 }
 
+pub fn io_closed(path: &str) -> PyErr {
+    io_failed(
+        format!("OpenDataFrame('{path}') is closed"),
+        "this lazy dataset handle was closed and can no longer be used for I/O.",
+        "open the path again with gr.open(...) or use a with gr.open(...) as handle block.",
+    )
+}
+
 pub fn io_wrong_type(expected: &str, path: &str) -> PyErr {
     io_failed(
         format!("{path} is not a saved Grumpy {expected}"),
         format!("grumpy.json at this path describes a different root type than {expected}."),
-        format!("use gr.load(...) for arrays/dataframes, or gr.stream(...) for batched reads."),
+        format!("use gr.load(...) for arrays/dataframes, or gr.open(...) for lazy dataframe access."),
     )
 }
 

@@ -144,23 +144,18 @@ def test_protein_like_residue_center_transform_and_assignment():
     assert isinstance(got, list)
 
 
-def test_stream_apply_compiled_protein_like_residue_center():
+def test_compile_protein_like_residue_center():
     df = _make_protein_like_df(n_scenes=1, mols_per_scene=2, chains_per_mol=1, residues_per_chain=8)
 
     def transform(batch):
-        # Compilable df RHS: batch.residue.atom_pos0.mean(dim=1)
         batch.residue.residue_center = batch.residue.atom_pos0.mean(dim=1)
         return batch
 
     with tempfile.TemporaryDirectory() as td:
         path = td + "/prot.gr"
         gr.save(df, path, chunk_size=64)
-        st = gr.stream(path, batch_size=1, drop_last=False)
-
-        # Force compile + rust scheduler (should work now for df_get/reduce_tmp/df_set).
-        out = list(st.apply([transform], cpu=2, compile=True, scheduler="auto"))
-        assert len(out) == len(st)
-        d0 = out[0].to_dict()
+        out = gr.compile(transform)(gr.load(path))
+        d0 = out.to_dict()
         assert "residue_center" in d0
 
 

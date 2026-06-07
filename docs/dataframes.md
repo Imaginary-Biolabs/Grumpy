@@ -140,6 +140,26 @@ Shallow columns (e.g. `scene_id` at scene depth only) broadcast as length-1 scal
 
 `len(df)` after drill-down reflects the logical row count at the current schema depth (the minimum outer axis length across columns). Use drill-down accessors (`df.scene`, `df.molecule`, …) when you need the per-column view at a specific nesting level.
 
+## Shape (`df.shape(dim=…)`)
+
+Dataframes expose the same **per-axis entity counts** as arrays, using canonical shape metadata (persisted in `grumpy.json` on save) and resident column layouts after indexing:
+
+```python
+df = gr.dataframe({...}, schema=["scene", "molecule", "residue", "atom"])
+
+df.shape(dim=0)              # scenes (outer axis at current depth)
+df.shape(dim="molecule")     # molecules per scene — nested int64 array
+df.shape(dim=1).to_list()    # same as named level when index_depth=0
+
+sub = df.scene[0]
+sub.shape(dim=0)             # molecules in scene 0
+sub.shape(dim="residue")     # residues per molecule
+```
+
+`dim` may be a non-negative integer (relative to the current nesting context) or a **schema level name**. `nshape` ignores nulls at the target axis (like arrays).
+
+On `gr.open`, `shape` reads from stored canon metadata without loading leaf buffers.
+
 ### Semantics summary
 
 | Form | Meaning |
@@ -177,4 +197,4 @@ Schema violations raise `grumpy.SchemaViolation` with a concrete `fix:` — see 
 
 ---
 
-**Next:** [Saving and loading](saving-loading.md) — persist dataframes to Zarr and stream batches through transforms.
+**Next:** [Saving and loading](saving-loading.md) — persist dataframes to Zarr and lazy `gr.open` access.

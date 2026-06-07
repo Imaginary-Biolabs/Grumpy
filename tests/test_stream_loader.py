@@ -1,8 +1,6 @@
-"""Tests for ML dataloader / streaming features (partial I/O, batch_on, shuffle, DDP)."""
+"""Tests for partial I/O helpers (load_slice) retained after stream removal."""
 
 from __future__ import annotations
-
-import pytest
 
 import grumpy as gr
 
@@ -31,21 +29,6 @@ def _make_protein_like_df(n_scenes=4, mols_per_scene=3, chains_per_mol=1, residu
         {"scene_id": scene_id, "molecule_id": molecule_id, "atom_number": atom_number},
         schema=schema,
     )
-
-
-def _batch_ranges(st):
-    """Collect axis-0 row counts per batch via scene_id column when present."""
-    out = []
-    for batch in st:
-        if hasattr(batch, "to_dict"):
-            d = batch.to_dict()
-            if "scene_id" in d:
-                out.append(len(d["scene_id"]))
-            else:
-                out.append(len(batch))
-        else:
-            out.append(len(batch))
-    return out
 
 
 def test_load_slice_parity_array(tmp_path):
@@ -83,262 +66,20 @@ def test_partial_io_reads_leaf_data(tmp_path):
     gr.save(x, path, chunk_size=64)
 
     gr._core.reset_io_bytes_read()
-    batches = list(gr.stream(path, batch_size=32))
+    partial = gr._core.load_slice(path, 0, 32)
     partial_bytes = gr._core.io_bytes_read()
-    assert len(batches) == 16
+    assert len(partial) == 32
     assert partial_bytes > 0
 
     gr._core.reset_io_bytes_read()
     gr._core.clear_path_caches()
     gr._core.load_slice(path, 0, 500)
     full_slice_bytes = gr._core.io_bytes_read()
-    assert partial_bytes <= full_slice_bytes * 2
+    assert partial_bytes < full_slice_bytes
 
 
-def test_stream_len_axis0(tmp_path):
+def test_stored_len(tmp_path):
     x = gr.array(list(range(10)), dtype=gr.int64)
     path = str(tmp_path / "a.gr")
     gr.save(x, path)
-    assert len(gr.stream(path, batch_size=4)) == 3
-    assert len(gr.stream(path, batch_size=4, drop_last=True)) == 2
-
-
-def test_stream_batches_match_manual_slices(tmp_path):
-    x = gr.array([[float(i)] for i in range(7)], dtype=gr.float64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path, chunk_size=2)
-    st = gr.stream(path, batch_size=3, drop_last=False)
-    got = [b.to_list() for b in st]
-    assert got == [[[0.0], [1.0], [2.0]], [[3.0], [4.0], [5.0]], [[6.0]]]
-
-
-def test_batch_on_molecule_packs_scenes(tmp_path):
-    df = _make_protein_like_df(n_scenes=4, mols_per_scene=2)
-    path = str(tmp_path / "prot.gr")
-    gr.save(df, path, chunk_size=16)
-    # 4 scenes * 2 molecules; batch_size=3 -> [2 scenes, 2 scenes]
-    st = gr.stream(path, batch_size=3, batch_on="molecule")
-    assert len(st) == 2
-    counts = _batch_ranges(st)
-    assert counts == [2, 2]
-
-
-def test_batch_on_entity_counts(tmp_path):
-    df = _make_protein_like_df(n_scenes=3, mols_per_scene=4)
-    path = str(tmp_path / "prot.gr")
-    gr.save(df, path)
-    st = gr.stream(path, batch_size=5, batch_on="molecule", drop_last=False)
-    # per scene: 4 molecules -> batches: scenes 0+1 (8 mols), scene 2 (4 mols)
-    assert len(st) == 2
-    assert _batch_ranges(st) == [2, 1]
-
-
-def test_shuffle_batch_order_reproducible(tmp_path):
-    x = gr.array(list(range(40)), dtype=gr.int64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path, chunk_size=8)
-    st1 = gr.stream(path, batch_size=10, shuffle=True, seed=42)
-    st2 = gr.stream(path, batch_size=10, shuffle=True, seed=42)
-    a = [b.to_list() for b in st1]
-    b = [b.to_list() for b in st2]
-    assert a == b
-    assert a != [list(range(i, i + 10)) for i in range(0, 40, 10)]
-
-
-def test_shuffle_different_seeds_differ(tmp_path):
-    x = gr.array(list(range(40)), dtype=gr.int64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path)
-    a = [b.to_list() for b in gr.stream(path, batch_size=10, shuffle=True, seed=1)]
-    b = [b.to_list() for b in gr.stream(path, batch_size=10, shuffle=True, seed=2)]
-    assert a != b
-
-
-def test_shuffle_requires_seed(tmp_path):
-    x = gr.array(list(range(10)), dtype=gr.int64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path)
-    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
-        gr.stream(path, batch_size=4, shuffle=True)
-
-
-def test_ddp_partition_covers_all_batches(tmp_path):
-    x = gr.array(list(range(24)), dtype=gr.int64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path)
-    world = 4
-    all_batches = []
-    for rank in range(world):
-        st = gr.stream(path, batch_size=3, world_size=world, rank=rank)
-        all_batches.extend(list(st))
-    flat = sorted(sum((b.to_list() for b in all_batches), []))
-    assert flat == list(range(24))
-
-
-def test_ddp_len_per_rank(tmp_path):
-    x = gr.array(list(range(20)), dtype=gr.int64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path)
-    lens = [len(gr.stream(path, batch_size=4, world_size=3, rank=r)) for r in range(3)]
-    assert sum(lens) == len(gr.stream(path, batch_size=4))
-
-
-def test_stream_in_memory_parity(tmp_path):
-    df = _make_protein_like_df(n_scenes=5, mols_per_scene=2)
-    path = str(tmp_path / "df.gr")
-    gr.save(df, path, chunk_size=4)
-    full = gr.load(path)
-    sync = [b.to_dict() for b in gr.stream(path, batch_size=2, in_memory=True)]
-    manual = [full[i : i + 2].to_dict() for i in range(0, len(full), 2)]
-    assert sync == manual
-
-
-def test_shared_offsets_on_save(tmp_path):
-    df = _make_protein_like_df(n_scenes=3, mols_per_scene=2)
-    path = str(tmp_path / "df.gr")
-    gr.save(df, path, chunk_size=8)
-    import json
-    from pathlib import Path
-
-    meta = json.loads((Path(path) / "grumpy.json").read_text())
-    columns = meta["root"]["columns"]
-    offset_paths = set()
-    for col in columns:
-        layout = col["layout"]
-        while "content" in layout:
-            if layout.get("type") == "listoffset":
-                offset_paths.add(layout["offsets"])
-            layout = layout.get("content", {})
-    # molecule and residue level offsets should be shared across columns
-    assert len(offset_paths) <= 4
-
-
-def test_workers_prefetch_yields_same_batches(tmp_path):
-    df = _make_protein_like_df(n_scenes=3, mols_per_scene=2)
-    path = str(tmp_path / "df.gr")
-    gr.save(df, path)
-    sync = [b.to_dict() for b in gr.stream(path, batch_size=1, workers=0)]
-    prefetch = [b.to_dict() for b in gr.stream(path, batch_size=1, workers=2)]
-    assert sync == prefetch
-
-
-def test_stream_apply_still_works(tmp_path):
-    x = gr.array([[1.0, 2.0], [3.0, 4.0]], dtype=gr.float64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path, chunk_size=2)
-    st = gr.stream(path, batch_size=1)
-    out = list(st.apply(lambda b: b * 2.0, cpu=1))
-    assert [b.to_list() for b in out] == [[[2.0, 4.0]], [[6.0, 8.0]]]
-
-
-def test_batch_on_parity_with_full_load(tmp_path):
-    df = _make_protein_like_df(n_scenes=5, mols_per_scene=2)
-    path = str(tmp_path / "df.gr")
-    gr.save(df, path, chunk_size=8)
-    full = gr.load(path)
-    st = gr.stream(path, batch_size=3, batch_on="molecule")
-    seen = 0
-    for batch in st:
-        n = len(batch.to_dict()["scene_id"])
-        expected = gr._core.load_slice(path, seen, seen + n)
-        assert batch.to_dict() == expected.to_dict()
-        seen += n
-    assert seen == len(full)
-
-
-def test_drop_last_batch_on(tmp_path):
-    df = _make_protein_like_df(n_scenes=3, mols_per_scene=3)
-    path = str(tmp_path / "df.gr")
-    gr.save(df, path)
-    # 9 molecules total, batch_size=5 -> [6,3]; drop_last drops final partial batch
-    assert len(gr.stream(path, batch_size=5, batch_on="molecule", drop_last=True)) == 1
-    assert len(gr.stream(path, batch_size=5, batch_on="molecule", drop_last=False)) == 2
-
-
-def test_stream_getitem_slice(tmp_path):
-    x = gr.array(list(range(12)), dtype=gr.int64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path, chunk_size=4)
-    st = gr.stream(path, batch_size=3)
-    assert len(st) == 4
-    sub = st[1:3]
-    assert len(sub) == 2
-    batches = [b.to_list() for b in sub]
-    assert batches == [[3, 4, 5], [6, 7, 8]]
-
-
-def test_stream_getitem_int(tmp_path):
-    x = gr.array(list(range(10)), dtype=gr.int64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path)
-    st = gr.stream(path, batch_size=2)
-    assert list(st[2])[0].to_list() == [4, 5]
-
-
-def test_save_generator_array(tmp_path):
-    path = str(tmp_path / "gen.gr")
-
-    def batches():
-        for i in range(5):
-            yield gr.array([[i]], dtype=gr.int64)
-
-    gr.save(batches(), path, chunk_size=2)
-    loaded = gr.load(path)
-    assert loaded.to_list() == [[0], [1], [2], [3], [4]]
-
-
-def test_save_generator_union(tmp_path):
-    path = str(tmp_path / "gen_union.gr")
-
-    def batches():
-        yield gr.array([1, [2]], dtype=gr.int64)
-        yield gr.array([[3, 4]], dtype=gr.int64)
-
-    gr.save(batches(), path)
-    loaded = gr.load(path)
-    assert loaded.to_list() == [1, [2], [3, 4]]
-
-
-def test_save_generator_dataframe(tmp_path):
-    path = str(tmp_path / "gen_df.gr")
-
-    def batches():
-        for i in range(3):
-            yield gr.dataframe({"a": [i], "b": [i + 10]})
-
-    gr.save(batches(), path)
-    loaded = gr.load(path)
-    assert loaded.to_dict() == {"a": [0, 1, 2], "b": [10, 11, 12]}
-
-
-def test_chunk_dim_save(tmp_path):
-    x = gr.array([[i, i + 1] for i in range(20)], dtype=gr.int64)
-    path = str(tmp_path / "chunk.gr")
-    gr.save(x, path, chunk_size=4, chunk_dim=1)
-    loaded = gr.load(path)
-    assert loaded.to_list() == x.to_list()
-
-
-def test_compiled_stream_apply_partial_io(tmp_path):
-    x = gr.array(list(range(100)), dtype=gr.float64)
-    path = str(tmp_path / "a.gr")
-    gr.save(x, path, chunk_size=32)
-
-    def mul_only(batch):
-        batch = batch * 2.0
-        return batch
-
-    gr._core.reset_io_bytes_read()
-    st = gr.stream(path, batch_size=10)
-    out = list(st.apply(mul_only, cpu=2, compile=True, scheduler="rust", prefetch=0))
-    partial_bytes = gr._core.io_bytes_read()
-    assert len(out) == 10
-    assert out[0].to_list()[0] == 0.0
-
-    gr._core.reset_io_bytes_read()
-    gr._core.clear_path_caches()
-    gr._core.load_slice(path, 0, 100)
-    full_bytes = gr._core.io_bytes_read()
-    assert partial_bytes > 0
-    assert partial_bytes <= full_bytes * 2
-
+    assert gr._core.stored_len(path) == 10

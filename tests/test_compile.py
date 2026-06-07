@@ -5,7 +5,7 @@ import pytest
 import grumpy as gr
 
 
-def test_apply_compile_parity_array_pipeline():
+def test_compile_parity_array_pipeline():
     def t1(batch):
         batch = batch * 2
         return batch
@@ -19,23 +19,16 @@ def test_apply_compile_parity_array_pipeline():
         return batch
 
     x = gr.array([[1, 2, 3], [4, 5], [6]], dtype=gr.int32)
-    with tempfile.TemporaryDirectory() as td:
-        path = td + "/x.gr"
-        gr.save(x, path, chunk_size=2)
-        st = gr.stream(path, batch_size=2, drop_last=False)
+    plain = t3(t2(t1(x)))
 
-        out_plain = []
-        for b in st.apply([t1, t2, t3], cpu=1, compile=False):
-            out_plain.extend(b.to_list())
-
-        out_comp = []
-        for b in st.apply([t1, t2, t3], cpu=1, compile=True):
-            out_comp.extend(b.to_list())
-
-        assert out_comp == out_plain
+    ct1 = gr.compile(t1)
+    ct2 = gr.compile(t2)
+    ct3 = gr.compile(t3)
+    compiled = ct3(ct2(ct1(x)))
+    assert compiled.to_list() == plain.to_list()
 
 
-def test_apply_compile_parity_dataframe_assignment():
+def test_compile_parity_dataframe_assignment():
     df = gr.dataframe(
         {
             "molecule_id": ["a", "b"],
@@ -50,31 +43,16 @@ def test_apply_compile_parity_dataframe_assignment():
         return batch
 
     out_plain = t(df)
-
-    # Run via stream.apply compile=True to exercise compiled path.
-    with tempfile.TemporaryDirectory() as td:
-        path = td + "/df.gr"
-        gr.save(df, path, chunk_size=1)
-        st = gr.stream(path, batch_size=1, drop_last=False)
-        batches = list(st.apply([t], cpu=1, compile=True))
-        assert len(batches) == 2
-        # Merge the two one-row batches to compare by dict; simplest: just compare each row.
-        assert batches[0]["residue_center"].to_dict()["residue_center"] == [out_plain["residue_center"].to_dict()["residue_center"][0]]
-        assert batches[1]["residue_center"].to_dict()["residue_center"] == [out_plain["residue_center"].to_dict()["residue_center"][1]]
+    out_compiled = gr.compile(t)(df)
+    assert out_compiled["residue_center"].to_dict() == out_plain["residue_center"].to_dict()
 
 
-def test_apply_compile_warns_on_uncompilable_transform():
+def test_compile_warns_on_uncompilable_transform():
     def bad(batch):
         if True:  # control-flow unsupported by compiler
             return batch
         return batch
 
     x = gr.array([1, 2, 3], dtype=gr.int32)
-    with tempfile.TemporaryDirectory() as td:
-        path = td + "/x.gr"
-        gr.save(x, path, chunk_size=2)
-        st = gr.stream(path, batch_size=2, drop_last=False)
-        with pytest.warns(UserWarning, match="could not be compiled"):
-            _ = list(st.apply([bad], cpu=1, compile=True))
-
-
+    with pytest.warns(UserWarning, match="could not be compiled"):
+        _ = gr.compile(bad)(x)

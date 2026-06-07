@@ -1,7 +1,7 @@
 """Grumpy: high-performance numerical computing on ragged and nested data.
 
 Grumpy provides Awkward-like layout semantics with strong typing, explicit nullability,
-mutable arrays, Zarr-backed I/O, and optional compilation of streaming transforms.
+mutable arrays, Zarr-backed lazy I/O via :func:`open`, and optional compilation of transforms.
 
 Layouts
 -------
@@ -11,8 +11,8 @@ Zarr, streamed, and used in dataframes.
 
 Notes
 -----
-- Streaming supports axis-0 and ``batch_on`` batching, shuffle, DDP, and I/O prefetch on
-  both layout paths.
+- :func:`open` exposes lazy on-disk dataframes; row/schema indexing materializes subsets;
+  column access returns lazy column proxies until indexed.
 - ``gr.compile`` accepts a restricted subset of Python (see :func:`compile`); scalar
   elementwise opcodes fuse on union batches as well as list-chains.
 """
@@ -65,14 +65,15 @@ from ._core import (
     save as _save,
     append_batch as _append_batch,
     load as _load,
+    open_dataset as _open,
+    OpenDataFrame,
+    OpenColumn,
     rng as _rng,
     py_can_cast as _can_cast,
     py_promote_types as _promote_types,
 )
 
 from . import compiler as _compiler_mod
-from .stream import Stream, StreamApply
-
 compile = _compiler_mod.compile
 
 # Public dtype singletons (match the API examples).
@@ -405,37 +406,24 @@ def save(obj, path: str, chunk_size: int = 1024, chunk_dim=None):
 
 
 def load(path: str):
+    """Load a saved dataset fully into memory."""
     return _load(path)
 
 
-def stream(
-    path: str,
-    batch_size: int = 32,
-    drop_last: bool = False,
-    batch_on: Optional[str] = None,
-    shuffle: Optional[str] = None,
-    seed: Optional[int] = None,
-    workers: int = 0,
-    in_memory: bool = False,
-    gpu: bool | str = False,
-    world_size: int = 1,
-    rank: int = 0,
-    batch_indices: Optional[tuple[int, ...]] = None,
-) -> Stream:
-    return Stream(
-        path=path,
-        batch_size=batch_size,
-        drop_last=drop_last,
-        batch_on=batch_on,
-        shuffle=shuffle,
-        seed=seed,
-        workers=workers,
-        in_memory=in_memory,
-        gpu=gpu,
-        world_size=world_size,
-        rank=rank,
-        batch_indices=batch_indices,
-    )
+def open(path: str) -> OpenDataFrame:
+    """Open a saved dataset as a lazy on-disk handle.
+
+    Row and schema indexing materialize subset dataframes. Column selection
+    (``df['col']`` or ``df.col``) returns an :class:`OpenColumn` proxy until
+    the column is indexed.
+
+    Call :meth:`~grumpy.OpenDataFrame.close` when finished, or use a context
+    manager::
+
+        with gr.open("data.gr") as h:
+            batch = h[[0, 1, 2]]
+    """
+    return _open(path)
 
 
 def rng(seed: int = 0) -> Generator:
@@ -551,11 +539,11 @@ __all__ = [
     "dataframe",
     "save",
     "load",
-    "stream",
+    "open",
+    "OpenDataFrame",
+    "OpenColumn",
     "rng",
     "Generator",
-    "Stream",
-    "StreamApply",
     "sin",
     "cos",
     "tan",

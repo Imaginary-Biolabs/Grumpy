@@ -26,7 +26,6 @@ from grumpy.compiler import (
     compile_pipeline,
     compile_pipeline_info,
 )
-from grumpy.stream import Stream, StreamApply, _ceil_div
 
 
 def test_version_and_public_exports():
@@ -65,110 +64,14 @@ def test_init_wrappers_and_comparisons():
     assert str(gr.logical_not(a).dtype) == str(gr.bool_)
 
 
-def test_ceil_div():
-    assert _ceil_div(5, 2) == 3
-    assert _ceil_div(4, 2) == 2
-
-
-def test_stream_validation_and_len(tmp_path):
+def test_open_public_api(tmp_path):
     x = gr.array([[1, 2], [3, 4], [5, 6]], dtype=gr.int32)
     p = tmp_path / "a.gr"
     gr.save(x, str(p), chunk_size=2)
-
-    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
-        Stream(str(p), batch_size=0)
-    st = Stream(str(p), batch_size=2, drop_last=True)
-    assert len(st) == 1
-    st2 = Stream(str(p), batch_size=2, drop_last=False)
-    assert len(st2) == 2
-    assert [b.to_list() for b in st2] == [[[1, 2], [3, 4]], [[5, 6]]]
-
-
-def test_stream_apply_validation(tmp_path):
-    x = gr.array([1, 2, 3], dtype=gr.int32)
-    p = tmp_path / "a.gr"
-    gr.save(x, str(p))
-    st = gr.stream(str(p), batch_size=2)
-    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
-        st.apply(lambda b: b, cpu=0)
-    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
-        st.apply([])
-    sa = st.apply(lambda b: b)
-    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
-        list(StreamApply(sa.base, sa.fns, compile="bogus"))  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="grumpy\\.ArgumentInvalid"):
-        list(StreamApply(sa.base, sa.fns, scheduler="bogus"))  # type: ignore[arg-type]
-
-
-def test_stream_apply_compile_modes(tmp_path):
-    x = gr.array([1, 2, 3, 4], dtype=gr.int32)
-    p = tmp_path / "a.gr"
-    gr.save(x, str(p), chunk_size=2)
-    st = gr.stream(str(p), batch_size=2)
-
-    def t(batch):
-        batch = batch + 1
-        return batch
-
-    out_never = list(st.apply(t, compile=False))
-    out_force = list(st.apply(t, compile=True))
-    out_auto = list(st.apply(t, compile="auto"))
-    assert [b.to_list() for b in out_force] == [b.to_list() for b in out_never] == [b.to_list() for b in out_auto]
-
-
-def test_stream_apply_mixed_compile_auto(tmp_path):
-    x = gr.array([1, 2], dtype=gr.int32)
-    p = tmp_path / "a.gr"
-    gr.save(x, str(p))
-
-    def good(batch):
-        batch = batch * 2
-        return batch
-
-    def bad(batch):
-        if True:
-            return batch
-        return batch
-
-    st = gr.stream(str(p), batch_size=1)
-    with pytest.warns(UserWarning):
-        _ = list(st.apply([good, bad], compile=True))
-
-
-def test_stream_rust_scheduler_warnings(tmp_path):
-    x = gr.array([[0.0, 0.0], [1.0, 1.0]], dtype=gr.float64)
-    p = tmp_path / "a.gr"
-    gr.save(x, str(p))
-
-    def t(batch):
-        batch = batch * 2.0
-        return batch
-
-    def unsupported(batch):
-        batch = gr.sin(batch)
-        return batch
-
-    st = gr.stream(str(p), batch_size=1)
-    with pytest.warns(UserWarning, match="could not use Rust scheduling"):
-        _ = list(st.apply(unsupported, cpu=2, compile=True, scheduler="rust"))
-
-    # mul_scalar is supported — Rust scheduling should run without the fallback warning.
-    def mul_only(batch):
-        batch = batch * 2.0
-        return batch
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", UserWarning)
-        _ = list(st.apply(mul_only, cpu=2, compile=True, scheduler="rust"))
-
-
-def test_stream_parallel_prefetch_and_short_input(tmp_path):
-    x = gr.array([1], dtype=gr.int32)
-    p = tmp_path / "a.gr"
-    gr.save(x, str(p))
-    st = gr.stream(str(p), batch_size=1)
-    out = list(st.apply(lambda b: b, cpu=2, prefetch=0))
-    assert len(out) == 1
+    h = gr.open(str(p))
+    assert "OpenDataFrame" in repr(h)
+    assert len(h) == 3
+    assert h[0:2].to_list() == x[0:2].to_list()
 
 
 def test_compile_decorator_success_and_properties():

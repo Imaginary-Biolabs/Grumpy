@@ -30,11 +30,8 @@ COLORS = {
 }
 
 COMPILE_SERIES = (
-    ("Python stream (cpu=1)", "stream_py_cpu1_ms", "numpy"),
-    ("Python parallel (cpu=4)", "stream_py_cpu4_ms", "numpy"),
-    ("Compiled (cpu=1)", "stream_compiled_cpu1_ms", "grumpy"),
-    ("Compiled + ThreadPool (cpu=4)", "stream_compiled_cpu4_pysched_ms", "grumpy_compiled"),
-    ("Compiled + Rust (cpu=4)", "stream_compiled_cpu4_rust_ms", "grumpy_ragged_compiled"),
+    ("Python (gr.open)", "open_py_ms", "numpy"),
+    ("Compiled (gr.open)", "open_compiled_ms", "grumpy_ragged_compiled"),
 )
 
 REPRESENTATIVE_OPS = [
@@ -198,7 +195,7 @@ def _compile_chart(cases: list[dict[str, Any]]):
             ys.append(val if val is not None else None)
         fig.add_bar(name=lib, x=names, y=ys, marker_color=COLORS[color_key])
     fig.update_layout(
-        **_fig_layout("Streaming compile — mini-epoch (ms)", height=480)
+        **_fig_layout("Open-handle compile — mini-epoch (ms)", height=480)
     )
     fig.update_xaxes(tickangle=-20)
     return fig

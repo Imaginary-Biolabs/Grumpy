@@ -1,8 +1,8 @@
 # Home
 
-Grumpy is layout-first infrastructure for **ragged and nested** numerical data: protein tables, variable-length sequences, mixed annotation fields, and the batches that feed structural ML pipelines. Unlike ad-hoc Python lists, Grumpy keeps a typed layout tree in Rust so elementwise ops, reductions, neighbor search, and streaming I/O stay fast without hand-written loops.
+Grumpy is layout-first infrastructure for **ragged and nested** numerical data: protein tables, variable-length sequences, mixed annotation fields, and the batches that feed structural ML pipelines. Unlike ad-hoc Python lists, Grumpy keeps a typed layout tree in Rust so elementwise ops, reductions, neighbor search, and lazy Zarr I/O stay fast without hand-written loops.
 
-This guide walks from installation through arrays, dataframes, Zarr streaming, and optional compile-time fusion. Each page builds on the previous one.
+This guide walks from installation through arrays, dataframes, lazy `gr.open`, and optional compile-time fusion. Each page builds on the previous one.
 
 ## Installation
 
@@ -73,16 +73,17 @@ df = gr.dataframe(
 print(df.molecule.coords.to_list())
 ```
 
-### Save, stream, and transform batches
+### Save, open lazily, and transform batches
 
-Persist to a Zarr directory, then iterate batches for training — with optional parallel `apply`:
+Persist to a Zarr directory, then materialize subsets on demand:
 
 ```python
 gr.save(df, "data.gr", chunk_size=64)
 
-for batch in gr.stream("data.gr", batch_size=32, workers=2):
-    batch = batch * 2.0
-    train_step(batch)
+h = gr.open("data.gr")
+for i in range(0, len(h), 32):
+    batch = h[i : i + 32]
+    train_step(batch * 2.0)
 ```
 
 ### Compile fused transforms
@@ -94,9 +95,9 @@ When a batch function is simple enough, `@gr.compile` fuses it into one Rust pla
 def scale(batch):
     return batch * 2.0 + 1.0
 
-st = gr.stream("data.gr", batch_size=32)
-for batch in st.apply(scale, compile="auto", scheduler="auto"):
-    train_step(batch)
+h = gr.open("data.gr")
+for i in range(0, len(h), 32):
+    train_step(scale(h[i : i + 32]))
 ```
 
 ## Performance

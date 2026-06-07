@@ -1,8 +1,8 @@
 """Compile restricted batch transforms into fused Rust execution plans.
 
 The compiler analyzes straight-line Python functions (typically ``def f(batch): ...``)
-and builds :class:`~grumpy._core.CompiledPlan` opcode lists for use with
-:meth:`~grumpy.stream.Stream.apply` or the :func:`compile` decorator.
+and builds :class:`~grumpy._core.CompiledPlan` opcode lists for the
+:func:`compile` decorator and direct invocation on batches.
 
 Supported inputs
 ----------------
@@ -13,7 +13,7 @@ Supported inputs
 Known limitations
 -----------------
 - No control flow (``if``/``for``/``try``), no imports, single ``batch`` parameter.
-- Rust scheduling supports only a fixed opcode set (see ``stream.py``).
+- Rust scheduling of multi-batch pipelines is handled outside Grumpy (e.g. Fabric).
 """
 
 from __future__ import annotations
@@ -39,8 +39,7 @@ class CompiledTransform:
     """
     Callable wrapper that runs a compiled Rust plan when possible.
 
-    Instances are returned by :func:`compile` and used internally by
-    :meth:`~grumpy.stream.Stream.apply`.
+    Instances are returned by :func:`compile`.
 
     Attributes
     ----------

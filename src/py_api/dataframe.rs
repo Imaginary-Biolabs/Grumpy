@@ -1,6 +1,8 @@
+use crate::dataframe::{resolve_shape_dim};
 use crate::dataframe_indexing::{
     accessor_getitem, accessor_target_level, dataframe_getitem, parse_dataframe_index_key,
 };
+use crate::py_api::convert::shape_or_nshape;
 use crate::dtype::inferclass_to_dtype;
 use crate::error::{arg_invalid, schema_violation, unknown_column};
 use crate::layout::{drop_layout_axes, leaf_view, GrumpyArray, Layout};
@@ -47,6 +49,18 @@ impl PyGrumpyDataFrame {
 
     fn max(&self, py: Python<'_>) -> PyResult<PyObject> {
         self.inner.max_all(py)
+    }
+
+    fn shape(&self, py: Python<'_>, dim: Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let d = resolve_shape_dim(self.inner.schema.as_ref(), self.inner.index_depth, &dim)?;
+        let proxy = self.inner.shape_proxy_array()?;
+        shape_or_nshape(py, &proxy, d, false)
+    }
+
+    fn nshape(&self, py: Python<'_>, dim: Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let d = resolve_shape_dim(self.inner.schema.as_ref(), self.inner.index_depth, &dim)?;
+        let proxy = self.inner.shape_proxy_array()?;
+        shape_or_nshape(py, &proxy, d, true)
     }
 
     fn __getitem__(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<PyObject> {

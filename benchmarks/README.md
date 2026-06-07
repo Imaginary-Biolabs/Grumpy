@@ -102,7 +102,7 @@ python benchmarks/generate_perf_charts.py
 
 ## Compiler benchmark (docs / charts)
 
-Compares **streaming** pipelines where ``gr.compile`` is meant to be used — full mini-epoch over a Zarr-backed protein dataset:
+Compares **``gr.open``** batched indexing where ``gr.compile`` is meant to be used — full mini-epoch over a Zarr-backed protein dataset:
 
 ```bash
 python benchmarks/benchmark_compile_suite.py
@@ -110,21 +110,32 @@ python benchmarks/benchmark_compile_suite.py --quick          # <60 s elementwis
 python benchmarks/benchmark_compile_suite.py --json docs/generated/performance/compile_suite.json
 ```
 
-Default dataset: **256 proteins × 256 residues × 3 coords** (CA trace). Streaming with `batch_size=32`, `cpu=4`. Full suite budget ~300 s; per-mode timeout 90 s. Use `--quick` for 96-residue elementwise-only runs under 60 s.
+Default dataset: **256 proteins × 256 residues × 3 coords** (CA trace). `batch_size=32`. Full suite budget ~300 s; per-mode timeout 90 s. Use `--quick` for 96-residue elementwise-only runs under 60 s.
 
 Pipelines: fused elementwise + pool, staged elementwise (4 functions → one plan), normalize + kNN + pool (`k=16`), kNN (`k=16`) + pool.
 
-Each case times five modes: Python stream (cpu=1), Python parallel (cpu=4), compiled (cpu=1), compiled + ThreadPool (cpu=4), compiled + Rust scheduler (cpu=4). **Compile pays off primarily via the Rust batch scheduler (cpu=4)**; cpu=1 compiled and eager paths both dispatch to Rust kernels.
+Each case times Python vs ``compile_pipeline`` per batch over a shared ``gr.open`` handle.
 
-## In-memory vs streaming
+## In-memory vs gr.open
 
-Compares batched transforms over **in-memory** data vs **Zarr streaming** (plus load-only baselines):
+Compares batched transforms over **in-memory** data vs **``gr.open`` indexing** (plus load-only baselines):
 
 ```bash
 python benchmarks/benchmark_memory_vs_stream.py
-python benchmarks/benchmark_memory_vs_stream.py --json docs/generated/performance/memory_vs_stream.json
+python benchmarks/benchmark_memory_vs_stream.py --json docs/generated/performance/memory_vs_open.json
 ```
 
-Default: 256 proteins × 96 residues, `batch_size=32`, **< 60 s** wall budget. Shows how much of a stream epoch is Zarr I/O vs compute.
+Default: 256 proteins × 96 residues, `batch_size=32`, **< 60 s** wall budget. Shows how much of an open epoch is Zarr I/O vs compute.
+
+## gr.load vs gr.open indexing
+
+Compares full materialization, batched slice epochs, and single-row access:
+
+```bash
+python benchmarks/benchmark_load_vs_open.py
+python benchmarks/benchmark_load_vs_open.py --json docs/generated/performance/load_vs_open.json
+```
+
+Default: 256 proteins × 128 residues (3-column dataframe), `batch_size=32`. Reports how much slower batched ``gr.open`` indexing is vs ``gr.load`` + in-memory slices.
 
 The compile chart on the [docs landing page](https://imaginary-biolabs.github.io/Grumpy/) is rebuilt together with the API chart by `generate_perf_charts.py`.

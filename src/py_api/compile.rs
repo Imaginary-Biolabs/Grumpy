@@ -3,7 +3,6 @@ use crate::layout::{drop_layout_axes, GrumpyArray, Layout, Leaf, LeafBuffer, Off
 use crate::neighbors as neigh_ops;
 use crate::ops::{self, BinOp};
 use crate::reduce::{self, ReduceOp, ReduceOutput};
-use crate::stream::{self, BatchPayload, BatchPlan};
 use crate::io as io_ops;
 use crate::dtype::DType;
 use crate::py_api::types::{PyCompiledBatchesIter, PyCompiledPlan, PyGrumpyArray, PyGrumpyDataFrame, PlanOp};
@@ -18,8 +17,6 @@ use pyo3::types::{PyAnyMethods, PyDict, PyList};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
-use crate::py_api::py_stream::{prepare_stream_plan_with_shuffle_level, spawn_prefetch_loader};
-
 #[pymethods]
 impl PyCompiledBatchesIter {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -424,97 +421,6 @@ fn run_plan_df_rust(ops_plan: &[PlanOp], mut cur: df_ops::GrumpyDataFrame) -> Py
         }
     }
     Ok(cur)
-}
-
-#[pyfunction]
-#[pyo3(signature = (path, batch_size, drop_last, cpu, _prefetch, spec, batch_on=None, shuffle=None, seed=None, world_size=1, rank=0, batch_indices=None, gpu="false"))]
-pub fn compiled_stream_apply(
-    _py: Python<'_>,
-    path: String,
-    batch_size: usize,
-    drop_last: bool,
-    cpu: usize,
-    _prefetch: usize,
-    spec: Bound<'_, PyAny>,
-    batch_on: Option<String>,
-    shuffle: Option<String>,
-    seed: Option<u64>,
-    world_size: usize,
-    rank: usize,
-    batch_indices: Option<Vec<usize>>,
-    gpu: &str,
-) -> PyResult<PyCompiledBatchesIter> {
-    let gpu_pref = crate::gpu::GpuPreference::parse(gpu)?;
-    if cpu < 1 {
-        return Err(arg_must_be_positive("cpu", cpu));
-    }
-    if batch_size == 0 {
-        return Err(arg_must_be_positive("batch_size", batch_size));
-    }
-    let plan_ops = PyCompiledPlan::new(spec)?;
-    let shuffle_arg = shuffle.as_deref();
-    let (handle, plan, is_df, _shuffle_within, _seed) = prepare_stream_plan_with_shuffle_level(
-        &path,
-        batch_size,
-        drop_last,
-        batch_on.as_deref(),
-        shuffle_arg,
-        seed,
-        world_size,
-        rank,
-        batch_indices.as_deref(),
-        false,
-    )?;
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(cpu)
-        .build()
-        .map_err(|e| internal("compiled_stream_apply", format!("failed to build thread pool: {e}")))?;
-    if is_df {
-        let handle = handle.clone();
-        let results: Vec<PyResult<df_ops::GrumpyDataFrame>> = pool.install(|| {
-            plan.batches
-                .par_iter()
-                .map(|batch| {
-                    let payload = stream::load_batch(&handle, batch)?;
-                    match payload {
-                        stream::BatchPayload::DataFrame(df) => run_plan_df_rust(&plan_ops.ops, df),
-                        _ => Err(internal("compiled_stream_apply", "array payload for dataframe stream")),
-                    }
-                })
-                .collect()
-        });
-        let mut outs: Vec<df_ops::GrumpyDataFrame> = Vec::with_capacity(results.len());
-        for r in results {
-            outs.push(r?);
-        }
-        return Ok(PyCompiledBatchesIter {
-            arr_batches: None,
-            df_batches: Some(outs),
-            pos: 0,
-        });
-    }
-    let handle = handle.clone();
-    let results: Vec<PyResult<GrumpyArray>> = pool.install(|| {
-        plan.batches
-            .par_iter()
-            .map(|batch| {
-                let payload = stream::load_batch(&handle, batch)?;
-                match payload {
-                    stream::BatchPayload::Array(arr) => run_plan_array_rust(&plan_ops.ops, arr, gpu_pref),
-                    _ => Err(internal("compiled_stream_apply", "dataframe payload for array stream")),
-                }
-            })
-            .collect()
-    });
-    let mut outs: Vec<GrumpyArray> = Vec::with_capacity(results.len());
-    for r in results {
-        outs.push(r?);
-    }
-    Ok(PyCompiledBatchesIter {
-        arr_batches: Some(outs),
-        df_batches: None,
-        pos: 0,
-    })
 }
 
 pub(crate) fn df_get_level0_column(df: &df_ops::GrumpyDataFrame, level0: &str, colname: &str) -> PyResult<GrumpyArray> {

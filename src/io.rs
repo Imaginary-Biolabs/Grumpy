@@ -1,4 +1,4 @@
-use crate::dataframe::{GrumpyDataFrame, Schema};
+use crate::dataframe::{CanonShape, GrumpyDataFrame, Schema};
 use crate::dtype::DType;
 use crate::error::{arg_invalid, index_out_of_bounds, internal, internal_dtype_buffer_mismatch, invalid_slice_range, io_failed, io_wrong_type, schema_violation, unsupported};
 use crate::io_cache::{IoCache, IoReader};
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use zarrs::array::{Array, ArrayBuilder, DataType, ElementOwned, FillValue};
 use zarrs::array::chunk_grid::ChunkGrid;
@@ -71,6 +71,56 @@ fn path_resident(
 pub fn clear_path_caches() {
     PATH_IO_CACHES.lock().unwrap().clear();
     PATH_RESIDENT.lock().unwrap().clear();
+}
+
+/// Drop path-scoped I/O and resident cache entries (called by :meth:`OpenDataFrame.close`).
+pub fn release_path_resources(path: &str) {
+    PATH_IO_CACHES.lock().unwrap().remove(path);
+    PATH_RESIDENT.lock().unwrap().remove(path);
+}
+
+struct OpenSessionInner {
+    handle: DatasetHandle,
+    closed: AtomicBool,
+}
+
+/// Shared open-handle state for :class:`OpenDataFrame` and derived :class:`OpenColumn` proxies.
+#[derive(Clone)]
+pub struct OpenSession {
+    inner: Arc<OpenSessionInner>,
+}
+
+impl OpenSession {
+    pub fn new(handle: DatasetHandle) -> Self {
+        Self {
+            inner: Arc::new(OpenSessionInner {
+                handle,
+                closed: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.inner.handle.path
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
+    pub fn handle(&self) -> PyResult<&DatasetHandle> {
+        if self.is_closed() {
+            return Err(crate::error::io_closed(self.path()));
+        }
+        Ok(&self.inner.handle)
+    }
+
+    pub fn close(&self) {
+        if self.inner.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        release_path_resources(self.path());
+    }
 }
 
 #[derive(Clone)]
@@ -165,13 +215,43 @@ impl SchemaRef {
     }
 }
 
+/// Canonical nested shape persisted in ``grumpy.json`` (no reference column required).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct CanonMeta {
+    pub nrows: Option<usize>,
+    pub offsets: Vec<Option<Vec<i64>>>,
+}
+
+impl From<&CanonShape> for CanonMeta {
+    fn from(c: &CanonShape) -> Self {
+        Self {
+            nrows: c.nrows,
+            offsets: c.offsets.clone(),
+        }
+    }
+}
+
+impl From<CanonMeta> for CanonShape {
+    fn from(m: CanonMeta) -> Self {
+        Self {
+            nrows: m.nrows,
+            offsets: m.offsets,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum RootMeta {
     #[serde(rename = "array")]
     Array { dtype: DTypeSer, layout: LayoutMeta },
     #[serde(rename = "dataframe")]
-    DataFrame { schema: Option<Vec<Vec<String>>>, columns: Vec<ColumnMeta> },
+    DataFrame {
+        schema: Option<Vec<Vec<String>>>,
+        columns: Vec<ColumnMeta>,
+        #[serde(default)]
+        canon: Option<CanonMeta>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -360,6 +440,7 @@ pub fn save_dataframe(
         root: RootMeta::DataFrame {
             schema: schema_levels,
             columns,
+            canon: Some(CanonMeta::from(&df.canon)),
         },
     };
     write_meta(path, &meta)?;
@@ -370,7 +451,11 @@ pub fn load_dataframe(py: Python<'_>, path: &str) -> PyResult<GrumpyDataFrame> {
     let _ = py;
     let meta = read_meta(path)?;
     match meta.root {
-        RootMeta::DataFrame { schema, columns } => {
+        RootMeta::DataFrame {
+            schema,
+            columns,
+            canon,
+        } => {
             let store = store_fs(path)?;
             let cache = IoCache::default();
             let io = IoReader {
@@ -398,7 +483,8 @@ pub fn load_dataframe(py: Python<'_>, path: &str) -> PyResult<GrumpyDataFrame> {
                     Some(Schema { levels, name_to_level })
                 }
             };
-            GrumpyDataFrame::new(names, cols, schema)
+            let stored_canon = canon.map(CanonShape::from);
+            GrumpyDataFrame::from_loaded(names, cols, schema, stored_canon)
         }
         _ => Err(io_wrong_type("dataframe", path)),
     }
@@ -418,7 +504,11 @@ fn load_resident(
                 layout: load_layout(&io, dt, layout)?,
             }))
         }
-        RootMeta::DataFrame { schema, columns } => {
+        RootMeta::DataFrame {
+            schema,
+            columns,
+            canon,
+        } => {
             let mut names: Vec<String> = Vec::new();
             let mut cols: Vec<GrumpyArray> = Vec::new();
             for c in columns {
@@ -442,8 +532,12 @@ fn load_resident(
                     })
                 }
             };
-            Ok(ResidentDataset::DataFrame(GrumpyDataFrame::new(
-                names, cols, schema,
+            let stored_canon = canon.clone().map(CanonShape::from);
+            Ok(ResidentDataset::DataFrame(GrumpyDataFrame::from_loaded(
+                names,
+                cols,
+                schema,
+                stored_canon,
             )?))
         }
     }
@@ -820,29 +914,179 @@ pub fn load_dataframe_axis0_slice(
         return GrumpyDataFrame::new(df.names.clone(), cols, df.schema.clone());
     }
     match &handle.meta.root {
-        RootMeta::DataFrame { schema, columns } => {
-            let mut names: Vec<String> = Vec::new();
-            let mut cols: Vec<GrumpyArray> = Vec::new();
-            for c in columns {
-                let dt: DType = c.dtype.clone().into();
-                let layout = load_layout_axis0_slice(handle, dt, &c.layout, start, stop)?;
-                names.push(c.name.clone());
-                cols.push(GrumpyArray { dtype: dt, layout });
-            }
-            let schema = match schema {
-                None => None,
-                Some(levels) => {
-                    let mut name_to_level = std::collections::HashMap::new();
-                    for (lvl, names) in levels.iter().enumerate() {
-                        for n in names {
-                            name_to_level.insert(n.clone(), lvl);
-                        }
-                    }
-                    Some(Schema { levels: levels.clone(), name_to_level })
-                }
-            };
-            GrumpyDataFrame::new(names, cols, schema)
+        RootMeta::DataFrame { schema, columns, .. } => {
+            load_dataframe_columns_axis0_slice_inner(handle, None, columns, schema.as_ref(), start, stop)
         }
+        _ => Err(io_wrong_type("dataframe", &handle.path)),
+    }
+}
+
+/// Load selected columns (or all when ``colnames`` is ``None``) for axis-0 ``[start, stop)``.
+pub fn load_dataframe_columns_axis0_slice(
+    handle: &DatasetHandle,
+    colnames: Option<&[String]>,
+    start: usize,
+    stop: usize,
+) -> PyResult<GrumpyDataFrame> {
+    if let Some(ResidentDataset::DataFrame(df)) = handle.resident.as_deref() {
+        let filter: Option<std::collections::HashSet<&str>> =
+            colnames.map(|ns| ns.iter().map(|s| s.as_str()).collect());
+        let mut names: Vec<String> = Vec::new();
+        let mut cols: Vec<GrumpyArray> = Vec::new();
+        for (n, c) in df.names.iter().zip(df.cols.iter()) {
+            if filter.as_ref().is_some_and(|f| !f.contains(n.as_str())) {
+                continue;
+            }
+            names.push(n.clone());
+            cols.push(GrumpyArray {
+                dtype: c.dtype,
+                layout: take_range(&c.layout, start, stop)?,
+            });
+        }
+        return GrumpyDataFrame::new(names, cols, df.schema.clone());
+    }
+    match &handle.meta.root {
+        RootMeta::DataFrame { schema, columns, .. } => {
+            load_dataframe_columns_axis0_slice_inner(handle, colnames, columns, schema.as_ref(), start, stop)
+        }
+        _ => Err(io_wrong_type("dataframe", &handle.path)),
+    }
+}
+
+fn load_dataframe_columns_axis0_slice_inner(
+    handle: &DatasetHandle,
+    colnames: Option<&[String]>,
+    columns: &[ColumnMeta],
+    schema_levels: Option<&Vec<Vec<String>>>,
+    start: usize,
+    stop: usize,
+) -> PyResult<GrumpyDataFrame> {
+    let filter: Option<std::collections::HashSet<&str>> =
+        colnames.map(|ns| ns.iter().map(|s| s.as_str()).collect());
+    let mut names: Vec<String> = Vec::new();
+    let mut cols: Vec<GrumpyArray> = Vec::new();
+    for c in columns {
+        if filter.as_ref().is_some_and(|f| !f.contains(c.name.as_str())) {
+            continue;
+        }
+        let dt: DType = c.dtype.clone().into();
+        let layout = load_layout_axis0_slice(handle, dt, &c.layout, start, stop)?;
+        names.push(c.name.clone());
+        cols.push(GrumpyArray { dtype: dt, layout });
+    }
+    let schema = schema_from_levels(schema_levels);
+    GrumpyDataFrame::new(names, cols, schema)
+}
+
+fn schema_from_levels(levels: Option<&Vec<Vec<String>>>) -> Option<Schema> {
+    levels.map(|levels| {
+        let mut name_to_level = std::collections::HashMap::new();
+        for (lvl, names) in levels.iter().enumerate() {
+            for n in names {
+                name_to_level.insert(n.clone(), lvl);
+            }
+        }
+        Schema {
+            levels: levels.clone(),
+            name_to_level,
+        }
+    })
+}
+
+/// Load one column for axis-0 ``[start, stop)`` without reading other columns.
+pub fn load_column_axis0_slice(
+    handle: &DatasetHandle,
+    col_name: &str,
+    start: usize,
+    stop: usize,
+) -> PyResult<GrumpyArray> {
+    if let Some(ResidentDataset::DataFrame(df)) = handle.resident.as_deref() {
+        for (n, c) in df.names.iter().zip(df.cols.iter()) {
+            if n == col_name {
+                return Ok(GrumpyArray {
+                    dtype: c.dtype,
+                    layout: take_range(&c.layout, start, stop)?,
+                });
+            }
+        }
+        return Err(crate::error::unknown_column(col_name));
+    }
+    match &handle.meta.root {
+        RootMeta::DataFrame { columns, .. } => {
+            for c in columns {
+                if c.name == col_name {
+                    let dt: DType = c.dtype.clone().into();
+                    let layout = load_layout_axis0_slice(handle, dt, &c.layout, start, stop)?;
+                    return Ok(GrumpyArray { dtype: dt, layout });
+                }
+            }
+            Err(crate::error::unknown_column(col_name))
+        }
+        _ => Err(io_wrong_type("dataframe", &handle.path)),
+    }
+}
+
+/// Canonical shape for an open handle (from persisted metadata or offset-buffer scan).
+pub fn canon_from_handle(handle: &DatasetHandle) -> PyResult<CanonShape> {
+    match &handle.meta.root {
+        RootMeta::DataFrame {
+            canon,
+            columns,
+            schema,
+        } => {
+            if let Some(c) = canon {
+                return Ok(c.clone().into());
+            }
+            let nrows = handle.axis0_len()?;
+            let nlev = schema.as_ref().map(|s| s.len()).unwrap_or(0);
+            let mut offsets: Vec<Option<Vec<i64>>> = vec![None; nlev];
+            if let Some(col) = columns.first() {
+                collect_offsets_from_layout_meta(&handle.reader(), &col.layout, 0, &mut offsets)?;
+            }
+            Ok(CanonShape {
+                nrows: Some(nrows),
+                offsets,
+            })
+        }
+        _ => Err(io_wrong_type("dataframe", &handle.path)),
+    }
+}
+
+fn collect_offsets_from_layout_meta(
+    io: &IoReader<'_>,
+    meta: &LayoutMeta,
+    list_depth: usize,
+    out: &mut [Option<Vec<i64>>],
+) -> PyResult<()> {
+    match meta {
+        LayoutMeta::ListOffset { offsets, content } => {
+            let lev = list_depth + 1;
+            if lev < out.len() && out[lev].is_none() {
+                out[lev] = Some(io.cache.read_i64(io.store, offsets)?);
+            }
+            collect_offsets_from_layout_meta(io, content, list_depth + 1, out)?;
+        }
+        LayoutMeta::OffsetView { content, .. } | LayoutMeta::Indexed { content, .. } => {
+            collect_offsets_from_layout_meta(io, content, list_depth, out)?;
+        }
+        LayoutMeta::UnionScalarList { lists, .. } => {
+            collect_offsets_from_layout_meta(io, lists, list_depth, out)?;
+        }
+        LayoutMeta::Leaf { .. } => {}
+    }
+    Ok(())
+}
+
+pub fn schema_from_handle(handle: &DatasetHandle) -> PyResult<Option<Schema>> {
+    match &handle.meta.root {
+        RootMeta::DataFrame { schema, .. } => Ok(schema_from_levels(schema.as_ref())),
+        _ => Err(io_wrong_type("dataframe", &handle.path)),
+    }
+}
+
+pub fn column_names_from_handle(handle: &DatasetHandle) -> PyResult<Vec<String>> {
+    match &handle.meta.root {
+        RootMeta::DataFrame { columns, .. } => Ok(columns.iter().map(|c| c.name.clone()).collect()),
         _ => Err(io_wrong_type("dataframe", &handle.path)),
     }
 }

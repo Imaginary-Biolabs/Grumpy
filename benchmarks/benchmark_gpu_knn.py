@@ -16,7 +16,8 @@ import numpy as np
 
 import grumpy as gr
 
-from _bench_common import row_length, timeit
+from _bench_common import timeit
+from _open_epoch import epoch_open_batched
 
 
 @dataclass
@@ -36,9 +37,9 @@ class GpuKnnReport:
     cpu_dim1_ms: float
     gpu_dim1_ms: float
     auto_dim1_ms: float | None = None
-    cpu_stream_ms: float | None = None
-    gpu_stream_ms: float | None = None
-    auto_stream_ms: float | None = None
+    cpu_open_ms: float | None = None
+    gpu_open_ms: float | None = None
+    auto_open_ms: float | None = None
     wall_time_s: float = 0.0
 
 
@@ -62,18 +63,21 @@ def _bench_neighbors(x: gr.GrumpyArray, *, gpu: bool | str, warmup: int, repeats
     return timeit(run, warmup=warmup, repeats=repeats) * 1e3
 
 
-def _bench_stream(path: str, *, gpu: bool | str, batch_size: int, warmup: int, repeats: int) -> float:
-    def run() -> None:
-        st = gr.stream(path, batch_size=batch_size, gpu=gpu)
+def _knn_pool(batch, *, gpu: bool | str):
+    batch = gr.neighbors(batch, batch, k=args_k, dim=1, loop=False, gpu=gpu)
+    return batch.mean(dim=1)
 
-        def knn_pool(batch):
-            batch = gr.neighbors(batch, batch, k=args_k, dim=1, loop=False)
-            return batch.mean(dim=1)
 
-        for _ in st.apply(knn_pool, cpu=1, compile="auto"):
-            pass
+def _bench_open(path: str, *, gpu: bool | str, n_molecules: int, batch_size: int, warmup: int, repeats: int) -> float:
+    def epoch() -> None:
+        epoch_open_batched(
+            path,
+            lambda batch: _knn_pool(batch, gpu=gpu),
+            n_molecules=n_molecules,
+            batch_size=batch_size,
+        )
 
-    return timeit(run, warmup=warmup, repeats=repeats) * 1e3
+    return timeit(epoch, warmup=warmup, repeats=repeats) * 1e3
 
 
 args_k = 16
@@ -105,15 +109,36 @@ def main(argv: list[str] | None = None) -> int:
     gpu_ms = _bench_neighbors(x, gpu=True, warmup=args.warmup, repeats=args.repeats)
     auto_ms = _bench_neighbors(x, gpu="auto", warmup=args.warmup, repeats=args.repeats)
 
-    stream_cpu_ms = None
-    stream_gpu_ms = None
-    stream_auto_ms = None
+    open_cpu_ms = None
+    open_gpu_ms = None
+    open_auto_ms = None
     with tempfile.TemporaryDirectory(prefix="grumpy_gpu_bench_") as tmp:
         path = str(Path(tmp) / "coords.gr")
         gr.save(x, path, chunk_size=args.batch_size)
-        stream_cpu_ms = _bench_stream(path, gpu=False, batch_size=args.batch_size, warmup=args.warmup, repeats=args.repeats)
-        stream_gpu_ms = _bench_stream(path, gpu=True, batch_size=args.batch_size, warmup=args.warmup, repeats=args.repeats)
-        stream_auto_ms = _bench_stream(path, gpu="auto", batch_size=args.batch_size, warmup=args.warmup, repeats=args.repeats)
+        open_cpu_ms = _bench_open(
+            path,
+            gpu=False,
+            n_molecules=args.n_molecules,
+            batch_size=args.batch_size,
+            warmup=args.warmup,
+            repeats=args.repeats,
+        )
+        open_gpu_ms = _bench_open(
+            path,
+            gpu=True,
+            n_molecules=args.n_molecules,
+            batch_size=args.batch_size,
+            warmup=args.warmup,
+            repeats=args.repeats,
+        )
+        open_auto_ms = _bench_open(
+            path,
+            gpu="auto",
+            n_molecules=args.n_molecules,
+            batch_size=args.batch_size,
+            warmup=args.warmup,
+            repeats=args.repeats,
+        )
 
     wall = time.perf_counter() - wall_start
     report = GpuKnnReport(
@@ -132,9 +157,9 @@ def main(argv: list[str] | None = None) -> int:
         cpu_dim1_ms=cpu_ms,
         gpu_dim1_ms=gpu_ms,
         auto_dim1_ms=auto_ms,
-        cpu_stream_ms=stream_cpu_ms,
-        gpu_stream_ms=stream_gpu_ms,
-        auto_stream_ms=stream_auto_ms,
+        cpu_open_ms=open_cpu_ms,
+        gpu_open_ms=open_gpu_ms,
+        auto_open_ms=open_auto_ms,
         wall_time_s=wall,
     )
 
@@ -146,8 +171,11 @@ def main(argv: list[str] | None = None) -> int:
     print("| mode | CPU ms | GPU force ms | GPU auto ms | speedup (auto) |")
     print("|---|---:|---:|---:|---:|")
     print(f"| neighbors dim=1 (in-memory) | {cpu_ms:.1f} | {gpu_ms:.1f} | {auto_ms:.1f} | {cpu_ms / auto_ms:.2f}× |")
-    if stream_cpu_ms is not None and stream_gpu_ms is not None and stream_auto_ms is not None:
-        print(f"| stream kNN+pool (compile) | {stream_cpu_ms:.1f} | {stream_gpu_ms:.1f} | {stream_auto_ms:.1f} | {stream_cpu_ms / stream_auto_ms:.2f}× |")
+    if open_cpu_ms is not None and open_gpu_ms is not None and open_auto_ms is not None:
+        print(
+            f"| open kNN+pool (compile) | {open_cpu_ms:.1f} | {open_gpu_ms:.1f} | {open_auto_ms:.1f} | "
+            f"{open_cpu_ms / open_auto_ms:.2f}× |"
+        )
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:

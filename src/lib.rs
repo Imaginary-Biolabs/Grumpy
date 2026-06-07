@@ -23,7 +23,6 @@ mod dataframe_indexing;
 mod io;
 mod io_cache;
 mod random;
-mod stream;
 mod py_api;
 
 use pyo3::prelude::*;

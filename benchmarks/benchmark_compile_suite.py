@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Streaming compiler benchmark — where ``gr.compile`` pays off.
+Open-handle compiler benchmark — where ``gr.compile`` pays off.
 
-Simulates protein-structure training pipelines: Zarr-backed axis-0 streaming over
-a saved dataset, comparing Python vs compiled transforms and Rust batch scheduling.
+Simulates protein-structure training pipelines: Zarr-backed batched indexing via
+``gr.open``, comparing eager Python transforms vs ``compile_pipeline`` per batch.
 
 Defaults target a **~3–5 min** full suite: 256-structure mini-epoch, 256-residue CA
 traces, ``batch_size=32``. Pipelines are compute-heavy (fused elementwise chains and
-kNN + pool) so **compiled + Rust batch scheduler (cpu=4)** clearly beats eager Python
-streaming; use ``--quick`` for a <60 s elementwise-only smoke run.
+kNN + pool); use ``--quick`` for a <60 s elementwise-only smoke run.
 """
 
 from __future__ import annotations
@@ -27,9 +26,10 @@ from typing import Callable
 import numpy as np
 
 import grumpy as gr
-from grumpy.compiler import compile_pipeline_info
+from grumpy.compiler import compile_pipeline, compile_pipeline_info
 
 from _bench_common import row_length, timeit
+from _open_epoch import epoch_open_batched
 
 # --- timing guards (seconds) ---
 DEFAULT_SUITE_BUDGET_S = 300.0
@@ -44,11 +44,8 @@ class BenchTimeout(Exception):
 class CompileBenchCase:
     name: str
     complexity: str
-    stream_py_cpu1_ms: float | None
-    stream_py_cpu4_ms: float | None
-    stream_compiled_cpu1_ms: float | None
-    stream_compiled_cpu4_pysched_ms: float | None
-    stream_compiled_cpu4_rust_ms: float | None
+    open_py_ms: float | None
+    open_compiled_ms: float | None
     grumpy_code: str = ""
     notes: str = ""
 
@@ -77,24 +74,25 @@ def _alarm_handler(_signum: int, _frame) -> None:
     raise BenchTimeout()
 
 
-def _time_epoch(
+def _time_open_epoch(
     path: str,
-    fns: list[Callable],
+    transform: Callable,
     *,
+    n_molecules: int,
     batch_size: int,
-    cpu: int,
-    compile: bool | str,
-    scheduler: str,
     warmup: int,
     repeats: int,
     timeout_s: float,
 ) -> float:
-    """Return best wall time (seconds) for one full pass over all stream batches."""
+    """Return best wall time (seconds) for one full batched pass via ``gr.open``."""
 
     def run() -> None:
-        st = gr.stream(path, batch_size=batch_size, drop_last=False)
-        for _ in st.apply(fns, cpu=cpu, compile=compile, scheduler=scheduler):
-            pass
+        epoch_open_batched(
+            path,
+            transform,
+            n_molecules=n_molecules,
+            batch_size=batch_size,
+        )
 
     old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
     signal.setitimer(signal.ITIMER_REAL, timeout_s)
@@ -163,59 +161,60 @@ def _protein_dataframe(
     )
 
 
-def _bench_stream_modes(
+def _py_pipeline(fns: list[Callable]) -> Callable:
+    def run(batch):
+        for fn in fns:
+            batch = fn(batch)
+        return batch
+
+    return run
+
+
+def _bench_open_modes(
     path: str,
     fns: list[Callable],
     *,
+    n_molecules: int,
     batch_size: int,
-    cpu: int,
     warmup: int,
     repeats: int,
     mode_timeout_s: float,
     deadline: float,
     label: str,
-) -> tuple[float | None, float | None, float | None, float | None, float | None]:
+) -> tuple[float | None, float | None]:
     _require_compiled(fns)
     modes = (
-        ("stream_py_cpu1_ms", dict(cpu=1, compile=False, scheduler="auto")),
-        ("stream_py_cpu4_ms", dict(cpu=cpu, compile=False, scheduler="auto")),
-        ("stream_compiled_cpu1_ms", dict(cpu=1, compile=True, scheduler="auto")),
-        ("stream_compiled_cpu4_pysched_ms", dict(cpu=cpu, compile=True, scheduler="python")),
-        ("stream_compiled_cpu4_rust_ms", dict(cpu=cpu, compile=True, scheduler="auto")),
+        ("open_py_ms", _py_pipeline(fns)),
+        ("open_compiled_ms", compile_pipeline(fns)),
     )
     results: dict[str, float | None] = {k: None for k, _ in modes}
 
-    for key, kw in modes:
+    for key, transform in modes:
         if time.perf_counter() >= deadline:
             print(f"  skip {label}/{key}: suite budget exhausted", file=sys.stderr, flush=True)
             break
         try:
-            sec = _time_epoch(
+            sec = _time_open_epoch(
                 path,
-                fns,
+                transform,
+                n_molecules=n_molecules,
                 batch_size=batch_size,
                 warmup=warmup,
                 repeats=repeats,
                 timeout_s=mode_timeout_s,
-                **kw,
             )
             results[key] = sec * 1e3
         except BenchTimeout:
             print(f"  TIMEOUT {label}/{key} > {mode_timeout_s:.0f}s — skipped", file=sys.stderr, flush=True)
             continue
 
-    return (
-        results["stream_py_cpu1_ms"],
-        results["stream_py_cpu4_ms"],
-        results["stream_compiled_cpu1_ms"],
-        results["stream_compiled_cpu4_pysched_ms"],
-        results["stream_compiled_cpu4_rust_ms"],
-    )
+    return results["open_py_ms"], results["open_compiled_ms"]
 
 
 def build_cases(
     coord_path: str,
     *,
+    n_molecules: int,
     batch_size: int,
     cpu: int,
     n_residues: int,
@@ -311,11 +310,11 @@ def build_cases(
             print(f"  skip {name}: suite budget exhausted", file=sys.stderr, flush=True)
             break
         print(f"  case: {name}", file=sys.stderr, flush=True)
-        py1, py4, c1, c4_py, c4_rust = _bench_stream_modes(
+        py_ms, compiled_ms = _bench_open_modes(
             coord_path,
             fns,
+            n_molecules=n_molecules,
             batch_size=batch_size,
-            cpu=cpu,
             warmup=warmup,
             repeats=repeats,
             mode_timeout_s=mode_timeout_s,
@@ -326,11 +325,8 @@ def build_cases(
             CompileBenchCase(
                 name=name,
                 complexity=complexity,
-                stream_py_cpu1_ms=py1,
-                stream_py_cpu4_ms=py4,
-                stream_compiled_cpu1_ms=c1,
-                stream_compiled_cpu4_pysched_ms=c4_py,
-                stream_compiled_cpu4_rust_ms=c4_rust,
+                open_py_ms=py_ms,
+                open_compiled_ms=compiled_ms,
                 grumpy_code=code,
                 notes=f"{notes}; {n_residues}-residue CA, batch_size={batch_size}",
             )
@@ -340,7 +336,7 @@ def build_cases(
 
 
 def print_report(report: CompileBenchReport) -> None:
-    print("## Streaming compile suite — full mini-epoch\n")
+    print("## Open-handle compile suite — full mini-epoch\n")
     print(f"- python: {report.python}")
     print(f"- numpy: {report.numpy}")
     print(f"- platform: {report.platform}")
@@ -350,37 +346,28 @@ def print_report(report: CompileBenchReport) -> None:
         f"warmup={report.warmup}, repeats={report.repeats}, "
         f"budget={report.suite_budget_s:.0f}s, wall={report.wall_time_s:.1f}s\n"
     )
-    print(
-        "| pipeline | Python cpu=1 | Python cpu=4 | Compiled cpu=1 | Compiled cpu=4 py | Compiled cpu=4 rust |"
-    )
-    print("|---|---:|---:|---:|---:|---:|")
+    print("| pipeline | Python (open) | Compiled (open) | speedup |")
+    print("|---|---:|---:|---:|")
     for c in report.cases:
         def _cell(v: float | None) -> str:
             return "—" if v is None else f"{v:.1f}"
 
-        print(
-            f"| {c.name} | {_cell(c.stream_py_cpu1_ms)} | {_cell(c.stream_py_cpu4_ms)} | "
-            f"{_cell(c.stream_compiled_cpu1_ms)} | {_cell(c.stream_compiled_cpu4_pysched_ms)} | "
-            f"{_cell(c.stream_compiled_cpu4_rust_ms)} |"
-        )
+        speedup = "—"
+        if c.open_py_ms and c.open_compiled_ms:
+            speedup = f"{c.open_py_ms / c.open_compiled_ms:.2f}×"
+        print(f"| {c.name} | {_cell(c.open_py_ms)} | {_cell(c.open_compiled_ms)} | {speedup} |")
     print()
     for c in report.cases:
         print(f"### {c.name}")
-        if c.stream_py_cpu1_ms and c.stream_compiled_cpu1_ms:
-            print(f"- compile vs Python (cpu=1): {c.stream_py_cpu1_ms / c.stream_compiled_cpu1_ms:.2f}×")
-        if c.stream_py_cpu1_ms and c.stream_compiled_cpu4_rust_ms:
-            print(f"- Rust compiled (cpu=4) vs Python (cpu=1): {c.stream_py_cpu1_ms / c.stream_compiled_cpu4_rust_ms:.2f}×")
-        if c.stream_py_cpu4_ms and c.stream_compiled_cpu4_rust_ms:
-            print(f"- Rust compiled (cpu=4) vs Python parallel (cpu=4): {c.stream_py_cpu4_ms / c.stream_compiled_cpu4_rust_ms:.2f}×")
-        if c.stream_compiled_cpu4_pysched_ms and c.stream_compiled_cpu4_rust_ms:
-            print(f"- Rust vs ThreadPool scheduler (cpu=4): {c.stream_compiled_cpu4_pysched_ms / c.stream_compiled_cpu4_rust_ms:.2f}×")
+        if c.open_py_ms and c.open_compiled_ms:
+            print(f"- compiled vs Python: {c.open_py_ms / c.open_compiled_ms:.2f}×")
         if c.notes:
             print(f"- {c.notes}")
         print()
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Streaming compiler benchmark with JSON export.")
+    ap = argparse.ArgumentParser(description="Open-handle compiler benchmark with JSON export.")
     ap.add_argument("--n-molecules", type=int, default=256, help="Structures in Zarr store (mini-epoch).")
     ap.add_argument("--n-residues", type=int, default=256, help="Residues per structure (typical domain length).")
     ap.add_argument(
@@ -417,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
 
         cases = build_cases(
             coord_path,
+            n_molecules=args.n_molecules,
             batch_size=args.batch_size,
             cpu=args.cpu,
             n_residues=args.n_residues,
@@ -435,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     report = CompileBenchReport(
-        suite="compile_streaming",
+        suite="compile_open",
         python=sys.version.split()[0],
         numpy=np.__version__,
         platform=platform.platform(),

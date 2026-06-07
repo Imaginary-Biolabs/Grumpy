@@ -1,8 +1,6 @@
-"""Cover last compiler/stream branches."""
+"""Cover last compiler branches."""
 
 from __future__ import annotations
-
-import textwrap
 
 import pytest
 
@@ -12,7 +10,6 @@ from grumpy.compiler import (
     _try_compile,
     _try_compile_to_ops,
 )
-from grumpy.stream import StreamApply
 
 
 def test_try_compile_to_ops_no_source(monkeypatch):
@@ -54,37 +51,11 @@ def test_try_compile_empty_body():
     assert _try_compile(ns["f"]).error
 
 
-def test_stream_unsupported_op_rust_warns(tmp_path, monkeypatch):
-    x = gr.array([1.0, 2.0], dtype=gr.float64)
-    p = tmp_path / "a.gr"
-    gr.save(x, str(p))
-    st = gr.stream(str(p), batch_size=1)
-
+def test_compile_pipeline_info_fused_ops():
     def t(batch):
-        batch = batch * 2.0
+        batch = batch * 2
         return batch
 
-    sa = st.apply(t, cpu=2, compile=True, scheduler="rust")
-    import grumpy.compiler as cm
-
-    fake_info = PipelineInfo(
-        run_all=lambda b: b,
-        fully_compiled=True,
-        fused_ops=[{"op": "not_a_real_op"}],
-    )
-
-    def fake_info_fn(_fns):
-        return fake_info
-
-    monkeypatch.setattr(cm, "compile_pipeline_info", fake_info_fn)
-    with pytest.warns(UserWarning, match="not supported by Rust scheduling"):
-        list(sa)
-
-
-def test_stream_parallel_refill(tmp_path):
-    x = gr.array([[1], [2], [3], [4]], dtype=gr.int32)
-    p = tmp_path / "a.gr"
-    gr.save(x, str(p))
-    st = gr.stream(str(p), batch_size=1)
-    out = list(st.apply(lambda b: b, cpu=2, prefetch=2))
-    assert len(out) == 4
+    info = gr.compile_pipeline_info([t])
+    assert info.fully_compiled
+    assert info.fused_ops

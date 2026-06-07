@@ -1,8 +1,8 @@
 # Saving and loading
 
-Training and analysis pipelines need data that outlives a single Python session. Grumpy persists **list-chain** and **union** layouts to **Zarr** directory stores with a `grumpy.json` layout manifest, then reads back only the leaf ranges required for each batch. That combination — compact on-disk layout plus partial I/O — is what makes large protein datasets practical without loading everything into RAM.
+Training and analysis pipelines need data that outlives a single Python session. Grumpy persists **list-chain** and **union** layouts to **Zarr** directory stores with a `grumpy.json` layout manifest, then reads back only the leaf ranges required for each access. That combination — compact on-disk layout plus partial I/O — is what makes large protein datasets practical without loading everything into RAM.
 
-This page covers one-shot save/load, then streaming with `apply` for batched transforms.
+This page covers one-shot save/load, lazy `open`, and incremental append.
 
 ## Save and load
 
@@ -29,6 +29,10 @@ gr.save(x, "union.gr", chunk_size=64)
 assert gr.load("union.gr").to_list() == x.to_list()
 ```
 
+### Canonical shape metadata
+
+Dataframes with `schema=` persist **canonical nested shape** (`canon`) in `grumpy.json` — axis-0 length and list-offset vectors per schema level. This powers `df.shape(dim=…)` and `gr.open(…).shape(dim=…)` without reading a reference column from disk.
+
 ### Chunk sizing
 
 By default every 1-D leaf buffer uses `chunk_size` (default 1024). Tune this when outer axes are small and inner leaves are large — typical for atom-level coordinates:
@@ -53,83 +57,43 @@ assert len(gr.load("list.gr")) == 10
 
 Each append loads the existing store, concatenates axis 0, and rewrites. For very large corpora, prefer writing separate shards or a single upfront save.
 
-## Streaming with apply
+## Lazy open (`gr.open`)
 
-`gr.stream` opens a saved store and yields **batches** along axis 0 (or along a schema entity via `batch_on`). Transforms run through `apply`, which supports Python threading and optional Rust scheduling when the pipeline compiles.
-
-### Basic streaming
+`gr.open` returns an **OpenDataFrame** — a lazy handle over a saved dataframe. Row and schema indexing **materialize** subset dataframes; column selection returns an **OpenColumn** proxy until indexed.
 
 ```python
-st = gr.stream("data.gr", batch_size=32, drop_last=False)
-print(len(st))  # number of batches — metadata only, no full load
+with gr.open("proteins.gr") as h:
+    print(len(h))                      # axis-0 length from canon metadata
+    print(h.shape(dim="molecule"))     # nested counts without leaf I/O
+    batch = h.scene[[0, 5, 12]]        # materialized GrumpyDataFrame
+    pos = h.residue_pos[[True, False]] # partial column load via OpenColumn
 
-for batch in st:
-    process(batch)
+# Or manage the handle explicitly:
+h = gr.open("proteins.gr")
+full = h.load()
+h.close()
 ```
 
-Subset batches without reloading the file:
+Schema drill-down matches in-memory dataframes:
 
 ```python
-for batch in st[0:4]:
-    process(batch)
+scene = h.scene[0]                 # materialized subset
+mol = scene.molecule[1]
 ```
 
-### Parallel apply
+Dot notation on `open` returns lazy column proxies (`open.residue_pos`); bracket column select (`open["residue_pos"]`) keeps full nesting until indexed.
 
-Pass one or more callables; `cpu` controls transform parallelism (distinct from I/O `workers` on `Stream`):
+### Partial axis-0 reads
 
-```python
-def transform(batch):
-    return batch.vals * 2.0
-
-st2 = st.apply(transform, cpu=4)
-for batch in st2:
-    train_step(batch)
-```
-
-Prefetch I/O while transforms run:
-
-```python
-st = gr.stream("data.gr", batch_size=32, workers=2)
-for batch in st.apply(transform, cpu=4):
-    train_step(batch)
-```
-
-### Training-oriented options
-
-For reproducible epoch order, set `shuffle` and `seed`. For multi-GPU data parallel training, partition batches with `world_size` and `rank`:
-
-```python
-st = gr.stream(
-    "data.gr",
-    batch_size=32,
-    shuffle="molecule",   # schema level name, or True for axis 0
-    seed=42,
-    world_size=4,
-    rank=0,
-)
-```
-
-Pack batches by schema entity instead of flat axis 0 when molecules should stay whole:
-
-```python
-st = gr.stream("proteins.gr", batch_size=8, batch_on="molecule")
-```
-
-Load the full dataset once when RAM allows and batches should be zero-copy slices:
-
-```python
-st = gr.stream("data.gr", batch_size=32, in_memory=True)
-```
-
-Union datasets use **compact partial I/O**: each batch reads only selected outer rows and the scalar/list segments they reference.
+Low-level `gr._core.load_slice(path, start, stop)` loads a contiguous axis-0 range for arrays or dataframes without opening a long-lived handle. Union datasets read only the referenced scalar/list segments.
 
 ### Current limitations
 
-- **`Indexed`** layouts are not supported for streaming slice loads.
+- **`Indexed`** layouts are not supported for on-disk slice loads (materialize before save).
+- **`gr.open`** is dataframe-only; use `gr.load` or `load_slice` for arrays.
 
-Fusing transforms into a single Rust plan — and when that pays off — is covered in [Compilation](compilation.md).
+Fusing transforms into a single Rust plan is covered in [Compilation](compilation.md). Training-time batching, shuffle, and DDP live in **Fabric** (outside Grumpy).
 
 ---
 
-**Next:** [Compilation](compilation.md) — fuse batch transforms and schedule them with Rust across CPU cores.
+**Next:** [Compilation](compilation.md) — fuse transforms into a Rust execution plan.

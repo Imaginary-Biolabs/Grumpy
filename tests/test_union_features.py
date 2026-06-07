@@ -9,26 +9,23 @@ def _union_array():
     return gr.array([1, [2, 3], 4, [5]], dtype=gr.int64)
 
 
-def test_union_scalar_mul_compiled_path(tmp_path):
+def test_union_scalar_mul_compiled_path():
     x = gr.array([1.0, [2.0, 3.0], 4.0], dtype=gr.float64)
-    path = str(tmp_path / "u.gr")
-    gr.save(x, path, chunk_size=2)
 
     def mul_only(batch):
         batch = batch * 2.0
         return batch
 
-    st = gr.stream(path, batch_size=1)
-    out = list(st.apply(mul_only, cpu=1, compile=True, scheduler="rust"))
-    assert [b.to_list() for b in out] == [[2.0], [[4.0, 6.0]], [8.0]]
+    out = gr.compile(mul_only)(x)
+    assert out.to_list() == [2.0, [4.0, 6.0], 8.0]
 
 
-def test_union_stream_batches(tmp_path):
+def test_union_load_slice(tmp_path):
     x = _union_array()
     path = str(tmp_path / "u.gr")
     gr.save(x, path)
-    batches = [b.to_list() for b in gr.stream(path, batch_size=2)]
-    assert batches == [[1, [2, 3]], [4, [5]]]
+    assert gr._core.load_slice(path, 0, 2).to_list() == x[0:2].to_list()
+    assert gr._core.load_slice(path, 2, 4).to_list() == x[2:4].to_list()
 
 
 def test_union_sum_all():

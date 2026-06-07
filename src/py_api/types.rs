@@ -1,11 +1,10 @@
+use crate::dataframe::{CanonShape, Schema};
 use crate::dataframe as df_ops;
-use crate::io as io_ops;
+use crate::io::OpenSession;
 use crate::layout::GrumpyArray;
 use crate::random::GrumpyRng;
 use crate::reduce::ReduceOp;
-use crate::stream::{BatchPayload, BatchPlan};
 use std::cell::RefCell;
-use std::sync::mpsc::Receiver;
 use pyo3::prelude::*;
 
 #[pyclass(name = "GrumpyArray")]
@@ -29,6 +28,31 @@ pub struct PyDataFrameAccessor {
     // Schema levels path, e.g. ["residue"] or ["molecule","residue"].
     pub(crate) path: Vec<String>,
     pub(crate) index_level: usize,
+}
+
+/// Lazy on-disk dataframe handle returned by :func:`grumpy.open`.
+#[pyclass(name = "OpenDataFrame")]
+pub struct PyOpenDataFrame {
+    pub(crate) session: OpenSession,
+    pub(crate) column_names: Option<Vec<String>>,
+    pub(crate) schema: Option<Schema>,
+    pub(crate) canon: CanonShape,
+    pub(crate) index_depth: usize,
+}
+
+/// Lazy column proxy; indexing materializes a :class:`GrumpyArray`.
+#[pyclass(name = "OpenColumn")]
+pub struct PyOpenColumn {
+    pub(crate) session: OpenSession,
+    pub(crate) column_name: String,
+    pub(crate) column_names: Option<Vec<String>>,
+    pub(crate) schema: Option<Schema>,
+    pub(crate) canon: CanonShape,
+    pub(crate) index_depth: usize,
+    /// Schema axes to drop for dot-notation column access.
+    pub(crate) drop_axes: usize,
+    /// When true, flatten nested column to leaf before indexing (``open.col`` access).
+    pub(crate) flatten_to_leaf: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -58,13 +82,3 @@ pub struct PyCompiledBatchesIter {
     pub(crate) pos: usize,
 }
 
-#[pyclass(name = "StreamBatchesIter")]
-pub struct PyStreamBatchesIter {
-    pub(crate) handle: io_ops::DatasetHandle,
-    pub(crate) is_dataframe: bool,
-    pub(crate) plan: BatchPlan,
-    pub(crate) pos: usize,
-    pub(crate) shuffle_within: Option<String>,
-    pub(crate) seed: Option<u64>,
-    pub(crate) prefetch_rx: Option<Receiver<PyResult<BatchPayload>>>,
-}

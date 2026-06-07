@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-In-memory vs Zarr streaming benchmark.
+In-memory vs ``gr.open`` indexing benchmark.
 
 Compares the same batch transforms over:
   - a dataset resident in RAM (manual axis-0 batch slices), and
-  - ``gr.stream`` loads from a saved Zarr store.
+  - ``gr.open`` batched indexing from a saved Zarr store.
 
-Also times stream **load-only** (no transform) to separate I/O from compute.
+Also times open **load-only** (no transform) to separate I/O from compute.
 Defaults complete in **< 60 s** (256 structures × 96 residues, batch_size=32).
 """
 
@@ -28,6 +28,7 @@ import numpy as np
 import grumpy as gr
 
 from _bench_common import timeit
+from _open_epoch import epoch_in_memory_batched, epoch_open_batched, epoch_open_load_only
 from benchmark_compile_suite import _protein_coords, _protein_dataframe
 
 DEFAULT_SUITE_BUDGET_S = 55.0
@@ -41,19 +42,17 @@ class BenchTimeout(Exception):
 
 
 @dataclass
-class MemoryStreamCase:
+class MemoryOpenCase:
     name: str
     in_memory_ms: float | None
-    stream_transform_ms: float | None
-    stream_load_only_ms: float | None
-    stream_prefetch_ms: float | None = None
-    stream_in_memory_ms: float | None = None
+    open_transform_ms: float | None
+    open_load_only_ms: float | None
     grumpy_code: str = ""
     notes: str = ""
 
 
 @dataclass
-class MemoryStreamReport:
+class MemoryOpenReport:
     suite: str
     python: str
     numpy: str
@@ -67,7 +66,7 @@ class MemoryStreamReport:
     suite_budget_s: float
     case_timeout_s: float
     wall_time_s: float = 0.0
-    cases: list[MemoryStreamCase] = field(default_factory=list)
+    cases: list[MemoryOpenCase] = field(default_factory=list)
 
 
 def _alarm_handler(_signum: int, _frame) -> None:
@@ -84,45 +83,11 @@ def _timed_call(fn: Callable[[], None], *, warmup: int, repeats: int, timeout_s:
         signal.signal(signal.SIGALRM, old_handler)
 
 
-def _epoch_in_memory_batched(
-    obj: T,
-    transform: Callable[[T], T],
-    *,
-    n_molecules: int,
-    batch_size: int,
-) -> None:
-    for start in range(0, n_molecules, batch_size):
-        stop = min(start + batch_size, n_molecules)
-        batch = obj[start:stop]
-        transform(batch)
-
-
-def _epoch_stream_transform(
-    path: str,
-    transform: Callable[[T], T],
-    *,
-    batch_size: int,
-    workers: int = 0,
-    in_memory: bool = False,
-) -> None:
-    st = gr.stream(path, batch_size=batch_size, drop_last=False, workers=workers, in_memory=in_memory)
-    for batch in st:
-        transform(batch)
-
-
-def _epoch_stream_load_only(
-    path: str, *, batch_size: int, workers: int = 0, in_memory: bool = False
-) -> None:
-    st = gr.stream(path, batch_size=batch_size, drop_last=False, workers=workers, in_memory=in_memory)
-    for _batch in st:
-        pass
-
-
 def _bench_case(
     name: str,
     *,
     in_memory_obj: T,
-    stream_path: str,
+    open_path: str,
     transform: Callable[[T], T],
     n_molecules: int,
     batch_size: int,
@@ -132,22 +97,20 @@ def _bench_case(
     deadline: float,
     grumpy_code: str,
     notes: str,
-    workers: int = 0,
-    in_memory: bool = False,
-) -> MemoryStreamCase | None:
+) -> MemoryOpenCase | None:
     if time.perf_counter() >= deadline:
         print(f"  skip {name}: suite budget exhausted", file=sys.stderr, flush=True)
         return None
 
     print(f"  case: {name}", file=sys.stderr, flush=True)
     in_ms: float | None = None
-    stream_ms: float | None = None
+    open_ms: float | None = None
     load_ms: float | None = None
 
     try:
         in_ms = (
             _timed_call(
-                lambda: _epoch_in_memory_batched(
+                lambda: epoch_in_memory_batched(
                     in_memory_obj, transform, n_molecules=n_molecules, batch_size=batch_size
                 ),
                 warmup=warmup,
@@ -158,20 +121,19 @@ def _bench_case(
         )
     except BenchTimeout:
         print(f"  TIMEOUT {name}/in-memory > {case_timeout_s:.0f}s", file=sys.stderr, flush=True)
-        return MemoryStreamCase(name, None, None, None, grumpy_code, notes + " (in-memory timed out)")
+        return MemoryOpenCase(name, None, None, None, grumpy_code, notes + " (in-memory timed out)")
 
     if time.perf_counter() >= deadline:
-        return MemoryStreamCase(name, in_ms, None, None, grumpy_code, notes)
+        return MemoryOpenCase(name, in_ms, None, None, grumpy_code, notes)
 
     try:
-        stream_ms = (
+        open_ms = (
             _timed_call(
-                lambda: _epoch_stream_transform(
-                    stream_path,
+                lambda: epoch_open_batched(
+                    open_path,
                     transform,
+                    n_molecules=n_molecules,
                     batch_size=batch_size,
-                    workers=workers,
-                    in_memory=in_memory,
                 ),
                 warmup=warmup,
                 repeats=repeats,
@@ -180,20 +142,19 @@ def _bench_case(
             * 1e3
         )
     except BenchTimeout:
-        print(f"  TIMEOUT {name}/stream-transform > {case_timeout_s:.0f}s", file=sys.stderr, flush=True)
-        return MemoryStreamCase(name, in_ms, None, None, grumpy_code=grumpy_code, notes=notes)
+        print(f"  TIMEOUT {name}/open-transform > {case_timeout_s:.0f}s", file=sys.stderr, flush=True)
+        return MemoryOpenCase(name, in_ms, None, None, grumpy_code=grumpy_code, notes=notes)
 
     if time.perf_counter() >= deadline:
-        return MemoryStreamCase(name, in_ms, stream_ms, None, grumpy_code=grumpy_code, notes=notes)
+        return MemoryOpenCase(name, in_ms, open_ms, None, grumpy_code=grumpy_code, notes=notes)
 
     try:
         load_ms = (
             _timed_call(
-                lambda: _epoch_stream_load_only(
-                    stream_path,
+                lambda: epoch_open_load_only(
+                    open_path,
+                    n_molecules=n_molecules,
                     batch_size=batch_size,
-                    workers=workers,
-                    in_memory=in_memory,
                 ),
                 warmup=warmup,
                 repeats=repeats,
@@ -202,10 +163,10 @@ def _bench_case(
             * 1e3
         )
     except BenchTimeout:
-        print(f"  TIMEOUT {name}/stream-load > {case_timeout_s:.0f}s", file=sys.stderr, flush=True)
-        return MemoryStreamCase(name, in_ms, stream_ms, None, grumpy_code=grumpy_code, notes=notes)
+        print(f"  TIMEOUT {name}/open-load > {case_timeout_s:.0f}s", file=sys.stderr, flush=True)
+        return MemoryOpenCase(name, in_ms, open_ms, None, grumpy_code=grumpy_code, notes=notes)
 
-    return MemoryStreamCase(name, in_ms, stream_ms, load_ms, grumpy_code=grumpy_code, notes=notes)
+    return MemoryOpenCase(name, in_ms, open_ms, load_ms, grumpy_code=grumpy_code, notes=notes)
 
 
 def build_cases(
@@ -222,8 +183,8 @@ def build_cases(
     repeats: int,
     case_timeout_s: float,
     suite_budget_s: float,
-) -> list[MemoryStreamCase]:
-    cases: list[MemoryStreamCase] = []
+) -> list[MemoryOpenCase]:
+    cases: list[MemoryOpenCase] = []
     deadline = time.perf_counter() + suite_budget_s
 
     def scale(batch):
@@ -278,7 +239,7 @@ def build_cases(
         row = _bench_case(
             name,
             in_memory_obj=mem_obj,
-            stream_path=path,
+            open_path=path,
             transform=transform,
             n_molecules=n_molecules,
             batch_size=batch_size,
@@ -288,35 +249,14 @@ def build_cases(
             deadline=deadline,
             grumpy_code=code,
             notes=notes,
-            workers=4,
         )
         if row is not None:
             cases.append(row)
-            if "df" in name.lower():
-                if time.perf_counter() >= deadline:
-                    continue
-                im_row = _bench_case(
-                    f"{name} (in_memory=True)",
-                    in_memory_obj=mem_obj,
-                    stream_path=path,
-                    transform=transform,
-                    n_molecules=n_molecules,
-                    batch_size=batch_size,
-                    warmup=warmup,
-                    repeats=repeats,
-                    case_timeout_s=case_timeout_s,
-                    deadline=deadline,
-                    grumpy_code=code,
-                    notes="stream with in_memory=True (full dataset resident in RAM)",
-                    in_memory=True,
-                )
-                if im_row is not None:
-                    cases.append(im_row)
     return cases
 
 
-def print_report(report: MemoryStreamReport) -> None:
-    print("## In-memory vs streaming — batched epoch\n")
+def print_report(report: MemoryOpenReport) -> None:
+    print("## In-memory vs gr.open — batched epoch\n")
     print(f"- python: {report.python}")
     print(f"- numpy: {report.numpy}")
     print(f"- platform: {report.platform}")
@@ -326,8 +266,7 @@ def print_report(report: MemoryStreamReport) -> None:
         f"warmup={report.warmup}, repeats={report.repeats}, "
         f"budget={report.suite_budget_s:.0f}s, wall={report.wall_time_s:.1f}s\n"
     )
-    print("Stream cases use `workers=4` for parallel I/O prefetch.\n")
-    print("| case | in-memory | stream (load+transform) | stream load-only | transform overhead |")
+    print("| case | in-memory | open (load+transform) | open load-only | transform overhead |")
     print("|---|---:|---:|---:|---:|")
 
     def cell(v: float | None) -> str:
@@ -335,30 +274,30 @@ def print_report(report: MemoryStreamReport) -> None:
 
     for c in report.cases:
         overhead: float | None = None
-        if c.stream_transform_ms is not None and c.stream_load_only_ms is not None:
-            overhead = max(0.0, c.stream_transform_ms - c.stream_load_only_ms)
+        if c.open_transform_ms is not None and c.open_load_only_ms is not None:
+            overhead = max(0.0, c.open_transform_ms - c.open_load_only_ms)
         print(
-            f"| {c.name} | {cell(c.in_memory_ms)} | {cell(c.stream_transform_ms)} | "
-            f"{cell(c.stream_load_only_ms)} | {cell(overhead)} |"
+            f"| {c.name} | {cell(c.in_memory_ms)} | {cell(c.open_transform_ms)} | "
+            f"{cell(c.open_load_only_ms)} | {cell(overhead)} |"
         )
 
     print()
     for c in report.cases:
         print(f"### {c.name}")
-        if c.in_memory_ms and c.stream_transform_ms:
-            print(f"- stream / in-memory: {c.stream_transform_ms / c.in_memory_ms:.2f}×")
-        if c.stream_load_only_ms and c.stream_transform_ms:
-            overhead = max(0.0, c.stream_transform_ms - c.stream_load_only_ms)
-            pct = 100.0 * c.stream_load_only_ms / c.stream_transform_ms if c.stream_transform_ms else 0.0
-            print(f"- transform overhead (stream − load-only): {overhead:.1f} ms")
-            print(f"- load share of stream epoch: {pct:.0f}%")
+        if c.in_memory_ms and c.open_transform_ms:
+            print(f"- open / in-memory: {c.open_transform_ms / c.in_memory_ms:.2f}×")
+        if c.open_load_only_ms and c.open_transform_ms:
+            overhead = max(0.0, c.open_transform_ms - c.open_load_only_ms)
+            pct = 100.0 * c.open_load_only_ms / c.open_transform_ms if c.open_transform_ms else 0.0
+            print(f"- transform overhead (open − load-only): {overhead:.1f} ms")
+            print(f"- load share of open epoch: {pct:.0f}%")
         if c.notes:
             print(f"- {c.notes}")
         print()
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="In-memory vs streaming benchmark.")
+    ap = argparse.ArgumentParser(description="In-memory vs gr.open benchmark.")
     ap.add_argument("--n-molecules", type=int, default=256)
     ap.add_argument("--n-residues", type=int, default=96)
     ap.add_argument("--atoms-per-res", type=int, default=4)
@@ -375,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
     rng = np.random.default_rng(args.seed)
     n_batches = (args.n_molecules + args.batch_size - 1) // args.batch_size
 
-    with tempfile.TemporaryDirectory(prefix="grumpy_mem_stream_bench_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="grumpy_mem_open_bench_") as tmp:
         coord_path = str(Path(tmp) / "coords.gr")
         df_full_path = str(Path(tmp) / "proteins.gr")
         df_atoms_path = str(Path(tmp) / "proteins_atoms.gr")
@@ -416,8 +355,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     wall_time = time.perf_counter() - wall_start
-    report = MemoryStreamReport(
-        suite="memory_vs_stream",
+    report = MemoryOpenReport(
+        suite="memory_vs_open",
         python=sys.version.split()[0],
         numpy=np.__version__,
         platform=platform.platform(),

@@ -114,8 +114,18 @@ pub struct GrumpyDataFrame {
 
 impl GrumpyDataFrame {
     pub fn new(names: Vec<String>, cols: Vec<GrumpyArray>, schema: Option<Schema>) -> PyResult<Self> {
-        if names.len() != cols.len() {
-            return Err(internal("GrumpyDataFrame::new", "names/cols length mismatch"));
+        Self::from_loaded(names, cols, schema, None)
+    }
+
+    /// Construct from loaded columns, optionally restoring persisted canonical shape metadata.
+    pub fn from_loaded(
+        names: Vec<String>,
+        cols: Vec<GrumpyArray>,
+        schema: Option<Schema>,
+        canon: Option<CanonShape>,
+    ) -> PyResult<Self> {
+        if names.len() != cols.len() && !(cols.is_empty() && !names.is_empty()) {
+            return Err(internal("GrumpyDataFrame::from_loaded", "names/cols length mismatch"));
         }
         let mut df = Self {
             names,
@@ -124,8 +134,41 @@ impl GrumpyDataFrame {
             canon: CanonShape::default(),
             index_depth: 0,
         };
-        df.recompute_canon()?;
+        if let Some(c) = canon {
+            df.canon = c;
+        } else {
+            df.recompute_canon()?;
+        }
         Ok(df)
+    }
+
+    /// Entity count at the current schema ``index_depth`` from canonical metadata alone.
+    pub fn entity_count_from_canon(&self) -> usize {
+        entity_count_from_canon(&self.canon, self.index_depth)
+    }
+
+    /// Array used for ``shape`` / ``nshape`` (column layout when resident, else canon metadata).
+    pub fn shape_proxy_array(&self) -> PyResult<GrumpyArray> {
+        if !self.cols.is_empty() {
+            let mut pick: Option<&GrumpyArray> = None;
+            let mut pick_ndim = 0usize;
+            for (name, col) in self.names.iter().zip(self.cols.iter()) {
+                let ndim = crate::layout::layout_ndim(&col.layout)?;
+                let prefer = if let Some(schema) = &self.schema {
+                    schema.level_for_column(name).ok().is_some_and(|lvl| lvl >= self.index_depth)
+                } else {
+                    true
+                };
+                if prefer && (pick.is_none() || ndim >= pick_ndim) {
+                    pick = Some(col);
+                    pick_ndim = ndim;
+                }
+            }
+            if let Some(col) = pick {
+                return Ok(col.clone());
+            }
+        }
+        proxy_array_from_canon(&self.canon, self.index_depth)
     }
 
     /// Intermediate schema-index step; shallow and deep columns may differ in outer length until final alignment.
@@ -809,4 +852,98 @@ pub fn parse_row_index(py: Python<'_>, idx: &Bound<'_, PyAny>, n: usize) -> PyRe
     ))
 }
 
+/// Entity count at schema ``index_depth`` from canonical metadata (no column I/O).
+pub fn entity_count_from_canon(canon: &CanonShape, index_depth: usize) -> usize {
+    if index_depth == 0 {
+        return canon.nrows.unwrap_or(0);
+    }
+    if let Some(off) = canon.offsets.get(index_depth).and_then(|o| o.as_ref()) {
+        return off.len().saturating_sub(1);
+    }
+    canon.nrows.unwrap_or(0)
+}
+
+/// Synthetic int64 array built from canonical offsets for shape queries.
+pub fn proxy_array_from_canon(canon: &CanonShape, index_depth: usize) -> PyResult<GrumpyArray> {
+    use crate::layout::{Leaf, LeafBuffer, ListOffset};
+    let outer = entity_count_from_canon(canon, index_depth);
+    let leaf_len = canon
+        .offsets
+        .iter()
+        .filter_map(|o| o.as_ref())
+        .last()
+        .and_then(|o| o.last().copied())
+        .map(|x| x as usize)
+        .unwrap_or(outer);
+    let mut inner: Layout = {
+        let mut l = Leaf::new(DType::Int64);
+        l.len = leaf_len;
+        l.buffer = LeafBuffer::I64(Arc::new(vec![0i64; leaf_len]));
+        Layout::Leaf(l)
+    };
+    for lev in (index_depth + 1..canon.offsets.len()).rev() {
+        if let Some(off) = canon.offsets[lev].as_ref() {
+            inner = Layout::ListOffset(ListOffset {
+                offsets: Arc::new(off.clone()),
+                content: Box::new(inner),
+            });
+        }
+    }
+    let layout = if canon.offsets.iter().all(|o| o.is_none()) && outer > 0 {
+        if matches!(inner, Layout::Leaf(_)) {
+            Layout::ListOffset(ListOffset {
+                offsets: Arc::new((0..=outer as i64).collect()),
+                content: Box::new(inner),
+            })
+        } else {
+            inner
+        }
+    } else {
+        inner
+    };
+    Ok(GrumpyArray {
+        dtype: DType::Int64,
+        layout,
+    })
+}
+
+/// Resolve ``dim`` for ``shape`` — int axis index or schema level name.
+pub fn resolve_shape_dim(
+    schema: Option<&Schema>,
+    index_depth: usize,
+    dim: &Bound<'_, PyAny>,
+) -> PyResult<usize> {
+    if let Ok(i) = dim.extract::<usize>() {
+        return Ok(i);
+    }
+    if let Ok(s) = dim.extract::<String>() {
+        let schema = schema.ok_or_else(|| {
+            schema_violation(
+                format!("unknown shape dim '{s}'"),
+                "named shape dimensions require schema=.",
+                "pass a numeric dim or construct the dataframe with schema=.",
+            )
+        })?;
+        let level = *schema.name_to_level.get(&s).ok_or_else(|| {
+            schema_violation(
+                format!("unknown schema level '{s}'"),
+                "dim must name a declared schema level.",
+                "use a level from schema= or a numeric dim index.",
+            )
+        })?;
+        if level < index_depth {
+            return Err(schema_violation(
+                format!("schema level '{s}' is above current index_depth {index_depth}"),
+                "shape dim must refer to the current nesting context or deeper levels.",
+                "index into outer schema levels before querying deeper shape dims.",
+            ));
+        }
+        return Ok(level - index_depth);
+    }
+    Err(arg_invalid(
+        "dim",
+        "shape dim must be int or schema level name",
+        "use df.shape(dim=0) or df.shape(dim='molecule').",
+    ))
+}
 

@@ -41,31 +41,6 @@ def test_reduce_dim_out_of_range():
     assert re.search(r"axis\s+5", msg)
 
 
-def test_stream_batch_index_oob():
-    import tempfile
-    import os
-
-    with tempfile.TemporaryDirectory() as td:
-        path = os.path.join(td, "x.gr")
-        gr.save(gr.array(list(range(10)), dtype=gr.int32), path)
-        st = gr.stream(path, batch_size=4)
-        with pytest.raises(IndexError) as ei:
-            _ = st[99]
-        _assert_grumpy_error(ei.value, "IndexOutOfBounds")
-
-
-def test_stream_shuffle_requires_seed():
-    import tempfile
-    import os
-
-    with tempfile.TemporaryDirectory() as td:
-        path = os.path.join(td, "x.gr")
-        gr.save(gr.array(list(range(4)), dtype=gr.int32), path)
-        with pytest.raises(ValueError) as ei:
-            gr.stream(path, batch_size=2, shuffle=True)
-        _assert_grumpy_error(ei.value, "ArgumentInvalid")
-
-
 def test_cat_dtype_mismatch():
     a = gr.array([1, 2], dtype=gr.int32)
     b = gr.array([3], dtype=gr.int64)
