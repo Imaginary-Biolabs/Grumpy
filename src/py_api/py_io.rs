@@ -39,6 +39,12 @@ pub fn clear_path_caches() {
 }
 
 #[pyfunction]
+pub fn io_cache_stats(path: String) -> PyResult<(usize, usize)> {
+    io_ops::io_cache_stats_for_path(&path)
+        .ok_or_else(|| PyValueError::new_err("no active open cache for path"))
+}
+
+#[pyfunction]
 #[pyo3(signature = (obj, path, chunk_size=1024usize, chunk_dim=None))]
 pub fn save(py: Python<'_>, obj: Bound<'_, PyAny>, path: String, chunk_size: usize, chunk_dim: Option<String>) -> PyResult<()> {
     let depth = chunk_dim

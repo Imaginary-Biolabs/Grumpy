@@ -1,7 +1,7 @@
 use crate::dataframe::{CanonShape, GrumpyDataFrame, Schema};
 use crate::dtype::DType;
 use crate::error::{arg_invalid, index_out_of_bounds, internal, internal_dtype_buffer_mismatch, invalid_slice_range, io_failed, io_wrong_type, schema_violation, unsupported};
-use crate::io_cache::{IoCache, IoReader};
+use crate::io_cache::{IoCache, IoCachePolicy, IoReader, DEFAULT_CHUNK_BUDGET_BYTES};
 use crate::layout::{concat_layout_segments, remap_union_pick, take_range, GrumpyArray, Layout, Leaf, LeafBuffer, ListOffset, OffsetView, UnionScalarList};
 use bitvec::bitvec;
 use bitvec::order::Lsb0;
@@ -36,21 +36,8 @@ pub(crate) fn record_io_bytes(n: usize) {
 const META_FILE: &str = "grumpy.json";
 const FORMAT_VERSION: u32 = 1;
 
-static PATH_IO_CACHES: LazyLock<Mutex<HashMap<String, Arc<IoCache>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 static PATH_RESIDENT: LazyLock<Mutex<HashMap<String, Arc<ResidentDataset>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn path_io_cache(path: &str) -> Arc<IoCache> {
-    let mut caches = PATH_IO_CACHES.lock().unwrap();
-    if let Some(c) = caches.get(path) {
-        return Arc::clone(c);
-    }
-    let c = Arc::new(IoCache::default());
-    caches.insert(path.to_string(), Arc::clone(&c));
-    c
-}
 
 fn path_resident(
     path: &str,
@@ -67,16 +54,61 @@ fn path_resident(
     Ok(r)
 }
 
-/// Clear path-persistent I/O and resident caches (for tests).
+/// Clear global resident caches (for tests).
 pub fn clear_path_caches() {
-    PATH_IO_CACHES.lock().unwrap().clear();
     PATH_RESIDENT.lock().unwrap().clear();
 }
 
-/// Drop path-scoped I/O and resident cache entries (called by :meth:`OpenDataFrame.close`).
+/// Drop path-scoped resident cache entries (called by :meth:`OpenDataFrame.close`).
 pub fn release_path_resources(path: &str) {
-    PATH_IO_CACHES.lock().unwrap().remove(path);
     PATH_RESIDENT.lock().unwrap().remove(path);
+}
+
+/// Return session chunk-cache stats ``(bytes, chunk_count)`` across active open handles.
+pub fn io_cache_stats_for_path(path: &str) -> Option<(usize, usize)> {
+    let mut guard = OPEN_CACHE_STATS.lock().unwrap();
+    let weaks = guard.get_mut(path)?;
+    weaks.retain(|w| w.strong_count() > 0);
+    let mut total_bytes = 0usize;
+    let mut total_chunks = 0usize;
+    for weak in weaks.iter() {
+        if let Some(cache) = weak.upgrade() {
+            let (bytes, chunks) = cache.stats();
+            total_bytes += bytes;
+            total_chunks += chunks;
+        }
+    }
+    if total_chunks == 0 {
+        None
+    } else {
+        Some((total_bytes, total_chunks))
+    }
+}
+
+static OPEN_CACHE_STATS: LazyLock<Mutex<HashMap<String, Vec<std::sync::Weak<IoCache>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn register_open_cache(path: &str, cache: &Arc<IoCache>) {
+    OPEN_CACHE_STATS
+        .lock()
+        .unwrap()
+        .entry(path.to_string())
+        .or_default()
+        .push(Arc::downgrade(cache));
+}
+
+fn unregister_open_cache(path: &str, cache: &Arc<IoCache>) {
+    let mut guard = OPEN_CACHE_STATS.lock().unwrap();
+    if let Some(weaks) = guard.get_mut(path) {
+        weaks.retain(|weak| {
+            weak.upgrade()
+                .map(|live| !Arc::ptr_eq(&live, cache))
+                .unwrap_or(false)
+        });
+        if weaks.is_empty() {
+            guard.remove(path);
+        }
+    }
 }
 
 struct OpenSessionInner {
@@ -119,6 +151,8 @@ impl OpenSession {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.inner.handle.cache.clear();
+        unregister_open_cache(self.path(), &self.inner.handle.cache);
         release_path_resources(self.path());
     }
 }
@@ -139,14 +173,34 @@ pub struct DatasetHandle {
 }
 
 impl DatasetHandle {
+    /// Ephemeral handle for one-shot reads (e.g. ``load_slice``).
     pub fn open(path: &str) -> PyResult<Self> {
-        Self::open_with_mode(path, false)
+        Self::open_with_options(path, IoCachePolicy::None, false)
+    }
+
+    /// Lazy open handle with session chunk LRU (default budget).
+    pub fn open_lazy(path: &str, policy: IoCachePolicy) -> PyResult<Self> {
+        Self::open_with_options(path, policy, false)
     }
 
     pub fn open_with_mode(path: &str, in_memory: bool) -> PyResult<Self> {
+        let policy = if in_memory {
+            IoCachePolicy::Metadata
+        } else {
+            IoCachePolicy::Chunks {
+                budget_bytes: DEFAULT_CHUNK_BUDGET_BYTES,
+            }
+        };
+        Self::open_with_options(path, policy, in_memory)
+    }
+
+    pub fn open_with_options(path: &str, policy: IoCachePolicy, in_memory: bool) -> PyResult<Self> {
         let meta = read_meta(path)?;
         let store = store_fs(path)?;
-        let cache = path_io_cache(path);
+        let cache = Arc::new(IoCache::new(policy));
+        if !matches!(policy, IoCachePolicy::None) {
+            register_open_cache(path, &cache);
+        }
         let resident = if in_memory {
             Some(path_resident(path, &store, cache.as_ref(), &meta)?)
         } else {
@@ -394,7 +448,7 @@ pub fn load_array(py: Python<'_>, path: &str) -> PyResult<GrumpyArray> {
     match meta.root {
         RootMeta::Array { dtype, layout } => {
             let store = store_fs(path)?;
-            let cache = IoCache::default();
+            let cache = IoCache::new(IoCachePolicy::None);
             let io = IoReader {
                 store: &store,
                 cache: &cache,
@@ -457,7 +511,7 @@ pub fn load_dataframe(py: Python<'_>, path: &str) -> PyResult<GrumpyDataFrame> {
             canon,
         } => {
             let store = store_fs(path)?;
-            let cache = IoCache::default();
+            let cache = IoCache::new(IoCachePolicy::None);
             let io = IoReader {
                 store: &store,
                 cache: &cache,
@@ -547,7 +601,7 @@ fn load_resident(
 pub fn stored_axis0_len(path: &str) -> PyResult<usize> {
     let meta = read_meta(path)?;
     let store = store_fs(path)?;
-    let cache = IoCache::default();
+    let cache = IoCache::new(IoCachePolicy::None);
     let io = IoReader {
         store: &store,
         cache: &cache,

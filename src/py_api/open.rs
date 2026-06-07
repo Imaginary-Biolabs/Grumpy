@@ -10,6 +10,7 @@ use crate::io::{
     self as io_ops, canon_from_handle, column_names_from_handle, load_column_axis0_slice,
     load_dataframe_columns_axis0_slice, schema_from_handle, DatasetHandle, OpenSession,
 };
+use crate::io_cache::IoCachePolicy;
 use crate::layout::{drop_layout_axes, leaf_view, GrumpyArray, Layout};
 use crate::py_api::convert::{shape_or_nshape, wrap_result};
 use crate::py_api::indexing::{fast_getitem, getitem_array_indexing, getitem_coordinate};
@@ -111,8 +112,11 @@ fn shell_for_shape(open: &PyOpenDataFrame) -> PyResult<GrumpyDataFrame> {
 }
 
 #[pyfunction]
-pub fn open_dataset(path: String) -> PyResult<PyOpenDataFrame> {
-    let handle = DatasetHandle::open(&path)?;
+#[pyo3(signature = (path, cache="chunks", chunk_budget_mb=256))]
+pub fn open_dataset(path: String, cache: &str, chunk_budget_mb: usize) -> PyResult<PyOpenDataFrame> {
+    let budget_bytes = chunk_budget_mb.saturating_mul(1024 * 1024).max(1);
+    let policy = IoCachePolicy::parse(cache, budget_bytes)?;
+    let handle = DatasetHandle::open_lazy(&path, policy)?;
     match &handle.meta.root {
         io_ops::RootMeta::DataFrame { .. } => {
             let schema = schema_from_handle(&handle)?;

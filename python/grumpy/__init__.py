@@ -410,12 +410,21 @@ def load(path: str):
     return _load(path)
 
 
-def open(path: str) -> OpenDataFrame:
+def open(
+    path: str,
+    *,
+    cache: str = "chunks",
+    chunk_budget_mb: int = 256,
+) -> OpenDataFrame:
     """Open a saved dataset as a lazy on-disk handle.
 
     Row and schema indexing materialize subset dataframes. Column selection
     (``df['col']`` or ``df.col``) returns an :class:`OpenColumn` proxy until
     the column is indexed.
+
+    ``cache`` controls session I/O caching: ``"chunks"`` (default) keeps a
+    byte-bounded LRU of decoded Zarr chunks; ``"metadata"`` pins only offset
+    buffers; ``"none"`` disables caching.
 
     Call :meth:`~grumpy.OpenDataFrame.close` when finished, or use a context
     manager::
@@ -423,7 +432,7 @@ def open(path: str) -> OpenDataFrame:
         with gr.open("data.gr") as h:
             batch = h[[0, 1, 2]]
     """
-    return _open(path)
+    return _open(path, cache, chunk_budget_mb)
 
 
 def rng(seed: int = 0) -> Generator:

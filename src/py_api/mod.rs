@@ -45,8 +45,8 @@ use fns::setops::{isin, setdiff, setunion, setxor, unique};
 use fns::sortsearch::{nonzero, search_sorted};
 use fns::whereops::{argwhere, where_};
 use py_io::{
-    append_batch, clear_path_caches, io_bytes_read, load, load_slice, reset_io_bytes_read, save,
-    stored_len,
+    append_batch, clear_path_caches, io_bytes_read, io_cache_stats, load, load_slice,
+    reset_io_bytes_read, save, stored_len,
 };
 use pyo3::prelude::*;
 use random::py_rng;
@@ -110,5 +110,6 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(io_bytes_read, m)?)?;
     m.add_function(wrap_pyfunction!(reset_io_bytes_read, m)?)?;
     m.add_function(wrap_pyfunction!(clear_path_caches, m)?)?;
+    m.add_function(wrap_pyfunction!(io_cache_stats, m)?)?;
     Ok(())
 }
