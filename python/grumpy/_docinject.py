@@ -262,14 +262,22 @@ def inject_grumpy_array_docs() -> None:
                 ],
             ),
             "to_numpy": doc(
-                "Convert to NumPy when the layout is rectangular.",
-                returns="numpy.ndarray\n    Dense NumPy array.",
+                "Export as a C-contiguous NumPy array (rectangular layouts only).",
+                returns="numpy.ndarray\n    Dense NumPy array sharing memory when contiguous.",
                 examples=[
                     ">>> import grumpy as gr",
                     ">>> x = gr.array([[1, 2], [3, 4]])",
                     ">>> x.to_numpy().shape",
                     "(2, 2)",
                 ],
+            ),
+            "to_torch": doc(
+                "Export as a PyTorch tensor via ``torch.from_numpy`` (rectangular layouts only).",
+                returns="torch.Tensor",
+            ),
+            "to_tensorflow": doc(
+                "Export as a TensorFlow tensor via ``tf.convert_to_tensor`` (rectangular layouts only).",
+                returns="tf.Tensor",
             ),
             "flatten": doc(
                 "Flatten nested lists to a 1D leaf array.",

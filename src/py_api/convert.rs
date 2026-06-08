@@ -1,4 +1,5 @@
 use crate::dtype::DType;
+use crate::error::dim_out_of_range;
 use crate::layout::{build_array, GrumpyArray, Layout};
 use crate::py_api::types::PyGrumpyArray;
 use numpy::{PyArray1, PyArrayMethods, Element};
@@ -251,12 +252,26 @@ pub(crate) fn numpy_dtype<'py>(
     Ok(Some((np.getattr(attr)?, expected)))
 }
 
+fn layout_max_shape_dim(layout: &Layout) -> usize {
+    match layout {
+        Layout::Leaf(_) => 0,
+        Layout::ListOffset(lo) => 1 + layout_max_shape_dim(lo.content.as_ref()),
+        Layout::Indexed(ix) => layout_max_shape_dim(ix.content.as_ref()),
+        Layout::OffsetView(v) => layout_max_shape_dim(v.content.as_ref()),
+        Layout::UnionScalarList(u) => layout_max_shape_dim(&Layout::ListOffset(u.lists.clone())),
+    }
+}
+
 pub(crate) fn shape_or_nshape(
     py: Python<'_>,
     arr: &GrumpyArray,
     dim: usize,
     count_non_null_scalars: bool,
 ) -> PyResult<PyObject> {
+    let max_dim = layout_max_shape_dim(&arr.layout);
+    if dim > max_dim {
+        return Err(dim_out_of_range(dim as isize, max_dim + 1));
+    }
     if dim == 0 {
         return Ok((arr.len() as i64).into_py(py));
     }

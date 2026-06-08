@@ -71,6 +71,10 @@ from ._core import (
     rng as _rng,
     py_can_cast as _can_cast,
     py_promote_types as _promote_types,
+    from_numpy as _from_numpy,
+    from_torch as _from_torch,
+    from_tensorflow as _from_tensorflow,
+    is_rectangular as _is_rectangular,
 )
 
 from . import compiler as _compiler_mod
@@ -433,6 +437,26 @@ def open(
             batch = h[[0, 1, 2]]
     """
     return _open(path, cache, chunk_budget_mb)
+
+
+def from_numpy(obj, dtype: DType | None = None) -> GrumpyArray:
+    """Build a rectangular :class:`GrumpyArray` from a C-contiguous NumPy array."""
+    return _from_numpy(obj, dtype)
+
+
+def from_torch(obj, dtype: DType | None = None) -> GrumpyArray:
+    """Build a rectangular :class:`GrumpyArray` from a PyTorch tensor (via ``.numpy()``)."""
+    return _from_torch(obj, dtype)
+
+
+def from_tensorflow(obj, dtype: DType | None = None) -> GrumpyArray:
+    """Build a rectangular :class:`GrumpyArray` from a TensorFlow tensor (via ``.numpy()``)."""
+    return _from_tensorflow(obj, dtype)
+
+
+def is_rectangular(arr: GrumpyArray) -> bool:
+    """Return whether ``arr`` can be exported as a dense rectangular tensor."""
+    return _is_rectangular(arr)
 
 
 def rng(seed: int = 0) -> Generator:

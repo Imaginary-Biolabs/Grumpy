@@ -22,6 +22,7 @@ mod convert;
 mod dataframe;
 mod fns;
 mod indexing;
+mod interop;
 mod open;
 mod py_io;
 mod random;
@@ -33,6 +34,7 @@ use crate::dtype::PyDType;
 use cast::{py_can_cast, py_promote_types};
 use open::open_dataset;
 use fns::array::{array as gr_array, cat, full_like, ones_like, zeros_like};
+use interop::{from_numpy, from_tensorflow, from_torch, is_rectangular};
 use fns::binop::{add_arrays, multiply, subtract};
 use fns::dataframe::dataframe as gr_dataframe;
 use fns::einsum::{einsum, tensordot};
@@ -111,5 +113,9 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(reset_io_bytes_read, m)?)?;
     m.add_function(wrap_pyfunction!(clear_path_caches, m)?)?;
     m.add_function(wrap_pyfunction!(io_cache_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(from_numpy, m)?)?;
+    m.add_function(wrap_pyfunction!(from_torch, m)?)?;
+    m.add_function(wrap_pyfunction!(from_tensorflow, m)?)?;
+    m.add_function(wrap_pyfunction!(is_rectangular, m)?)?;
     Ok(())
 }

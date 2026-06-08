@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 import grumpy as gr
 
@@ -44,6 +45,23 @@ def test_variable_depth_shape_and_nshape_example():
     ns2 = y.nshape(2)
     assert ns2.to_list() == [[], [1, 1]]
 
+    with pytest.raises(ValueError, match="out of range"):
+        y.shape(3)
+
+
+def test_shape_dim_out_of_range():
+    flat = gr.array([1, 2, 3], dtype=gr.int32)
+    with pytest.raises(ValueError, match="out of range"):
+        flat.shape(1)
+
+    rect = gr.array([[1, 2], [3, 4]], dtype=gr.int32)
+    with pytest.raises(ValueError, match="out of range"):
+        rect.shape(2)
+
+    cube = gr.array([[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=gr.int32)
+    with pytest.raises(ValueError, match="out of range"):
+        cube.shape(3)
+
 
 def test_astype_casting():
     x = gr.array([1, 2, None], dtype=gr.int32)
@@ -61,19 +79,15 @@ def test_to_numpy_rectangular_typed():
     assert arr.tolist() == [[1, 2], [3, 4]]
 
 
-def test_to_numpy_ragged_object_fallback():
+def test_to_numpy_rejects_ragged():
     x = gr.array([[1, 2, 3], [4, 5]], dtype=gr.int32)
-    arr = x.to_numpy()
-    assert isinstance(arr, np.ndarray)
-    assert arr.dtype == object
-    assert arr.tolist() == [[1, 2, 3], [4, 5]]
+    with pytest.raises(ValueError):
+        x.to_numpy()
 
 
-def test_to_numpy_with_nulls_object_fallback():
+def test_to_numpy_rejects_nulls():
     x = gr.array([1, None, 2], dtype=gr.int32)
-    arr = x.to_numpy()
-    assert isinstance(arr, np.ndarray)
-    assert arr.dtype == object
-    assert arr.tolist() == [1, None, 2]
+    with pytest.raises(ValueError):
+        x.to_numpy()
 
 
