@@ -142,7 +142,7 @@ class CompiledTransform:
             return self._plan.run(batch)
         if (not self._warned) and self._compile_error:
             warnings.warn(
-                f"Stream.apply(compile=True): '{self.__qualname__}' could not be compiled; falling back to Python.\n"
+                f"gr.compile: '{self.__qualname__}' could not be compiled; falling back to Python.\n"
                 f"Reason: {self._compile_error}",
                 category=UserWarning,
                 stacklevel=2,

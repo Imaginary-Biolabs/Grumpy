@@ -6,9 +6,8 @@ This page is for contributors and advanced users who need to understand how Grum
 
 ```
 Grumpy/
-├── python/grumpy/       # Python package: public API, stream, compiler, doc injection
+├── python/grumpy/       # Python package: public API, open, compiler, doc injection
 │   ├── __init__.py      # Thin wrappers around _core
-│   ├── stream.py        # Stream / StreamApply, batch scheduling
 │   ├── compiler.py      # @gr.compile static analysis → CompiledPlan
 │   ├── errors.py        # Python-side grumpy.* errors
 │   └── _docinject.py    # Injected docstrings for GrumpyArray methods
@@ -18,7 +17,7 @@ Grumpy/
 │   ├── neighbors.rs     # kNN and radius search
 │   ├── geometry/        # CPU pairwise_distances, grid_pool
 │   ├── gpu/             # Optional Metal/CUDA kNN
-│   ├── stream/          # Zarr batch iterator, partial I/O
+│   ├── py_api/open.rs   # gr.open lazy handles (OpenDataFrame / OpenColumn)
 │   ├── py_api/          # PyO3 bindings (keep thin; call src/ kernels)
 │   └── error.rs         # ErrorCode, cause/fix formatting
 ├── docs/                # MkDocs site (this documentation)
@@ -66,7 +65,7 @@ A `GrumpyDataFrame` stores columns as arrays plus optional **schema** metadata. 
 
 ### Compilation IR
 
-`compiler.py` parses AST → JSON opcodes → `CompiledPlan` in Rust. `compiled_stream_apply` runs opcodes with optional Rayon over batches.
+`compiler.py` parses AST → JSON opcodes → `CompiledPlan` in Rust. `CompiledPlan.run` executes fused opcodes per batch with the GIL released for array/dataframe inputs.
 
 ## Implementation notes
 

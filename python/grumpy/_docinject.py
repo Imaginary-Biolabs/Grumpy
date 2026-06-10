@@ -641,7 +641,7 @@ def inject_dataframe_docs() -> None:
 def inject_compiled_plan_docs() -> None:
     cls = _core.CompiledPlan
     cls.__doc__ = doc(
-        "Fused Rust execution plan built by :func:`grumpy.compile` or ``Stream.apply(compile=...)``.",
+        "Fused Rust execution plan built by :func:`grumpy.compile` or :func:`grumpy.compiler.compile_pipeline`.",
         examples=[
             ">>> import grumpy as gr",
             ">>> @gr.compile",
@@ -720,31 +720,53 @@ def inject_core_function_docs() -> None:
                     "[1, 2]",
                 ],
             ),
-            "compiled_stream_apply": doc(
-                "Apply a fused compiled plan over streaming axis-0 batches in Rust.",
-                params=[
-                    "path : str",
-                    "    Saved dataset path.",
-                    "batch_size : int",
-                    "    Batch size.",
-                    "drop_last : bool",
-                    "    Whether to drop the final partial batch.",
-                    "cpu : int",
-                    "    Rayon worker count.",
-                    "prefetch : int",
-                    "    Maximum in-flight batches.",
-                    "ops : list[dict]",
-                    "    Fused opcode specification.",
-                ],
-                returns="iterator\n    Iterator of transformed batches.",
+        },
+    )
+
+
+def inject_open_docs() -> None:
+    open_df = _core.OpenDataFrame
+    open_df.__doc__ = doc(
+        "Lazy on-disk handle for a saved :class:`GrumpyDataFrame`.",
+        examples=[
+            ">>> import grumpy as gr",
+            ">>> gr.save(gr.dataframe({'x': [1, 2]}), 'data.gr')",
+            ">>> with gr.open('data.gr') as h:",
+            "...     len(h)",
+            "2",
+        ],
+    )
+    inject_many(
+        open_df,
+        {
+            "close": doc(
+                "Close the session and release cached Zarr chunks.",
+                returns="None",
                 examples=[
                     ">>> import grumpy as gr",
-                    ">>> st = gr.stream('data.gr', batch_size=32)",
-                    ">>> for batch in st.apply(lambda b: b * 2, cpu=4, compile='auto'):",
-                    "...     pass",
+                    ">>> h = gr.open('data.gr')",
+                    ">>> h.close()",
+                ],
+            ),
+            "load": doc(
+                "Materialize the full dataframe into memory.",
+                returns="GrumpyDataFrame\n    Eager in-memory dataframe.",
+                examples=[
+                    ">>> import grumpy as gr",
+                    ">>> with gr.open('data.gr') as h:",
+                    "...     h.load()",
                 ],
             ),
         },
+    )
+    open_col = _core.OpenColumn
+    open_col.__doc__ = doc(
+        "Lazy column proxy from :func:`grumpy.open`; indexing materializes leaf data.",
+        examples=[
+            ">>> import grumpy as gr",
+            ">>> with gr.open('data.gr') as h:",
+            "...     h['x']",
+        ],
     )
 
 
@@ -753,5 +775,6 @@ def inject_all() -> None:
     inject_grumpy_array_dunder_docs()
     inject_dtype_docs()
     inject_dataframe_docs()
+    inject_open_docs()
     inject_compiled_plan_docs()
     inject_core_function_docs()

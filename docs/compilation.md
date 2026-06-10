@@ -1,14 +1,12 @@
 # Compilation
 
-Python batch loops spend time crossing the interpreter boundary on every operation. **`@gr.compile`** and **`Stream.apply(compile=...)`** analyze a restricted subset of your transform, build a **CompiledPlan** of Rust opcodes, and execute them in one fused pass per batch — often with Rayon scheduling when `cpu > 1`.
+Python batch loops spend time crossing the interpreter boundary on every operation. **`@gr.compile`** analyzes a restricted subset of your transform, builds a **CompiledPlan** of Rust opcodes, and executes them in one fused pass per batch — with the GIL released for array and dataframe batches.
 
-Compilation matters most in **Zarr streaming** pipelines where the same transform runs thousands of times across epochs. Eager one-off calls on in-memory arrays rarely need it.
+Compilation matters most when the same transform runs thousands of times across training epochs. Pair **`@gr.compile`** with **`gr.open`** for lazy Zarr-backed batches, or call compiled wrappers on in-memory dataframes directly.
 
 ## What compilation does
 
-When compilation succeeds, Grumpy replaces your Python function body with a fixed opcode sequence — scalar elementwise math, reductions, kNN neighbors, and certain dataframe dot-assignments — executed entirely in Rust while the GIL is released.
-
-Decorate a function or pass it to `apply`:
+When compilation succeeds, Grumpy replaces your Python function body with a fixed opcode sequence — scalar elementwise math, reductions, kNN neighbors, and certain dataframe dot-assignments — executed entirely in Rust.
 
 ```python
 import grumpy as gr
@@ -22,39 +20,30 @@ print(scale(x).to_list())   # [[3.0, 5.0], [7.0]]
 print(scale.is_compiled)    # True
 ```
 
-The same function inside a stream:
+### With lazy open
+
+Materialize axis-0 slices from a saved dataset and run the compiled wrapper on each batch:
 
 ```python
 gr.save(x, "data.gr")
 
-st = gr.stream("data.gr", batch_size=1)
-for out in st.apply(scale, compile="auto"):
-    train_step(out)
+@gr.compile
+def scale(batch):
+    return batch * 2.0 + 1.0
+
+with gr.open("data.gr") as h:
+    for start in range(0, len(h), 32):
+        out = scale(h[start : start + 32])
+        train_step(out)
 ```
 
-If analysis fails, Grumpy falls back to plain Python and emits a **one-time warning**; the transform still runs correctly.
+If analysis fails at decoration time, the wrapper still runs as plain Python and emits a **one-time warning** on the first call; the transform remains correct.
 
-## When compilation kicks in
+## When compilation pays off
 
-`Stream.apply` accepts `compile=`:
+The homepage compile benchmark chart compares eager Python vs compiled paths on a protein-like **`gr.open`** mini-epoch. Gains show up when **multiple ops fuse** into one plan (elementwise chains, normalize + kNN + pool, and similar).
 
-| Value | Behavior |
-|-------|----------|
-| `"auto"` (default) | Compile when the full pipeline fuses into one supported plan |
-| `True` / `"force"` | Require compilation; warn or fall back if unsupported |
-| `False` / `"never"` | Always run Python callables |
-
-Scheduling is separate via `scheduler=`:
-
-| Value | Behavior |
-|-------|----------|
-| `"auto"` | Use Rust Rayon batch scheduling when the plan is fully compiled and `cpu > 1` |
-| `"python"` | `ThreadPoolExecutor` over batches |
-| `"rust"` | Require Rust scheduling (falls back with a warning if the plan is not fully compiled) |
-
-Compilation pays off primarily when **multiple ops fuse** and **`cpu > 1`** with `scheduler="auto"` — the homepage compile benchmark chart compares Python vs compiled paths on a protein-like stream.
-
-Union batches support the same scalar elementwise opcodes as list-chains when loaded from stream or memory:
+Union batches support the same scalar elementwise opcodes as list-chains:
 
 ```python
 u = gr.array([1.0, [2.0, 3.0], 4.0], dtype=gr.float64)
@@ -64,16 +53,32 @@ gr.save(u, "u.gr", chunk_size=2)
 def double(batch):
     return batch * 2.0
 
-st = gr.stream("u.gr", batch_size=1)
-out = list(st.apply(double, compile=True, scheduler="rust"))
+with gr.open("u.gr") as h:
+    out = double(h[[0]])
 ```
+
+Multi-function pipelines fuse when each step is compilable:
+
+```python
+def stage_a(batch):
+    return batch * 2.0
+
+def stage_b(batch):
+    return batch + 1.0
+
+run = gr.compiler.compile_pipeline([stage_a, stage_b])
+with gr.open("data.gr") as h:
+    out = run(h[[0]])
+```
+
+Epoch-level shuffle, DDP sharding, and parallel batch scheduling live in **Fabric** (outside Grumpy).
 
 ## Writing compilable functions
 
 Follow these rules so static analysis can build a plan:
 
 1. **Straight-line code only** — no `if`, `for`, `while`, `try`, imports, or nested function definitions.
-2. **Single argument** named by convention `batch` (the stream batch object).
+2. **Single argument** named by convention `batch` (a `GrumpyArray` or `GrumpyDataFrame` batch).
 3. **Supported statements** — see list below.
 
 ### Supported constructs (MVP)
@@ -92,19 +97,6 @@ def normalize_and_pool(batch):
     batch = batch * 0.01
     batch = batch + 1.0
     return batch.mean(dim=1)
-```
-
-Multi-function pipelines in one `apply` call fuse when each step is compilable:
-
-```python
-def stage_a(batch):
-    return batch * 2.0
-
-def stage_b(batch):
-    return batch + 1.0
-
-for out in st.apply([stage_a, stage_b], compile="auto", cpu=4, scheduler="auto"):
-    train_step(out)
 ```
 
 ### Unsupported (falls back to Python)

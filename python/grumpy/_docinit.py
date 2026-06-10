@@ -490,21 +490,21 @@ FUNCTION_DOCS: dict[str, str] = {
             "[1, 2]",
         ],
     ),
-    "stream": doc(
-        "Open a streaming iterator over a saved dataset.",
+    "open": doc(
+        "Open a saved dataframe as a lazy on-disk handle.",
         params=[
             "path : str",
             "    Saved dataset path.",
-            "batch_size : int, default 32",
-            "    Axis-0 batch size.",
-            "drop_last : bool, default False",
-            "    Drop the final partial batch.",
+            "cache : str, default 'chunks'",
+            "    I/O cache mode: ``'chunks'``, ``'metadata'``, or ``'none'``.",
+            "chunk_budget_mb : int, default 256",
+            "    Byte budget for decoded chunk LRU when ``cache='chunks'``.",
         ],
-        returns="Stream\n    Lazy batch iterator.",
+        returns="OpenDataFrame\n    Lazy handle; row/schema indexing materializes subsets.",
         examples=[
             ">>> import grumpy as gr",
-            ">>> st = gr.stream('data.gr', batch_size=32)",
-            ">>> len(st)",
+            ">>> with gr.open('data.gr') as h:",
+            "...     len(h)",
         ],
     ),
     "compile": doc(

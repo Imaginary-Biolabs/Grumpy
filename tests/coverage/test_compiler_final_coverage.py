@@ -56,6 +56,6 @@ def test_compile_pipeline_info_fused_ops():
         batch = batch * 2
         return batch
 
-    info = gr.compile_pipeline_info([t])
+    info = gr.compiler.compile_pipeline_info([t])
     assert info.fully_compiled
     assert info.fused_ops

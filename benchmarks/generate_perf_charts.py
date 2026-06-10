@@ -145,16 +145,45 @@ def _load_report(path: Path) -> dict[str, Any]:
 
 
 def _fig_layout(title: str, *, height: int = 420) -> dict[str, Any]:
+    # Title and legend share the top margin; stack them with paper coords so they
+    # do not collide with each other or the plot area.
     return dict(
-        title=dict(text=title, font=dict(family="IBM Plex Sans, sans-serif", size=16, color=COLORS["text"])),
+        title=dict(
+            text=title,
+            font=dict(family="IBM Plex Sans, sans-serif", size=16, color=COLORS["text"]),
+            x=0,
+            xanchor="left",
+            y=1,
+            yanchor="top",
+            pad=dict(b=8),
+        ),
         font=dict(family="IBM Plex Sans, sans-serif", color=COLORS["text"]),
         paper_bgcolor=COLORS["paper"],
         plot_bgcolor=COLORS["plot"],
         height=height,
-        margin=dict(l=48, r=24, t=56, b=48),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        xaxis=dict(gridcolor=COLORS["grid"], linecolor=COLORS["grid"], tickfont=dict(size=11)),
-        yaxis=dict(gridcolor=COLORS["grid"], linecolor=COLORS["grid"], tickfont=dict(size=11), title="Time (ms)"),
+        margin=dict(l=48, r=24, t=92, b=48),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=0.86,
+            xanchor="left",
+            x=0,
+            tracegroupgap=14,
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        xaxis=dict(
+            gridcolor=COLORS["grid"],
+            linecolor=COLORS["grid"],
+            tickfont=dict(size=11),
+            domain=[0, 1],
+        ),
+        yaxis=dict(
+            gridcolor=COLORS["grid"],
+            linecolor=COLORS["grid"],
+            tickfont=dict(size=11),
+            title="Time (ms)",
+            domain=[0, 0.82],
+        ),
         barmode="group",
     )
 
@@ -180,7 +209,7 @@ def _summary_chart(cases: list[dict[str, Any]]):
     selected = [c for c in cases if c["name"] in REPRESENTATIVE_OPS]
     if not selected:
         selected = cases[:4]
-    return _bar_chart_ms(selected, "Representative ops — public API (ms)", height=440)
+    return _bar_chart_ms(selected, "Representative ops — public API (ms)", height=460)
 
 
 def _compile_chart(cases: list[dict[str, Any]]):
@@ -195,7 +224,7 @@ def _compile_chart(cases: list[dict[str, Any]]):
             ys.append(val if val is not None else None)
         fig.add_bar(name=lib, x=names, y=ys, marker_color=COLORS[color_key])
     fig.update_layout(
-        **_fig_layout("Open-handle compile — mini-epoch (ms)", height=480)
+        **_fig_layout("Open-handle compile — mini-epoch (ms)", height=500)
     )
     fig.update_xaxes(tickangle=-20)
     return fig

@@ -66,12 +66,13 @@ def test_init_wrappers_and_comparisons():
 
 def test_open_public_api(tmp_path):
     x = gr.array([[1, 2], [3, 4], [5, 6]], dtype=gr.int32)
+    df = gr.dataframe({"col": x})
     p = tmp_path / "a.gr"
-    gr.save(x, str(p), chunk_size=2)
+    gr.save(df, str(p), chunk_size=2)
     h = gr.open(str(p))
     assert "OpenDataFrame" in repr(h)
     assert len(h) == 3
-    assert h[0:2].to_list() == x[0:2].to_list()
+    assert h["col"][0:2].to_list() == x[0:2].to_list()
 
 
 def test_compile_decorator_success_and_properties():

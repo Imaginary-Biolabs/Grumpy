@@ -50,6 +50,7 @@
   --md-code-fg-color: var(--gr-sand-900);
   --md-code-bg-color: var(--gr-sand-100);
   --md-code-bg-color--light: #f5f3efe6;
+  --md-code-bg-color--lighter: #ebe7e099;
 
   --md-typeset-color: var(--gr-sand-900);
   --md-typeset-a-color: var(--gr-ink-600);
@@ -99,7 +100,8 @@
 
   --md-code-fg-color: var(--gr-sand-100);
   --md-code-bg-color: var(--gr-ink-800);
-  --md-code-bg-color--light: #2a2725e6;
+  --md-code-bg-color--light: #383432cc;
+  --md-code-bg-color--lighter: #2a2725b3;
 
   --md-typeset-color: var(--gr-sand-100);
   --md-typeset-a-color: var(--gr-ink-200);
@@ -526,12 +528,29 @@
   font-weight: 500;
 }
 
+/* Code block copy / select controls (Material .md-code__nav) */
+.md-code__nav .md-code__button,
 .md-clipboard.md-icon {
-  color: var(--md-default-fg-color--lighter);
+  color: var(--md-default-fg-color--lightest);
 }
 
+:hover > .md-code__nav .md-code__button,
+.md-code__button:hover,
+.md-code__button.focus-visible,
 .md-clipboard.md-icon:hover {
-  color: var(--md-default-fg-color);
+  color: var(--md-accent-fg-color);
+}
+
+[data-md-color-scheme="imaginary-dark"] .md-code__nav .md-code__button,
+[data-md-color-scheme="imaginary-dark"] .md-clipboard.md-icon {
+  color: var(--gr-ink-400);
+}
+
+[data-md-color-scheme="imaginary-dark"] :hover > .md-code__nav .md-code__button,
+[data-md-color-scheme="imaginary-dark"] .md-code__button:hover,
+[data-md-color-scheme="imaginary-dark"] .md-code__button.focus-visible,
+[data-md-color-scheme="imaginary-dark"] .md-clipboard.md-icon:hover {
+  color: var(--gr-ink-200);
 }
 
 /* ── Content chrome ── */
@@ -724,8 +743,8 @@
   display: block;
   width: 100%;
   max-width: 100%;
-  min-height: 420px;
-  height: 460px;
+  min-height: 440px;
+  height: 480px;
   margin: 1.25rem 0 2rem;
   border: 1px solid var(--gr-sand-300);
   border-radius: 6px;

@@ -12,8 +12,8 @@ Reference documentation is generated from Python docstrings in the `grumpy` pack
       filters:
         - "!^GrumpyArray$"
         - "!^DType$"
-        - "!^Stream$"
-        - "!^StreamApply$"
+        - "!^OpenDataFrame$"
+        - "!^OpenColumn$"
         - "!^CompiledTransform$"
         - "!^compile$"
         - "!^_"
@@ -30,18 +30,10 @@ Reference documentation is generated from Python docstrings in the `grumpy` pack
         - GrumpyArray
         - DType
         - GrumpyDataFrame
+        - OpenDataFrame
+        - OpenColumn
       filters:
         - "!^__"
-
-## Streaming
-
-::: grumpy.stream
-    options:
-      show_root_heading: false
-      heading_level: 3
-      members:
-        - Stream
-        - StreamApply
 
 ## Compilation
 
