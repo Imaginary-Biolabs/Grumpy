@@ -16,20 +16,9 @@ theme:
   icon:
     repo: fontawesome/brands/github
   palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: imaginary
-      primary: custom
-      accent: custom
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-    - media: "(prefers-color-scheme: dark)"
-      scheme: imaginary-dark
-      primary: custom
-      accent: custom
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
+    scheme: imaginary
+    primary: custom
+    accent: custom
   features:
     - navigation.instant
     - navigation.sections

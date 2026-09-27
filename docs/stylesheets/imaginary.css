@@ -205,28 +205,16 @@
   display: none !important;
 }
 
-/* Brand assets: _on-light = dark ink, _on-dark = light ink */
+/* Brand assets — light docs only (dark header uses light-ink mark) */
 .gr-brand-icon,
 .gr-brand-mark,
 .gr-brand-logo {
+  display: block;
+}
+
+.gr-brand-icon--inverse.gr-brand-icon--on-light,
+.gr-brand-icon--page.gr-brand-icon--on-dark {
   display: none;
-}
-
-[data-md-color-scheme="imaginary"] .gr-brand-icon--inverse.gr-brand-icon--on-dark,
-[data-md-color-scheme="imaginary-dark"] .gr-brand-icon--inverse.gr-brand-icon--on-light,
-[data-md-color-scheme="imaginary"] .gr-brand-logo--inverse.gr-brand-logo--on-dark,
-[data-md-color-scheme="imaginary-dark"] .gr-brand-logo--inverse.gr-brand-logo--on-light {
-  display: block;
-}
-
-[data-md-color-scheme="imaginary"] .gr-brand-icon--page.gr-brand-icon--on-light,
-[data-md-color-scheme="imaginary-dark"] .gr-brand-icon--page.gr-brand-icon--on-dark {
-  display: block;
-}
-
-[data-md-color-scheme="imaginary"] .gr-brand-mark--page.gr-brand-mark--on-light,
-[data-md-color-scheme="imaginary-dark"] .gr-brand-mark--page.gr-brand-mark--on-dark {
-  display: block;
 }
 
 .gr-home-mark {
@@ -235,8 +223,13 @@
 }
 
 .gr-home-mark .gr-brand-mark {
-  width: min(6rem, 30vw);
+  width: min(14rem, 72vw);
   height: auto;
+}
+
+/* Light mode only — hide palette toggle if still present */
+.md-header__option {
+  display: none !important;
 }
 
 /* ── Homepage ── */
