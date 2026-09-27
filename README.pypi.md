@@ -1,9 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/grumpy_logo_dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/assets/grumpy_logo.png">
-    <img src="docs/assets/grumpy_logo.png" alt="Grumpy" width="280">
-  </picture>
+  <img src="https://raw.githubusercontent.com/Imaginary-Biolabs/Grumpy/main/docs/assets/grumpy_logo.png" alt="Grumpy" width="280">
 </p>
 
 <p align="center">
@@ -11,17 +7,17 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL--1.1-2A2725?style=for-the-badge&logo=opensourceinitiative&logoColor=E3E1DE" alt="license BSL 1.1" /></a>
+  <a href="https://github.com/Imaginary-Biolabs/Grumpy/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-BSL--1.1-2A2725?style=for-the-badge&logo=opensourceinitiative&logoColor=E3E1DE" alt="license BSL 1.1" /></a>
   <a href="https://github.com/Imaginary-Biolabs/Grumpy/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Imaginary-Biolabs/Grumpy/ci.yml?branch=main&style=for-the-badge&label=build&color=484240&logo=githubactions&logoColor=E3E1DE" alt="build status" /></a>
   <a href="https://codecov.io/gh/Imaginary-Biolabs/Grumpy"><img src="https://img.shields.io/codecov/c/github/Imaginary-Biolabs/Grumpy/main?style=for-the-badge&color=777067&logo=codecov&logoColor=E3E1DE" alt="codecov coverage" /></a>
   <a href="https://github.com/Imaginary-Biolabs/Grumpy/releases"><img src="https://img.shields.io/badge/version-0.1.1-C8C4BF?style=for-the-badge&logo=python&logoColor=2A2725" alt="version 0.1.1" /></a>
 </p>
 
 <p align="center">
-  <a href="LICENSE-FAQ.md">License FAQ</a> ·
+  <a href="https://github.com/Imaginary-Biolabs/Grumpy/blob/main/LICENSE-FAQ.md">License FAQ</a> ·
   <a href="https://imaginary-biolabs.github.io/Grumpy/">Documentation</a> ·
-  <a href="benchmarks/README.md">Benchmarks</a> ·
-  <a href="CONTRIBUTING.md">Contributing</a>
+  <a href="https://github.com/Imaginary-Biolabs/Grumpy/blob/main/benchmarks/README.md">Benchmarks</a> ·
+  <a href="https://github.com/Imaginary-Biolabs/Grumpy/blob/main/CONTRIBUTING.md">Contributing</a>
 </p>
 
 **Grumpy** is a Python library (Rust core) for **ragged**, **nested**, and **nullable** arrays — layout-first infrastructure for structural ML and general scientific computing. Mutable typed leaves, Zarr I/O, streaming batches, and optional `@gr.compile` fusion.
@@ -39,4 +35,4 @@ print(x.mean(dim=1).to_list())  # [2.0, 4.5]
 
 ## License
 
-Business Source License 1.1 — see [LICENSE](LICENSE) and [License FAQ](LICENSE-FAQ.md). Copyright © Imaginary Biolabs GmbH.
+Business Source License 1.1 — see [LICENSE](https://github.com/Imaginary-Biolabs/Grumpy/blob/main/LICENSE) and [License FAQ](https://github.com/Imaginary-Biolabs/Grumpy/blob/main/LICENSE-FAQ.md). Copyright © Imaginary Biolabs GmbH.
