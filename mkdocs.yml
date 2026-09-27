@@ -10,9 +10,7 @@ theme:
   custom_dir: docs/overrides
   logo: assets/grumpy_icon.svg
   favicon: assets/grumpy_favicon.svg
-  font:
-    text: IBM Plex Sans
-    code: IBM Plex Mono
+  font: false
   icon:
     repo: fontawesome/brands/github
   palette:
