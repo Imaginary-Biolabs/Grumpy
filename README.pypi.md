@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Imaginary-Biolabs/Grumpy/main/docs/assets/grumpy_logo.png" alt="Grumpy" width="280">
+  <img src="https://raw.githubusercontent.com/Imaginary-Biolabs/Grumpy/main/docs/assets/grumpy_logo.png" alt="Grumpy" width="320">
 </p>
 
 <p align="center">

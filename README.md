@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/grumpy_logo_dark.png">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/grumpy_logo.png">
-    <img src="docs/assets/grumpy_logo.png" alt="Grumpy" width="280">
+    <img src="docs/assets/grumpy_logo.png" alt="Grumpy" width="320">
   </picture>
 </p>
 
