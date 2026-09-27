@@ -1,15 +1,18 @@
 {#-
-  Grumpy footer: brand block, links, copyright, and social icons.
+  Grumpy footer: wordmark, links, copyright, and social icons.
 -#}
 <footer class="md-footer">
   <div class="gr-footer">
     <div class="gr-footer__inner md-grid">
       <div class="gr-footer__brand">
-        <span class="gr-footer__logo">{% include "partials/brand-icon.html" %}</span>
-        <div class="gr-footer__brand-text">
-          <span class="gr-footer__name">{{ config.site_name }}</span>
-          <span class="gr-footer__byline">Documentation · Imaginary Biolabs</span>
-        </div>
+        <a href="{{ nav.homepage.url | url }}" class="gr-footer__logo" aria-label="{{ config.site_name }}">
+          <img
+            class="gr-brand-logo"
+            src="{{ 'assets/grumpy_logo.png' | url }}"
+            alt="{{ config.site_name }}"
+          />
+        </a>
+        <span class="gr-footer__byline">Documentation · Imaginary Biolabs</span>
       </div>
       <nav class="gr-footer__links" aria-label="Footer">
         <a href="{{ nav.homepage.url | url }}">Home</a>

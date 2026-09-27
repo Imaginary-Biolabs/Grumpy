@@ -223,7 +223,7 @@
 }
 
 .gr-home-mark .gr-brand-mark {
-  width: min(14rem, 72vw);
+  width: min(9rem, 48vw);
   height: auto;
 }
 
@@ -351,13 +351,12 @@
 .gr-footer__logo {
   display: block;
   flex: 0 0 auto;
-  width: 2.5rem;
-  height: 2.5rem;
+  line-height: 0;
 }
 
-.gr-footer__logo .gr-brand-icon {
-  width: 2.5rem;
-  height: 2.5rem;
+.gr-footer__logo .gr-brand-logo {
+  height: 1.35rem;
+  width: auto;
 }
 
 .gr-header__title {
@@ -383,7 +382,7 @@
 }
 
 .gr-header-brand .gr-brand-logo {
-  height: 1.85rem;
+  height: 1.35rem;
   width: auto;
 }
 
@@ -413,7 +412,7 @@
   }
 
   .gr-header-brand .gr-brand-logo {
-    height: 1.65rem;
+    height: 1.2rem;
   }
 }
 
@@ -611,18 +610,17 @@
 
 .gr-footer__inner {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1.25rem 2rem;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1rem;
   padding: 1.75rem 0 1.25rem;
 }
 
 .gr-footer__brand {
   display: flex;
-  align-items: center;
-  gap: 0.85rem;
-  min-width: min(100%, 16rem);
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.4rem;
 }
 
 .gr-footer__brand-text {
@@ -653,6 +651,7 @@
 .gr-footer__links {
   display: flex;
   flex-wrap: wrap;
+  justify-content: flex-start;
   gap: 0.35rem 1.1rem;
   font-size: 0.82rem;
 }
@@ -680,7 +679,7 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 0.75rem 1.5rem;
   padding: 0.85rem 0 1.35rem;
   border-top: 1px solid var(--gr-sand-200);
